@@ -52,7 +52,12 @@ def generate_plumbing(layout: Dict[str, Any], options: Dict[str, Any]) -> Dict[s
     storage = options.get("storage", "Overhead Tank")
     hot_water = options.get("hotWater", "None")
     
-    rooms = layout.get("rooms", [])
+    rooms = []
+    if "floors" in layout:
+        for f in layout.get("floors", []):
+            rooms.extend(f.get("rooms", []))
+    if not rooms:
+        rooms = layout.get("rooms", [])
     if not rooms: return layout
     
     # Find Utility Room for Manifold chain
@@ -193,9 +198,13 @@ def route_rmst(nodes, switchboard):
 
 def generate_wiring(layout: Dict[str, Any], options: Dict[str, Any]) -> Dict[str, Any]:
     package = options.get("package", "Basic")
-    rooms = layout.get("rooms", [])
+    rooms = []
+    if "floors" in layout:
+        for f in layout.get("floors", []):
+            rooms.extend(f.get("rooms", []))
+    if not rooms:
+        rooms = layout.get("rooms", [])
     if not rooms: return layout
-    
     # 1. Place Main DB
     db_room = None
     for p in ["utility", "garage", "foyer", "corridor", "living"]:

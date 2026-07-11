@@ -2209,6 +2209,14 @@ def _stream_generate_work(req: "GenerateRequest", pq: "_queue_mod.Queue") -> Non
         base_rooms = apply_bedroom_intelligence(base_rooms, req.prompt, requested_types=requested_types)
         layout_params["rooms"] = base_rooms or get_base_rooms_for_bhk(1)
 
+        # FIX: Missing Bathrooms Injection
+        bhk_val = layout_params.get("bhk", sum(1 for r in layout_params["rooms"] if "bedroom" in r.get("type", "")))
+        if bhk_val > 0:
+            bath_count = sum(1 for r in layout_params["rooms"] if "bath" in r.get("type", "").lower() or "toilet" in r.get("type", "").lower())
+            if bath_count < bhk_val:
+                for _ in range(bhk_val - bath_count):
+                    layout_params["rooms"].append({"type": "bathroom", "confidence": 100})
+
         _prompt_l = (req.prompt or "").lower()
         _pooja_ok = bool(layout_params.get("indian_options", {}).get("pooja_room")) or \
             any(k in _prompt_l for k in ("pooja", "puja", "mandir", "temple", "prayer", "devghar"))
@@ -2216,6 +2224,8 @@ def _stream_generate_work(req: "GenerateRequest", pq: "_queue_mod.Queue") -> Non
             layout_params["rooms"] = [r for r in layout_params["rooms"] if "pooja" not in r.get("type", "").lower()]
 
         floors = layout_params.get("floors", 1)
+        if details.get("floors", 1) > 1:
+            floors = details.get("floors", 1)
         if req.floors and req.floors > 1:
             floors = req.floors
         layout_params["floors"] = floors
@@ -2330,6 +2340,22 @@ def _stream_generate_work(req: "GenerateRequest", pq: "_queue_mod.Queue") -> Non
         emit(8, "Generating Materials & Structures...", "Structural analysis · cost estimation")
 
         all_nodes = list(generated_nodes_0) + list(generated_nodes_1)
+        
+        # FIX: Color Injection
+        global_color = details.get("global_color") or details.get("color_hex")
+        if global_color:
+            for node in all_nodes:
+                node.wallColor = global_color
+        
+        room_colors = details.get("room_colors", [])
+        for rc in room_colors:
+            r_name = rc.get("room", "").lower()
+            r_col = rc.get("color", "")
+            if r_name and r_col:
+                for node in all_nodes:
+                    if r_name in node.name.lower() or r_name in getattr(node, "type", "").lower():
+                        node.wallColor = r_col
+        
         validation_report = final_layout_validation(all_nodes, indian_options=indian_opts, is_duplex=(floors > 1))
         response["validation"] = validation_report
         if not validation_report["ok"]:
@@ -2494,6 +2520,22 @@ def _stream_template_work(req: "TemplateRequest", pq: "_queue_mod.Queue") -> Non
         emit(8, "Generating Materials & Structures...", "Material assignment · structural check")
 
         all_nodes = list(generated_nodes_0) + list(generated_nodes_1)
+        
+        # FIX: Color Injection
+        global_color = details.get("global_color") or details.get("color_hex")
+        if global_color:
+            for node in all_nodes:
+                node.wallColor = global_color
+        
+        room_colors = details.get("room_colors", [])
+        for rc in room_colors:
+            r_name = rc.get("room", "").lower()
+            r_col = rc.get("color", "")
+            if r_name and r_col:
+                for node in all_nodes:
+                    if r_name in node.name.lower() or r_name in getattr(node, "type", "").lower():
+                        node.wallColor = r_col
+        
         template_validation = final_layout_validation(all_nodes, indian_options=indian_opts, is_duplex=(req.floors > 1))
         if not template_validation["ok"]:
             template_warnings.extend(template_validation["issues"])

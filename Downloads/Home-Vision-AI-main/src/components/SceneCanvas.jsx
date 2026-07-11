@@ -1147,6 +1147,7 @@ function SceneContent() {
                 transparent={showStructural}
                 buildingBounds={groundBounds}
                 exteriorColor={exteriorColor}
+                globalProperties={project.globalProperties}
               />
             ))}
             <InteriorObjects rooms={groundFloorRooms} accent={accentColor} />
@@ -1186,6 +1187,7 @@ function SceneContent() {
                 transparent={showStructural}
                 buildingBounds={firstBounds}
                 exteriorColor={exteriorColor}
+                globalProperties={project.globalProperties}
               />
             ))}
             <InteriorObjects rooms={firstFloorRooms} accent={accentColor} />

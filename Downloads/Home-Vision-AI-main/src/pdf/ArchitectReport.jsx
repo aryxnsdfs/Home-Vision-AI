@@ -493,20 +493,19 @@ function FloorPlanTopDown({ floor0, mep, mode = "architectural", project, height
         )}
 
         {/* MEP Overlay */}
+        {mode === 'electrical' && (
+          <React.Fragment>
+            <SvgLine x1={minX - 2} y1={minZ + 2} x2={minX + 2} y2={minZ - 2} stroke="#ef4444" strokeWidth={0.8} />
+            <SvgLine x1={minX - 2} y1={minZ - 2} x2={minX + 2} y2={minZ + 2} stroke="#ef4444" strokeWidth={0.8} />
+            <Text x={minX + 3} y={minZ} style={{ fontSize: dimSize * 0.8, fill: "#ef4444", fontWeight: "bold" }}>MAIN ELEC DROP</Text>
+          </React.Fragment>
+        )}
         {mode === 'electrical' && floor0.map(r => {
           const nodes = r.mep_nodes || [];
           const paths = r.wiring_paths || [];
           return (
             <React.Fragment key={`elec-${r.id}`}>
-              {paths.map((path, idx) => {
-                const colorMap = {
-                  "lighting": "#eab308", "heavy_power": "#f97316", "general_power": "#ef4444",
-                  "data": "#3b82f6", "smart": "#22c55e", "sub_main": "#334155"
-                };
-                const stroke = colorMap[path.circuit_type] || "#ef4444";
-                const sw = path.circuit_type === "heavy_power" || path.circuit_type === "sub_main" ? 0.6 : 0.3;
-                return <Path key={`w-${idx}`} d={`M ${path.from.x} ${path.from.z} L ${path.from.x} ${path.to.z} L ${path.to.x} ${path.to.z}`} fill="none" stroke={stroke} strokeWidth={sw} strokeDasharray="2,2" />;
-              })}
+
 
               {nodes.map((node, i) => {
                 if (node.type === "main_db") {
@@ -537,16 +536,19 @@ function FloorPlanTopDown({ floor0, mep, mode = "architectural", project, height
           );
         })}
 
+        {mode === 'plumbing' && (
+          <React.Fragment>
+            <SvgLine x1={minX - 2} y1={maxZ - 2} x2={minX + 2} y2={maxZ + 2} stroke="#3b82f6" strokeWidth={0.8} />
+            <SvgLine x1={minX - 2} y1={maxZ + 2} x2={minX + 2} y2={maxZ - 2} stroke="#3b82f6" strokeWidth={0.8} />
+            <Text x={minX + 3} y={maxZ} style={{ fontSize: dimSize * 0.8, fill: "#3b82f6", fontWeight: "bold" }}>MAIN WATER SUPPLY</Text>
+          </React.Fragment>
+        )}
         {mode === 'plumbing' && floor0.map(r => {
           const nodes = r.mep_nodes || [];
           const paths = r.plumbing_paths || [];
           return (
             <React.Fragment key={`plum-${r.id}`}>
-              {paths.map((path, idx) => {
-                const colorMap = { "cold_water": "#3b82f6", "hot_water": "#f97316", "drainage": "#78350f" };
-                const stroke = colorMap[path.pipe_type] || "#3b82f6";
-                return <Path key={`p-${idx}`} d={`M ${path.from.x} ${path.from.z} L ${path.from.x} ${path.to.z} L ${path.to.x} ${path.to.z}`} fill="none" stroke={stroke} strokeWidth={path.pipe_type === 'drainage' ? 0.6 : 0.3} strokeDasharray={path.pipe_type === 'drainage' ? "none" : "1.5,1"} />;
-              })}
+
 
               {nodes.filter(n => n.type === "water_source" || n.type === "ug_tank" || n.type === "oh_tank" || n.type === "pump" || n.type === "manifold" || n.type.includes("sink") || n.type.includes("basin") || n.type === "wc" || n.type.includes("shower") || n.type.includes("drain")).map((node, i) => (
                   <React.Fragment key={`wn-${i}`}>
@@ -709,29 +711,47 @@ export default function ArchitectReport({ project, snapshot }) {
   const projectTotal = subtotal + contingency;
 
   const elecSchedule = rooms.map(r => {
-    let lights = 0, fans = 0, sockets = 0;
+    let lights = 0, fans = 0, sockets = 0, heavy = 0;
     (r.mep_nodes || []).forEach(n => {
       if (n.type.includes("light")) lights++;
-      if (n.type === "fan") fans++;
-      if (n.type.includes("socket")) sockets++;
+      else if (n.type === "fan") fans++;
+      else if (n.type.includes("socket")) sockets++;
+      else if (n.type === "ac" || n.type === "geyser" || n.type === "oven") heavy++;
     });
-    return { name: (r.isFloor1 ? "FF - " : "GF - ") + r.name, lights, fans, sockets };
+    const watts = (lights * 15) + (fans * 60) + (sockets * 200) + (heavy * 2000);
+    const amps = watts / 240;
+    let fixtures = [];
+    if (lights > 0) fixtures.push(`${lights}x LED`);
+    if (fans > 0) fixtures.push(`${fans}x Fan`);
+    if (sockets > 0) fixtures.push(`${sockets}x 15A Socket`);
+    if (heavy > 0) fixtures.push(`${heavy}x 240V Heavy`);
+    return { name: (r.isFloor1 ? "FF - " : "GF - ") + r.name, voltage: "240V", amps: amps.toFixed(1) + "A", fixtures: fixtures.join(", ") || "None", watts };
   });
 
-  const totalLights = elecSchedule.reduce((s, r) => s + r.lights, 0);
-  const totalFans = elecSchedule.reduce((s, r) => s + r.fans, 0);
-  const totalSockets = elecSchedule.reduce((s, r) => s + r.sockets, 0);
+  const totalWatts = elecSchedule.reduce((s, r) => s + r.watts, 0);
+  const totalAmps = totalWatts / 240;
+  const serviceRequired = totalAmps < 100 ? "100A" : (totalAmps < 150 ? "150A" : "200A");
+
+  const totalLights = elecSchedule.reduce((s, r) => s + (parseInt(r.fixtures.match(/(\d+)x LED/)?.[1]) || 0), 0);
+  const totalFans = elecSchedule.reduce((s, r) => s + (parseInt(r.fixtures.match(/(\d+)x Fan/)?.[1]) || 0), 0);
+  const totalSockets = elecSchedule.reduce((s, r) => s + (parseInt(r.fixtures.match(/(\d+)x 15A Socket/)?.[1]) || 0), 0);
   
+  let plumbCounter = 1;
   const plumbSchedule = rooms.filter(r => r.type.includes("bath") || r.type.includes("kitchen")).map(r => {
     let fixs = [];
+    let gpm = 0;
     (r.mep_nodes || []).forEach(n => {
-      if (n.type === "wc") fixs.push("WC");
-      if (n.type.includes("sink")) fixs.push("SINK");
-      if (n.type.includes("basin")) fixs.push("BASIN");
-      if (n.type.includes("shower")) fixs.push("SHWR");
+      if (n.type === "wc") { fixs.push("WC"); gpm += 2.5; }
+      if (n.type.includes("sink") || n.type.includes("basin")) { fixs.push("SINK"); gpm += 1.5; }
+      if (n.type.includes("shower")) { fixs.push("SHWR"); gpm += 2.0; }
     });
-    return { name: (r.isFloor1 ? "FF - " : "GF - ") + r.name, fixtures: Array.from(new Set(fixs)).join(", ") };
+    let uniqueFixs = Array.from(new Set(fixs));
+    let typeStr = uniqueFixs.length > 0 ? uniqueFixs.join(", ") : "None";
+    return { name: (r.isFloor1 ? "FF - " : "GF - ") + r.name, itemId: `P-${plumbCounter++}`, type: typeStr, gpm: gpm.toFixed(1) };
   });
+
+  const totalGpm = plumbSchedule.reduce((s, r) => s + parseFloat(r.gpm), 0);
+  const mainLineSize = totalGpm < 10 ? "3/4 inch" : (totalGpm <= 20 ? "1 inch" : "1.25 inch");
 
   return (
     <Document title={`${project.name} Architect Export`} author="Home Vision AI">
@@ -850,13 +870,18 @@ export default function ArchitectReport({ project, snapshot }) {
         <Text style={styles.sectionTitle}>ELECTRICAL SCHEDULE</Text>
         <View style={styles.table}>
           <View style={[styles.tableRow, { backgroundColor: "#f1f5f9" }]} wrap={false}>
-            <Text style={[styles.c1, styles.tableHead]}>ROOM</Text><Text style={[styles.c2, styles.tableHead]}>LIGHTS</Text><Text style={[styles.c3, styles.tableHead]}>FANS</Text><Text style={[styles.c4, styles.tableHead]}>SOCKETS</Text><Text style={[styles.c5, styles.tableHead]}>REMARKS</Text>
+            <Text style={[styles.c1, styles.tableHead]}>ROOM</Text><Text style={[styles.c2, styles.tableHead]}>VOLTAGE</Text><Text style={[styles.c3, styles.tableHead]}>AMPERAGE</Text><Text style={[styles.c4, styles.tableHead]}>FIXTURES</Text><Text style={[styles.c5, styles.tableHead]}>REMARKS</Text>
           </View>
           {elecSchedule.map((row, i) => (
             <View key={`es-${i}`} style={styles.tableRow} wrap={false}>
-              <Text style={styles.c1}>{up(row.name)}</Text><Text style={styles.c2}>{row.lights}</Text><Text style={styles.c3}>{row.fans}</Text><Text style={styles.c4}>{row.sockets}</Text><Text style={styles.c5}>Auto</Text>
+              <Text style={styles.c1}>{up(row.name)}</Text><Text style={styles.c2}>{row.voltage}</Text><Text style={styles.c3}>{row.amps}</Text><Text style={styles.c4}>{row.fixtures}</Text><Text style={styles.c5}>Standard Load</Text>
             </View>
           ))}
+        </View>
+        <View style={{ marginTop: 8, padding: 8, backgroundColor: "#f8fafc", border: `1 solid ${LINE}` }}>
+          <Text style={{ fontSize: 9, fontWeight: "bold", marginBottom: 4 }}>PRELIMINARY LOAD SUMMARY</Text>
+          <Text style={{ fontSize: 8, color: MUTED }}>Total Calculated Electrical Demand: {totalAmps.toFixed(1)} Amps</Text>
+          <Text style={{ fontSize: 8, color: MUTED }}>Recommended Minimum Service: {serviceRequired} Main Panel</Text>
         </View>
       </Page>
 
@@ -870,13 +895,18 @@ export default function ArchitectReport({ project, snapshot }) {
         <Text style={styles.sectionTitle}>PLUMBING SCHEDULE</Text>
         <View style={styles.table}>
           <View style={[styles.tableRow, { backgroundColor: "#f1f5f9" }]} wrap={false}>
-            <Text style={[styles.c1, styles.tableHead]}>ROOM</Text><Text style={[styles.c2, styles.tableHead]}>FIXTURES</Text><Text style={[styles.c3, styles.tableHead]}>COLD WATER</Text><Text style={[styles.c4, styles.tableHead]}>HOT WATER</Text><Text style={[styles.c5, styles.tableHead]}>DRAIN</Text>
+            <Text style={[styles.c1, styles.tableHead]}>ROOM</Text><Text style={[styles.c2, styles.tableHead]}>ITEM ID</Text><Text style={[styles.c3, styles.tableHead]}>TYPE</Text><Text style={[styles.c4, styles.tableHead]}>PEAK GPM</Text><Text style={[styles.c5, styles.tableHead]}>REMARKS</Text>
           </View>
           {plumbSchedule.map((row, i) => (
             <View key={`ps-${i}`} style={styles.tableRow} wrap={false}>
-              <Text style={styles.c1}>{up(row.name)}</Text><Text style={styles.c2}>{row.fixtures}</Text><Text style={styles.c3}>YES</Text><Text style={styles.c4}>{row.fixtures.includes("SHWR") ? "YES" : "NO"}</Text><Text style={styles.c5}>YES</Text>
+              <Text style={styles.c1}>{up(row.name)}</Text><Text style={styles.c2}>{row.itemId}</Text><Text style={styles.c3}>{row.type}</Text><Text style={styles.c4}>{row.gpm}</Text><Text style={styles.c5}>Standard Flow</Text>
             </View>
           ))}
+        </View>
+        <View style={{ marginTop: 8, padding: 8, backgroundColor: "#f8fafc", border: `1 solid ${LINE}` }}>
+          <Text style={{ fontSize: 9, fontWeight: "bold", marginBottom: 4 }}>PRELIMINARY LOAD SUMMARY</Text>
+          <Text style={{ fontSize: 8, color: MUTED }}>Total Peak Water Demand: {totalGpm.toFixed(1)} GPM</Text>
+          <Text style={{ fontSize: 8, color: MUTED }}>Recommended Minimum Supply Line: {mainLineSize}</Text>
         </View>
       </Page>
 
@@ -960,7 +990,7 @@ export default function ArchitectReport({ project, snapshot }) {
             <View style={{ marginTop: 10, padding: 8, backgroundColor: "#fee2e2", borderLeft: "2 solid #ef4444", width: "100%", flexShrink: 1 }}>
               <Text style={{ fontSize: 9, color: "#b91c1c", fontWeight: "bold" }}>⚠️ LEGAL DISCLAIMER & REVIEW REQUIREMENTS</Text>
               <Text style={{ fontSize: 7, color: "#b91c1c", marginTop: 4 }}>This document is an AI-generated conceptual planning and design package.</Text>
-              <Text style={{ fontSize: 7, color: "#b91c1c", marginTop: 2 }}>All structural, electrical, plumbing, geotechnical, code compliance, safety, and construction-related calculations, specifications, and drawings must be reviewed, verified, and approved by licensed professionals before construction.</Text>
+              <Text style={{ fontSize: 7, color: "#b91c1c", marginTop: 2 }}>Detailed MEP routing is not included. The provided fixture locations and load calculations are preliminary and must be verified and routed by a licensed MEP engineer in accordance with local building codes.</Text>
               <Text style={{ fontSize: 7, color: "#b91c1c", marginTop: 2 }}>Home Vision AI does not certify structural safety, code compliance, engineering adequacy, or construction suitability.</Text>
             </View>
           </View>
