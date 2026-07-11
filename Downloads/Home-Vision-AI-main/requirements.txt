@@ -1,0 +1,7 @@
+fastapi
+uvicorn[standard]
+pydantic
+thefuzz
+python-Levenshtein
+numpy
+spacy

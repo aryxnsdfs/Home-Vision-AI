@@ -1,0 +1,37 @@
+{
+  "version": 1,
+  "runtimeMaterialInjection": true,
+  "fallbackGeometryEnabled": true,
+  "assets": [
+    {
+      "id": "sofa",
+      "path": "/models/sofa.glb",
+      "category": "living",
+      "expectedSizeKb": 15
+    },
+    {
+      "id": "chair",
+      "path": "/models/chair.glb",
+      "category": "seating",
+      "expectedSizeKb": 12
+    },
+    {
+      "id": "bed",
+      "path": "/models/bed.glb",
+      "category": "bedroom",
+      "expectedSizeKb": 18
+    },
+    {
+      "id": "dining_table",
+      "path": "/models/dining_table.glb",
+      "category": "dining",
+      "expectedSizeKb": 14
+    },
+    {
+      "id": "lamp",
+      "path": "/models/lamp.glb",
+      "category": "lighting",
+      "expectedSizeKb": 10
+    }
+  ]
+}
