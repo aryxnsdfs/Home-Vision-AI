@@ -116,9 +116,12 @@ Output a strict JSON 'Program' listing the exact rooms to build, their minimum v
 
 ## CRITICAL RULES
 1. Do NOT calculate absolute coordinates. You are only defining the roster of rooms.
-2. ALWAYS include a 'corridor' if there are multiple rooms (minimum width 3.5ft).
-3. Ensure every bedroom connects to a bathroom.
-4. For connections, use intent 'open_flow' for open-plan areas (e.g., living to dining), and 'standard' for doors.
+2. NO DUPLICATES: Never generate more than ONE living_room or ONE dining_room unless the user explicitly requested multiple.
+3. ENTRANCE & CIRCULATION: Every home MUST have a 'living_room' acting as the main entrance, or a dedicated 'foyer' that connects to the living_room. ALWAYS include a 'corridor' if there are more than 3 rooms.
+4. ZONING & PRIVACY: Bedrooms MUST NOT connect directly to the living_room or dining_room. Bedrooms must connect to a 'corridor'.
+5. WET ZONES: Ensure every bedroom connects to a bathroom. Do not connect bathrooms directly to living rooms or dining rooms (use a corridor).
+6. VERTICAL CIRCULATION: If the prompt implies multiple floors (e.g. "duplex", "stairs", "two-story"), you MUST include a 'staircase' room.
+7. For connections, use intent 'open_flow' for open-plan areas (e.g., living to dining), and 'standard' for doors.
 """
 
 def generate_cultural_program(prompt: str, emit_fn: Callable = None) -> dict:

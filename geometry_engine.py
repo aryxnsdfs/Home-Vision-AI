@@ -141,16 +141,41 @@ class CPSolver:
                 
                 model.AddBoolOr([touch_left, touch_right, touch_above, touch_below])
             
-        # Optimization Objective: Pack rooms tightly to eliminate gaps
-        # By minimizing the sum of all x_end and z_end coordinates, the solver is forced to 
-        # push all rooms as close to the origin (0,0) as possible, acting like gravity
-        # and perfectly closing any arbitrary gaps.
+        # Architectural Objectives: Zoning, Clustering, and Packing
         if room_vars:
             obj_vars = []
+            
+            # 1. Soft Structural Alignment & Packing
+            # Pull everything towards origin to eliminate gaps
             for rv in room_vars.values():
-                # We minimize the distance of the far corners to pull everything tight
                 obj_vars.append(rv['x'] + rv['w'])
                 obj_vars.append(rv['z'] + rv['l'])
+                
+            # 2. Public vs Private Zoning
+            # Heavily penalize Z distance for public rooms (pull them to front entrance at z=0)
+            public_types = ['living_room', 'foyer', 'porch', 'entrance']
+            for rv in room_vars.values():
+                if rv['type'] in public_types:
+                    obj_vars.append(rv['z'] * 5) # Strong pull to z=0
+                    
+            # 3. Wet Zone Clustering
+            wet_rooms = [rv for rv in room_vars.values() if rv['type'] in ['kitchen', 'bathroom', 'laundry', 'toilet']]
+            if len(wet_rooms) > 1:
+                wet_min_x = model.NewIntVar(0, plot_w, 'wet_min_x')
+                wet_max_x = model.NewIntVar(0, plot_w, 'wet_max_x')
+                wet_min_z = model.NewIntVar(0, plot_l, 'wet_min_z')
+                wet_max_z = model.NewIntVar(0, plot_l, 'wet_max_z')
+                
+                for wrv in wet_rooms:
+                    model.Add(wet_min_x <= wrv['x'])
+                    model.Add(wet_max_x >= wrv['x'] + wrv['w'])
+                    model.Add(wet_min_z <= wrv['z'])
+                    model.Add(wet_max_z >= wrv['z'] + wrv['l'])
+                    
+                # Penalize the size of the wet bounding box (clusters them tightly)
+                obj_vars.append((wet_max_x - wet_min_x) * 3)
+                obj_vars.append((wet_max_z - wet_min_z) * 3)
+                
             model.Minimize(sum(obj_vars))
         
         solver = cp_model.CpSolver()
