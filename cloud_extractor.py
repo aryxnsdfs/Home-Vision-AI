@@ -464,7 +464,94 @@ Output ONLY valid JSON. No markdown code blocks."""
 # Backwards Compatible Wrappers for server.py
 # -------------------------------------------------------------
 def extract_keywords_groq(user_prompt: str, vocabulary: dict) -> Dict[str, Any]:
-    return QueryRouter.route(user_prompt, vocabulary)
+    result = QueryRouter.route(user_prompt, vocabulary)
+    
+    # Post-process to rigorously enforce deduplication and logic rules
+    prompt_lower = user_prompt.lower()
+    singleton_types = {'living_room', 'dining_room', 'kitchen', 'foyer'}
+    seen_types = set()
+    deduped_rooms = []
+    
+    target_rooms = result.get('target_rooms', [])
+    if isinstance(target_rooms, list):
+        for rtype in target_rooms:
+            if rtype in singleton_types:
+                # Allow duplicates only if explicitly requested
+                rtype_clean = rtype.replace('_', ' ')
+                has_multiple = any(f"{n} {rtype_clean}" in prompt_lower for n in ["2", "two", "3", "three", "multiple", "double"])
+                if not has_multiple and rtype in seen_types:
+                    continue # Strip hallucinated duplicate
+                seen_types.add(rtype)
+            deduped_rooms.append(rtype)
+            
+        # Ensure a master bedroom exists if bedrooms are present
+        if 'master_bedroom' not in deduped_rooms and 'bedroom' in deduped_rooms:
+            bed_idx = deduped_rooms.index('bedroom')
+            deduped_rooms[bed_idx] = 'master_bedroom'
+            
+        result['target_rooms'] = deduped_rooms
+        
+    return result
 
 def reason_modifications_deepseek(user_prompt: str, current_floorplan: dict) -> dict:
     return QueryRouter.route(user_prompt, {}, current_floorplan)
+
+def auto_wire_topology(room_types: list) -> list:
+    """Takes a flat list of room strings and returns a list of dictionaries with proper architectural connections."""
+    room_specs = [{"type": r, "connections": []} for r in room_types]
+    
+    def get_indices(rtype): return [i for i, rs in enumerate(room_specs) if rs['type'] == rtype]
+    
+    living_idx = get_indices("living_room")
+    dining_idx = get_indices("dining_room")
+    kitchen_idx = get_indices("kitchen")
+    master_idx = get_indices("master_bedroom")
+    bed_idx = get_indices("bedroom")
+    bath_idx = get_indices("bathroom")
+    toilet_idx = get_indices("toilet")
+    corridor_idx = get_indices("corridor") + get_indices("hallway")
+    
+    all_baths = bath_idx + toilet_idx
+    
+    # Core Public Zone Flow
+    if living_idx and dining_idx:
+        room_specs[living_idx[0]]['connections'].append({"target_room": "dining_room", "intent": "open_flow"})
+    if dining_idx and kitchen_idx:
+        room_specs[dining_idx[0]]['connections'].append({"target_room": "kitchen", "intent": "open_flow"})
+    elif living_idx and kitchen_idx:
+        room_specs[living_idx[0]]['connections'].append({"target_room": "kitchen", "intent": "open_flow"})
+        
+    # Wet Zone Attachments
+    if master_idx and all_baths:
+        room_specs[master_idx[0]]['connections'].append({"target_room": room_specs[all_baths[0]]['type'], "intent": "standard"})
+        all_baths.pop(0) # used one bath
+        
+    # If 2 beds and 1 bath left, make a shared bath or Jack & Jill
+    # But standard connectivity just requires they connect to a corridor that has the bath
+    
+    # Private Zone Flow
+    if corridor_idx:
+        corr_i = corridor_idx[0]
+        corr_type = room_specs[corr_i]['type']
+        
+        # Connect remaining beds and baths to the corridor
+        for bi in bed_idx:
+            room_specs[bi]['connections'].append({"target_room": corr_type, "intent": "standard"})
+        for bi in all_baths:
+            room_specs[bi]['connections'].append({"target_room": corr_type, "intent": "standard"})
+            
+        # Connect corridor to living or dining
+        if living_idx:
+            room_specs[corr_i]['connections'].append({"target_room": "living_room", "intent": "open_flow"})
+        elif dining_idx:
+            room_specs[corr_i]['connections'].append({"target_room": "dining_room", "intent": "open_flow"})
+    else:
+        # If no corridor, bedrooms must connect to living/dining (not ideal but mathematically necessary)
+        target = "living_room" if living_idx else ("dining_room" if dining_idx else None)
+        if target:
+            for bi in bed_idx:
+                room_specs[bi]['connections'].append({"target_room": target, "intent": "standard"})
+            for bi in all_baths:
+                room_specs[bi]['connections'].append({"target_room": target, "intent": "standard"})
+                
+    return room_specs

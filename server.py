@@ -2064,7 +2064,8 @@ def _stream_generate_work(req: "GenerateRequest", emit_fn: Callable) -> None:
                 if room_str in prompt_lower.replace("_", " ") or room_str.replace(" ", "") in prompt_lower.replace(" ", ""):
                     valid_rooms.append(r)
             if valid_rooms:
-                layout_params["rooms"] = [{"type": r.replace(" ", "_"), "confidence": 100} for r in valid_rooms]
+                from cloud_extractor import auto_wire_topology
+                layout_params["rooms"] = auto_wire_topology([r.replace(" ", "_") for r in valid_rooms])
 
             for k in ("bhk",):
                 pass  # already handled above
