@@ -1,0 +1,5 @@
+[
+  {"type": "Sofa", "width": 6.0, "length": 3.0, "affinity": "wall", "facing": "center"},
+  {"type": "TV Unit", "width": 4.0, "length": 1.5, "affinity": "wall", "facing": "center", "relationship": "faces_sofa"},
+  {"type": "Coffee Table", "width": 3.0, "length": 2.0, "affinity": "center"}
+]

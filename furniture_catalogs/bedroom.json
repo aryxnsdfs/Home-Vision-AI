@@ -1,0 +1,5 @@
+[
+  {"type": "Bed", "width": 5.0, "length": 6.5, "affinity": "wall", "facing": "center"},
+  {"type": "Wardrobe", "width": 4.0, "length": 2.0, "affinity": "wall", "facing": "center"},
+  {"type": "Nightstand", "width": 1.5, "length": 1.5, "affinity": "wall", "relationship": "next_to_bed"}
+]

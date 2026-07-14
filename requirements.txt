@@ -1,0 +1,16 @@
+fastapi>=0.100.0
+uvicorn[standard]>=0.22.0
+pydantic>=2.0.0
+thefuzz
+python-Levenshtein
+numpy
+pandas
+spacy
+celery>=5.3.0
+redis>=5.0.0
+requests
+python-dotenv
+starlette
+google-genai
+Pillow
+ortools>=9.7.0

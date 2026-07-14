@@ -1,0 +1,48 @@
+@import url("https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap");
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  color-scheme: dark;
+  background: #05070a;
+  font-family: Inter, ui-sans-serif, system-ui, sans-serif;
+  text-rendering: geometricPrecision;
+}
+
+body {
+  margin: 0;
+  min-width: 320px;
+  min-height: 100vh;
+  overflow: hidden;
+  background: #05070a;
+  color: #f8fafc;
+}
+
+button,
+input,
+textarea,
+select {
+  font: inherit;
+}
+
+.glass {
+  background: rgba(15, 23, 42, 0.76);
+  border: 1px solid rgba(148, 163, 184, 0.16);
+  box-shadow: 0 18px 55px rgba(0, 0, 0, 0.32);
+  backdrop-filter: blur(18px);
+}
+
+.thin-scrollbar {
+  scrollbar-width: thin;
+  scrollbar-color: rgba(100, 116, 139, 0.5) transparent;
+}
+
+.thin-scrollbar::-webkit-scrollbar {
+  width: 8px;
+}
+
+.thin-scrollbar::-webkit-scrollbar-thumb {
+  background: rgba(100, 116, 139, 0.42);
+  border-radius: 999px;
+}

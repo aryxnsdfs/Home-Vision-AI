@@ -1,0 +1,5 @@
+[
+  {"type": "Countertop", "width": 6.0, "length": 2.0, "affinity": "wall", "facing": "center"},
+  {"type": "Fridge", "width": 2.5, "length": 2.5, "affinity": "wall", "facing": "center"},
+  {"type": "Stove", "width": 2.5, "length": 2.5, "affinity": "wall", "facing": "center"}
+]
