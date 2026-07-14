@@ -2293,29 +2293,8 @@ def _stream_generate_work(req: "GenerateRequest", emit_fn: Callable) -> None:
         # --- ZERO-STATIC ENGINE: Gemini Master Blueprint ---
         master_bp = None
         gemini_result = None
-        try:
-            from cloud_extractor import generate_validated_blueprint
-            gemini_result = generate_validated_blueprint(
-                req.prompt, plot_w, plot_l, floors,
-                facing=_merged_indian.get("facing", ""),
-                max_retries=0,
-                emit_fn=lambda msg: emit(msg.get("stage", 3), msg.get("label", ""), msg.get("substage", "")),
-            )
-            all_bp = gemini_result.get("master_blueprint", [])
-            if all_bp:
-                master_bp = all_bp
-                # Extract floor-specific blueprints
-                bp0 = [b for b in all_bp if b.get("floor_number", 0) == 0]
-                bp1 = [b for b in all_bp if b.get("floor_number", 0) == 1]
-                if not bp0:
-                    bp0 = all_bp  # If no floor_number specified, assume all are ground floor
-                logger.info(f"[ZERO-STATIC] Gemini blueprint accepted: {len(bp0)} ground floor rooms, {len(bp1)} first floor rooms")
-            else:
-                logger.warning("[ZERO-STATIC] Gemini returned empty blueprint, falling back to templates")
-        except Exception as e:
-            logger.warning(f"[ZERO-STATIC] Gemini blueprint failed, falling back to templates: {e}")
-            emit(3, "Generating Room Layout...", "Falling back to template engine...")
-            bp0 = None
+        bp0 = None
+        logger.info("[ZERO-STATIC] Bypassing Gemini Stage 2 coordinates (slow/redundant). Routing directly to high-speed CP Solver.")
 
         generated_nodes_0 = engine.generate(
             floor_0_rooms,
