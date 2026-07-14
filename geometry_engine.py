@@ -36,6 +36,14 @@ class CPSolver:
             r_id = room.get("id", f"{r_type}_{idx}")
             
             min_dim = int(ROOM_MINIMUMS.get(r_type, _DEFAULT_MIN)["min_dim"] * scale)
+            # Enforce strict minimum widths per the architectural spec
+            if "bedroom" in r_type:
+                min_dim = max(min_dim, int(9.0 * scale))
+            elif "kitchen" in r_type:
+                min_dim = max(min_dim, int(8.0 * scale))
+            elif "bath" in r_type or "toilet" in r_type:
+                min_dim = max(min_dim, int(5.0 * scale))
+                
             min_area_ft = ROOM_MINIMUMS.get(r_type, _DEFAULT_MIN)["area"]
             
             x = model.NewIntVar(0, plot_w - min_dim, f'x_{r_id}')
@@ -43,6 +51,11 @@ class CPSolver:
             
             w = model.NewIntVar(min_dim, plot_w, f'w_{r_id}')
             l = model.NewIntVar(min_dim, plot_l, f'l_{r_id}')
+            
+            # Aspect ratio constraint: 0.65 <= w/l <= 1.6
+            if "corridor" not in r_type:
+                model.Add(100 * w >= 65 * l)
+                model.Add(10 * w <= 16 * l)
             
             x_end = model.NewIntVar(min_dim, plot_w, f'x_end_{r_id}')
             z_end = model.NewIntVar(min_dim, plot_l, f'z_end_{r_id}')
@@ -145,11 +158,26 @@ class CPSolver:
         if room_vars:
             obj_vars = []
             
-            # 1. Soft Structural Alignment & Packing
-            # Pull everything towards origin to eliminate gaps
+            # 1. Soft Structural Alignment & Packing + Room Expansion
+            # We pull x and z to origin to pack rooms tightly.
+            # We subtract a heavily weighted width and length to maximize room utility instead of shrinking them.
             for rv in room_vars.values():
-                obj_vars.append(rv['x'] + rv['w'])
-                obj_vars.append(rv['z'] + rv['l'])
+                t = rv['type']
+                weight = 1
+                if 'living' in t: weight = 10
+                elif 'master' in t: weight = 9
+                elif 'dining' in t: weight = 8
+                elif 'kitchen' in t: weight = 7
+                elif 'bed' in t: weight = 6
+                elif 'bath' in t or 'toilet' in t: weight = 3
+                elif 'corridor' in t: weight = -5 # Heavily penalize corridor size
+                
+                # Pull to origin
+                obj_vars.append(rv['x'])
+                obj_vars.append(rv['z'])
+                # Expand size
+                obj_vars.append(-weight * rv['w'])
+                obj_vars.append(-weight * rv['l'])
                 
             # 2. Public vs Private Zoning
             # Heavily penalize Z distance for public rooms (pull them to front entrance at z=0)

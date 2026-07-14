@@ -116,7 +116,7 @@ Output a strict JSON 'Program' listing the exact rooms to build, their minimum v
 
 ## CRITICAL RULES
 1. Do NOT calculate absolute coordinates. You are only defining the roster of rooms.
-2. NO DUPLICATES: Never generate more than ONE living_room or ONE dining_room unless the user explicitly requested multiple.
+2. EXACT COUNT HONOURING: You MUST strictly behave as a constraint extractor. If the user explicitly asks for "3 bathrooms", you MUST output exactly 3 bathroom nodes. If they ask for a "dining room", you MUST include one. Do NOT omit requested rooms under any circumstance.
 3. ENTRANCE & CIRCULATION: Every home MUST have a 'living_room' acting as the main entrance, or a dedicated 'foyer' that connects to the living_room. ALWAYS include a 'corridor' if there are more than 3 rooms.
 4. ZONING & PRIVACY: Bedrooms MUST NOT connect directly to the living_room or dining_room. Bedrooms must connect to a 'corridor'.
 5. WET ZONES: Ensure every bedroom connects to a bathroom. Do not connect bathrooms directly to living rooms or dining rooms (use a corridor).
