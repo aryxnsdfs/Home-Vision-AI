@@ -198,35 +198,41 @@ class CPSolver:
                 obj_vars.append(-weight * rv['w'])
                 obj_vars.append(-weight * rv['l'])
                 
-            # 2. Strict Front/Middle/Rear Structural Zoning
-            front_types = ['living_room', 'foyer', 'dining_room', 'kitchen', 'porch', 'entrance']
-            # middle_types = ['corridor', 'hallway', 'powder_room'] float naturally
-            rear_types = ['bedroom', 'master_bedroom']
-            
+            # --- V4 MACRO ZONAL ARCHITECTURE ---
+            # Group rooms by zone
+            zones = {"public": [], "private": [], "service": []}
             for rv in room_vars.values():
-                t = rv['type']
-                if t in front_types:
-                    obj_vars.append(rv['z'] * 15) # Extreme pull to front (z=0)
-                elif t in rear_types:
-                    obj_vars.append(-rv['z'] * 15) # Extreme push to rear (z=max)
+                t = rv['type'].lower()
+                if t in ['living_room', 'foyer', 'dining_room', 'kitchen', 'porch', 'entrance']:
+                    zones["public"].append(rv)
+                elif t in ['master_bedroom', 'bedroom', 'closet']:
+                    zones["private"].append(rv)
+                elif t in ['bathroom', 'toilet', 'utility', 'laundry', 'store']:
+                    zones["service"].append(rv)
                     
-            # 3. Wet Zone Clustering
-            wet_rooms = [rv for rv in room_vars.values() if rv['type'] in ['kitchen', 'bathroom', 'laundry', 'toilet']]
-            if len(wet_rooms) > 1:
-                wet_min_x = model.NewIntVar(0, plot_w, 'wet_min_x')
-                wet_max_x = model.NewIntVar(0, plot_w, 'wet_max_x')
-                wet_min_z = model.NewIntVar(0, plot_l, 'wet_min_z')
-                wet_max_z = model.NewIntVar(0, plot_l, 'wet_max_z')
+            # 1. Macro-Zone Bounding Boxes (Minimize area to force clustering & wall alignment)
+            for z_name, z_rooms in zones.items():
+                if not z_rooms: continue
+                z_min_x = model.NewIntVar(0, plot_w, f'{z_name}_min_x')
+                z_max_x = model.NewIntVar(0, plot_w, f'{z_name}_max_x')
+                z_min_z = model.NewIntVar(0, plot_l, f'{z_name}_min_z')
+                z_max_z = model.NewIntVar(0, plot_l, f'{z_name}_max_z')
                 
-                for wrv in wet_rooms:
-                    model.Add(wet_min_x <= wrv['x'])
-                    model.Add(wet_max_x >= wrv['x'] + wrv['w'])
-                    model.Add(wet_min_z <= wrv['z'])
-                    model.Add(wet_max_z >= wrv['z'] + wrv['l'])
+                for rv in z_rooms:
+                    model.Add(z_min_x <= rv['x'])
+                    model.Add(z_max_x >= rv['x'] + rv['w'])
+                    model.Add(z_min_z <= rv['z'])
+                    model.Add(z_max_z >= rv['z'] + rv['l'])
                     
-                # Penalize the size of the wet bounding box (clusters them tightly)
-                obj_vars.append((wet_max_x - wet_min_x) * 3)
-                obj_vars.append((wet_max_z - wet_min_z) * 3)
+                # Penalize the bounding box to cluster the zone tightly (Soft constraint for Alignment/Symmetry)
+                obj_vars.append((z_max_x - z_min_x) * 4)
+                obj_vars.append((z_max_z - z_min_z) * 4)
+                
+                # 2. Zonal Placement (Public at front, Private at rear)
+                if z_name == "public":
+                    obj_vars.append(z_min_z * 20) # Pull Public Zone to Entrance (z=0)
+                elif z_name == "private":
+                    obj_vars.append(-z_max_z * 20) # Push Private Zone to Rear (z=plot_l)
                 
             # 4. Weighted Movement Graph Optimization (Manhattan Distances)
             # Minimize walking distance between topologically connected rooms
