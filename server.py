@@ -2059,9 +2059,21 @@ def _stream_generate_work(req: "GenerateRequest", emit_fn: Callable) -> None:
                 layout_params["bhk"] = slm_result["bhk"]
             prompt_lower = req.prompt.lower()
             valid_rooms: List[Dict] = []
+            
+            # Phase 1: Aggressive Deduplication
+            singleton_types = {'living_room', 'dining_room', 'kitchen', 'foyer'}
+            seen_types = set()
+            
             for r in slm_result.get("target_rooms", []):
                 room_str = r.lower().replace("_", " ")
                 if room_str in prompt_lower.replace("_", " ") or room_str.replace(" ", "") in prompt_lower.replace(" ", ""):
+                    r_clean = r.replace(" ", "_").lower()
+                    if r_clean in singleton_types:
+                        has_multiple = any(f"{n} {room_str}" in prompt_lower for n in ["2", "two", "3", "three", "multiple", "double"])
+                        if not has_multiple and r_clean in seen_types:
+                            logger.warning(f"[PHASE 1] Stripped hallucinated duplicate room: {r_clean}")
+                            continue
+                        seen_types.add(r_clean)
                     valid_rooms.append(r)
             if valid_rooms:
                 from cloud_extractor import auto_wire_topology

@@ -521,6 +521,24 @@ class GeometryValidator:
                 if _rooms_adjacent(boxes[i], boxes[j]):
                     adjacency[i].append(j)
                     adjacency[j].append(i)
+                    
+        # --- PHASE 4: FUNCTIONAL FORBIDDEN ADJACENCY ---
+        for i in range(n):
+            for j in adjacency[i]:
+                if j <= i: continue
+                rt1 = boxes[i].label.lower()
+                rt2 = boxes[j].label.lower()
+                
+                is_bath1 = "bath" in rt1 or "toilet" in rt1
+                is_bath2 = "bath" in rt2 or "toilet" in rt2
+                is_food1 = "kitchen" in rt1 or "dining" in rt1
+                is_food2 = "kitchen" in rt2 or "dining" in rt2
+                
+                if (is_bath1 and is_food2) or (is_bath2 and is_food1):
+                    msg = f"FORBIDDEN ADJACENCY: {boxes[i].label} cannot share a physical wall with {boxes[j].label} due to hygiene/vastu rules."
+                    logger.warning(msg)
+                    result.errors.append(msg)
+                    result.is_valid = False
 
         # 2. Build a door-connected graph: adjacent rooms with a connecting
         #    door on the shared boundary.
@@ -610,9 +628,10 @@ class GeometryValidator:
                         q.append((nb, path + [nb]))
             return None
             
-        def is_private(idx):
+        def is_passage_allowed(idx):
             rt = blueprint[idx].get("room_type", "").lower()
-            return "bed" in rt or "bath" in rt or "toilet" in rt or "closet" in rt
+            # Only high-traffic/movement rooms can act as passages for general flow
+            return any(p in rt for p in ['entrance', 'hallway', 'corridor', 'living', 'foyer'])
 
         living_idx = next((i for i, r in enumerate(blueprint) if "living" in r.get("room_type", "").lower()), None)
         kitchen_idx = next((i for i, r in enumerate(blueprint) if "kitchen" in r.get("room_type", "").lower()), None)
@@ -624,8 +643,8 @@ class GeometryValidator:
             path = bfs_path(living_idx, "bath")
             if path:
                 for node in path[1:-1]:
-                    if is_private(node):
-                        msg = f"PERSONA ERROR (Guest): Path from Living to Bath passes through private room {boxes[node].label}."
+                    if not is_passage_allowed(node):
+                        msg = f"PERSONA ERROR (Guest): Path from Living to Bath passes through non-passage room {boxes[node].label}."
                         logger.warning(msg)
                         result.errors.append(msg)
                         result.is_valid = False
@@ -636,8 +655,8 @@ class GeometryValidator:
                 path = bfs_path(b_idx, "kitchen")
                 if path:
                     for node in path[1:-1]:
-                        if is_private(node):
-                            msg = f"PERSONA ERROR (Resident): Path from {boxes[b_idx].label} to Kitchen passes through another private room {boxes[node].label}."
+                        if not is_passage_allowed(node):
+                            msg = f"PERSONA ERROR (Resident): Path from {boxes[b_idx].label} to Kitchen passes through non-passage room {boxes[node].label}."
                             logger.warning(msg)
                             result.errors.append(msg)
                             result.is_valid = False
@@ -653,14 +672,14 @@ class GeometryValidator:
             
             if path_kd:
                 for node in path_kd[1:-1]:
-                    if is_private(node):
-                        msg = f"PERSONA ERROR (Parent): Path from Kitchen to Dining goes through private {boxes[node].label}."
+                    if not is_passage_allowed(node):
+                        msg = f"PERSONA ERROR (Parent): Path from Kitchen to Dining goes through non-passage {boxes[node].label}."
                         result.errors.append(msg)
                         result.is_valid = False
             if path_dl:
                 for node in path_dl[1:-1]:
-                    if is_private(node):
-                        msg = f"PERSONA ERROR (Parent): Path from Dining to Living goes through private {boxes[node].label}."
+                    if not is_passage_allowed(node):
+                        msg = f"PERSONA ERROR (Parent): Path from Dining to Living goes through non-passage {boxes[node].label}."
                         result.errors.append(msg)
                         result.is_valid = False
 
@@ -669,8 +688,8 @@ class GeometryValidator:
             path_bath = bfs_path(b_idx, "bath")
             if path_bath:
                 for node in path_bath[1:-1]:
-                    if is_private(node) and "bath" not in blueprint[node].get("room_type", "").lower():
-                        msg = f"PERSONA ERROR (Laundry): Path from {boxes[b_idx].label} to Bath goes through another private room {boxes[node].label}."
+                    if not is_passage_allowed(node) and "bath" not in blueprint[node].get("room_type", "").lower():
+                        msg = f"PERSONA ERROR (Laundry): Path from {boxes[b_idx].label} to Bath goes through non-passage room {boxes[node].label}."
                         logger.warning(msg)
                         result.errors.append(msg)
                         result.is_valid = False

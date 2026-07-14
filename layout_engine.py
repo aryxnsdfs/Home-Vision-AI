@@ -1409,11 +1409,19 @@ class AdjacencyResolver:
                 if is_r1_bath and any(d for d in r1.doors): continue
                 if is_r2_bath and any(d for d in r2.doors): continue
                 
+                # --- PHASE 5: DETERMINISTIC DOOR PLANNER ---
+                is_vert = w["orientation"] == "vertical"
+                wall_len = (w["z2"] - w["z1"]) if is_vert else (w["x2"] - w["x1"])
+                door_w = 2.5 if (is_r1_bath or is_r2_bath) else 3.0
+                
+                # Rule: 3x3 Landing + Corner Clearance (needs at least door_w + 1ft buffer)
+                if wall_len < door_w + 1.0:
+                    logger.warning(f"[DOOR PLANNER] Shared wall {r1_id}-{r2_id} is too short ({wall_len:.1f}ft) for a {door_w}ft door.")
+                    continue # Skip placement; validator will fail layout if required
+                
                 # Calculate center of wall
                 cx = (w["x1"] + w["x2"]) / 2.0
                 cz = (w["z1"] + w["z2"]) / 2.0
-                
-                door_w = 2.5 if (is_r1_bath or is_r2_bath) else 3.5
                 
                 # Convert global center to room-relative center
                 d1_x, d1_z = cx - r1.rect.x, cz - r1.rect.z
@@ -1423,13 +1431,13 @@ class AdjacencyResolver:
                     if is_vert: return "west" if rel_x < room.rect.width / 2.0 else "east"
                     return "north" if rel_z < room.rect.length / 2.0 else "south"
                     
-                is_vert = w["orientation"] == "vertical"
                 face1 = get_face(d1_x, d1_z, r1, is_vert)
                 face2 = get_face(d2_x, d2_z, r2, is_vert)
                 
                 r1.doors.append(Door(x=d1_x, z=d1_z, width=door_w, wall_orientation=face1))
                 r2.doors.append(Door(x=d2_x, z=d2_z, width=door_w, wall_orientation=face2))
                 
+                logger.info(f"    Placed door between '{r1_id}' and '{r2_id}'")
                 placed_doors_between.add(pair)
                 logger.info(f"    Placed door between '{r1.name}' and '{r2.name}'")
 

@@ -578,5 +578,15 @@ def auto_wire_topology(room_types: list) -> list:
     # Common bath living connection (Medium Priority)
     if all_baths and living_idx:
         add_conn(living_idx[0], room_specs[all_baths[-1]]['type'], "standard", 4)
+        
+    # Phase 2: Assign Room Roles
+    for r in room_specs:
+        rt = r['type'].lower()
+        if rt in ['entrance', 'hallway', 'corridor', 'living_room', 'foyer']:
+            r['role'] = {'traffic': 'high', 'can_be_passage': True}
+        elif rt in ['dining_room', 'kitchen', 'utility']:
+            r['role'] = {'traffic': 'medium', 'can_be_passage': False}
+        else:
+            r['role'] = {'traffic': 'low', 'can_be_passage': False}
                 
     return room_specs
