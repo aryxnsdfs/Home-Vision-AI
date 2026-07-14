@@ -141,8 +141,8 @@ class GeometryValidator:
             }
             for d in r.doors:
                 room_dict["doors"].append({
-                    "position_x": d.x,
-                    "position_z": d.z,
+                    "position_x": d.x + r.rect.x,
+                    "position_z": d.z + r.rect.z,
                     "width": d.width,
                     "wall_orientation": getattr(d, "wall_orientation", "north")
                 })
