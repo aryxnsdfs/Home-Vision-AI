@@ -146,7 +146,27 @@ def generate_cultural_program(prompt: str, emit_fn: Callable = None) -> dict:
         ),
     )
     import json
-    return json.loads(response.text)
+    program = json.loads(response.text)
+    
+    # Post-process to strictly enforce deduplication (LLMs often hallucinate extras)
+    prompt_lower = prompt.lower()
+    singleton_types = ['living_room', 'dining_room', 'kitchen', 'foyer']
+    seen_types = set()
+    deduped_rooms = []
+    
+    for r in program.get('rooms', []):
+        rtype = r.get('type')
+        if rtype in singleton_types:
+            # Check if user explicitly asked for multiple of this room type
+            rtype_clean = rtype.replace('_', ' ')
+            has_multiple = any(f"{n} {rtype_clean}" in prompt_lower for n in ["2", "two", "3", "three", "multiple", "double"])
+            if not has_multiple and rtype in seen_types:
+                continue # Skip duplicate
+            seen_types.add(rtype)
+        deduped_rooms.append(r)
+        
+    program['rooms'] = deduped_rooms
+    return program
 
 # 2. Chain-of-Thought Architect Prompt
 # ---------------------------------------------------------------------------

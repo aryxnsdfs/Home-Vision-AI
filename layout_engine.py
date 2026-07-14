@@ -1381,7 +1381,7 @@ class AdjacencyResolver:
         placed_doors_between = set()
         
         for w in walls:
-            if w.get("is_shared") and not w.get("suppressed"):
+            if w.get("is_shared"):
                 r1_id, r2_id = w["room_ids"][:2]
                 pair = tuple(sorted([r1_id, r2_id]))
                 if pair in placed_doors_between:
