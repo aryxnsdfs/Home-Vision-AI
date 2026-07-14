@@ -56,6 +56,13 @@ class CPSolver:
             if "corridor" not in r_type:
                 model.Add(100 * w >= 65 * l)
                 model.Add(10 * w <= 16 * l)
+            else:
+                # Corridor must be narrow (width <= 5 OR length <= 5)
+                b1 = model.NewBoolVar(f'corr_w_narrow_{r_id}')
+                b2 = model.NewBoolVar(f'corr_l_narrow_{r_id}')
+                model.Add(w <= int(5.0 * scale)).OnlyEnforceIf(b1)
+                model.Add(l <= int(5.0 * scale)).OnlyEnforceIf(b2)
+                model.AddBoolOr([b1, b2])
             
             x_end = model.NewIntVar(min_dim, plot_w, f'x_end_{r_id}')
             z_end = model.NewIntVar(min_dim, plot_l, f'z_end_{r_id}')
@@ -81,6 +88,18 @@ class CPSolver:
             x_intervals = [rv['x_interval'] for rv in room_vars.values()]
             z_intervals = [rv['z_interval'] for rv in room_vars.values()]
             model.AddNoOverlap2D(x_intervals, z_intervals)
+            
+            # Constraint: Master Bedroom Area >= Other Bedrooms Area
+            master_rvs = [rv for rv in room_vars.values() if rv['type'] == 'master_bedroom']
+            bed_rvs = [rv for rv in room_vars.values() if rv['type'] == 'bedroom']
+            if master_rvs and bed_rvs:
+                mrv = master_rvs[0]
+                m_area = model.NewIntVar(0, plot_w * plot_l, 'm_area')
+                model.AddMultiplicationEquality(m_area, [mrv['w'], mrv['l']])
+                for i, brv in enumerate(bed_rvs):
+                    b_area = model.NewIntVar(0, plot_w * plot_l, f'b_area_{i}')
+                    model.AddMultiplicationEquality(b_area, [brv['w'], brv['l']])
+                    model.Add(m_area >= b_area)
             
         # Constraint: Adjacency (Rooms must touch if connected)
         # We also want to ensure the graph is fully connected (all rooms touch the main cluster)
@@ -179,12 +198,17 @@ class CPSolver:
                 obj_vars.append(-weight * rv['w'])
                 obj_vars.append(-weight * rv['l'])
                 
-            # 2. Public vs Private Zoning
-            # Heavily penalize Z distance for public rooms (pull them to front entrance at z=0)
-            public_types = ['living_room', 'foyer', 'porch', 'entrance']
+            # 2. Strict Front/Middle/Rear Structural Zoning
+            front_types = ['living_room', 'foyer', 'dining_room', 'kitchen', 'porch', 'entrance']
+            # middle_types = ['corridor', 'hallway', 'powder_room'] float naturally
+            rear_types = ['bedroom', 'master_bedroom']
+            
             for rv in room_vars.values():
-                if rv['type'] in public_types:
-                    obj_vars.append(rv['z'] * 5) # Strong pull to z=0
+                t = rv['type']
+                if t in front_types:
+                    obj_vars.append(rv['z'] * 15) # Extreme pull to front (z=0)
+                elif t in rear_types:
+                    obj_vars.append(-rv['z'] * 15) # Extreme push to rear (z=max)
                     
             # 3. Wet Zone Clustering
             wet_rooms = [rv for rv in room_vars.values() if rv['type'] in ['kitchen', 'bathroom', 'laundry', 'toilet']]

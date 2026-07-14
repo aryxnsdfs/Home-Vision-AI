@@ -137,7 +137,8 @@ class GeometryValidator:
             
             room_dict = {
                 "room_type": r.type,
-                "doors": []
+                "doors": [],
+                "windows": []
             }
             for d in r.doors:
                 room_dict["doors"].append({
@@ -145,6 +146,11 @@ class GeometryValidator:
                     "position_z": d.z + r.rect.z,
                     "width": d.width,
                     "wall_orientation": getattr(d, "wall_orientation", "north")
+                })
+            for w in r.windows:
+                room_dict["windows"].append({
+                    "position_x": w.x + r.rect.x,
+                    "position_z": w.z + r.rect.z
                 })
             blueprint.append(room_dict)
 
@@ -507,16 +513,59 @@ class GeometryValidator:
             if isinstance(features, str) and "main_entrance" in features:
                 start = idx
                 break
+            # Also try to start from living room or foyer
+            if "living" in room.get("room_type", "").lower() or "foyer" in room.get("room_type", "").lower():
+                start = idx
 
         visited = set()
         queue: deque[int] = deque([start])
         visited.add(start)
+        
+        bfs_tree = {} # Parent -> children
+        
         while queue:
             curr = queue.popleft()
+            bfs_tree[curr] = []
             for nb in door_connected[curr]:
                 if nb not in visited:
                     visited.add(nb)
                     queue.append(nb)
+                    bfs_tree[curr].append(nb)
+
+        # Circulation Test: Bedrooms cannot be passage rooms
+        for curr, children in bfs_tree.items():
+            curr_type = blueprint[curr].get("room_type", "").lower()
+            if "bed" in curr_type:
+                for child in children:
+                    child_type = blueprint[child].get("room_type", "").lower()
+                    if "bath" not in child_type and "toilet" not in child_type and "closet" not in child_type and "balcony" not in child_type:
+                        msg = f"CIRCULATION ERROR: Bedroom {boxes[curr].label} is being used as a passage to reach {boxes[child].label}!"
+                        logger.warning(msg)
+                        result.errors.append(msg)
+                        result.is_valid = False
+
+        # Door & Window Verification
+        for idx, room in enumerate(blueprint):
+            r_type = room.get("room_type", "").lower()
+            num_doors = len(room.get("doors", []))
+            num_windows = len(room.get("windows", [])) # Will need to pass windows to blueprint
+            
+            if num_doors == 0 and "corridor" not in r_type:
+                msg = f"DOOR ERROR: {boxes[idx].label} has no doors!"
+                logger.warning(msg)
+                result.errors.append(msg)
+                result.is_valid = False
+                
+            # If we passed windows in the blueprint dictionary
+            if "windows" in room:
+                if "bed" in r_type and num_windows == 0:
+                    msg = f"WINDOW ERROR: {boxes[idx].label} has no windows!"
+                    result.errors.append(msg)
+                    result.is_valid = False
+                elif ("bath" in r_type or "toilet" in r_type or "kitchen" in r_type) and num_windows == 0:
+                    msg = f"VENTILATION ERROR: {boxes[idx].label} has no ventilation!"
+                    result.errors.append(msg)
+                    result.is_valid = False
 
         # 4. Report unreachable rooms.
         for idx in range(n):
