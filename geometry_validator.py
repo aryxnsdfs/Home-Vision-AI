@@ -153,6 +153,36 @@ class GeometryValidator:
                     "position_z": w.z + r.rect.z
                 })
             blueprint.append(room_dict)
+            
+            # --- FURNITURE FIT VALIDATION ---
+            rt = r.type.lower()
+            min_dim = min(r.rect.width, r.rect.length)
+            area = r.rect.width * r.rect.length
+            
+            if "bed" in rt:
+                if min_dim < 9.0 or area < 100:
+                    msg = f"FURNITURE ERROR: {r.id} ({r.rect.width}x{r.rect.length}) is too small to fit a standard bed with walking clearance."
+                    logger.warning(msg)
+                    result.errors.append(msg)
+                    result.is_valid = False
+            elif "kitchen" in rt:
+                if min_dim < 7.5 or area < 64:
+                    msg = f"FURNITURE ERROR: {r.id} is too small for a functional kitchen work triangle."
+                    logger.warning(msg)
+                    result.errors.append(msg)
+                    result.is_valid = False
+            elif "living" in rt:
+                if min_dim < 10.0 or area < 120:
+                    msg = f"FURNITURE ERROR: {r.id} is too small for a functional living room setup."
+                    logger.warning(msg)
+                    result.errors.append(msg)
+                    result.is_valid = False
+            elif "dining" in rt:
+                if min_dim < 8.0 or area < 80:
+                    msg = f"FURNITURE ERROR: {r.id} cannot fit a functional dining table."
+                    logger.warning(msg)
+                    result.errors.append(msg)
+                    result.is_valid = False
 
         GeometryValidator._check_gaps_and_adjacency(boxes, result)
         GeometryValidator._check_connectivity(blueprint, boxes, result)
@@ -548,7 +578,7 @@ class GeometryValidator:
         for idx, room in enumerate(blueprint):
             r_type = room.get("room_type", "").lower()
             num_doors = len(room.get("doors", []))
-            num_windows = len(room.get("windows", [])) # Will need to pass windows to blueprint
+            num_windows = len(room.get("windows", []))
             
             if num_doors == 0 and "corridor" not in r_type:
                 msg = f"DOOR ERROR: {boxes[idx].label} has no doors!"
@@ -556,7 +586,6 @@ class GeometryValidator:
                 result.errors.append(msg)
                 result.is_valid = False
                 
-            # If we passed windows in the blueprint dictionary
             if "windows" in room:
                 if "bed" in r_type and num_windows == 0:
                     msg = f"WINDOW ERROR: {boxes[idx].label} has no windows!"
@@ -566,6 +595,85 @@ class GeometryValidator:
                     msg = f"VENTILATION ERROR: {boxes[idx].label} has no ventilation!"
                     result.errors.append(msg)
                     result.is_valid = False
+
+        # --- PERSONA-BASED BFS PATHFINDING ---
+        def bfs_path(start_idx, target_type):
+            q = deque([(start_idx, [start_idx])])
+            visited_bfs = {start_idx}
+            while q:
+                curr, path = q.popleft()
+                if target_type in blueprint[curr].get("room_type", "").lower():
+                    return path
+                for nb in door_connected[curr]:
+                    if nb not in visited_bfs:
+                        visited_bfs.add(nb)
+                        q.append((nb, path + [nb]))
+            return None
+            
+        def is_private(idx):
+            rt = blueprint[idx].get("room_type", "").lower()
+            return "bed" in rt or "bath" in rt or "toilet" in rt or "closet" in rt
+
+        living_idx = next((i for i, r in enumerate(blueprint) if "living" in r.get("room_type", "").lower()), None)
+        kitchen_idx = next((i for i, r in enumerate(blueprint) if "kitchen" in r.get("room_type", "").lower()), None)
+        bed_indices = [i for i, r in enumerate(blueprint) if "bed" in r.get("room_type", "").lower()]
+        bath_indices = [i for i, r in enumerate(blueprint) if "bath" in r.get("room_type", "").lower() or "toilet" in r.get("room_type", "").lower()]
+        
+        # 1. Guest: Living -> Common Bath
+        if living_idx is not None and bath_indices:
+            path = bfs_path(living_idx, "bath")
+            if path:
+                for node in path[1:-1]:
+                    if is_private(node):
+                        msg = f"PERSONA ERROR (Guest): Path from Living to Bath passes through private room {boxes[node].label}."
+                        logger.warning(msg)
+                        result.errors.append(msg)
+                        result.is_valid = False
+                        
+        # 2. Resident: Bedroom -> Kitchen
+        if kitchen_idx is not None:
+            for b_idx in bed_indices:
+                path = bfs_path(b_idx, "kitchen")
+                if path:
+                    for node in path[1:-1]:
+                        if is_private(node):
+                            msg = f"PERSONA ERROR (Resident): Path from {boxes[b_idx].label} to Kitchen passes through another private room {boxes[node].label}."
+                            logger.warning(msg)
+                            result.errors.append(msg)
+                            result.is_valid = False
+                            
+        # 3. Parent: Kitchen -> Dining -> Living
+        # Ensure direct open flow between them without going through private areas.
+        dining_idx = next((i for i, r in enumerate(blueprint) if "dining" in r.get("room_type", "").lower()), None)
+        if kitchen_idx is not None and dining_idx is not None and living_idx is not None:
+            # path from Kitchen to Dining
+            path_kd = bfs_path(kitchen_idx, "dining")
+            # path from Dining to Living
+            path_dl = bfs_path(dining_idx, "living")
+            
+            if path_kd:
+                for node in path_kd[1:-1]:
+                    if is_private(node):
+                        msg = f"PERSONA ERROR (Parent): Path from Kitchen to Dining goes through private {boxes[node].label}."
+                        result.errors.append(msg)
+                        result.is_valid = False
+            if path_dl:
+                for node in path_dl[1:-1]:
+                    if is_private(node):
+                        msg = f"PERSONA ERROR (Parent): Path from Dining to Living goes through private {boxes[node].label}."
+                        result.errors.append(msg)
+                        result.is_valid = False
+
+        # 4. Laundry Route: Bedroom -> Bathroom
+        for b_idx in bed_indices:
+            path_bath = bfs_path(b_idx, "bath")
+            if path_bath:
+                for node in path_bath[1:-1]:
+                    if is_private(node) and "bath" not in blueprint[node].get("room_type", "").lower():
+                        msg = f"PERSONA ERROR (Laundry): Path from {boxes[b_idx].label} to Bath goes through another private room {boxes[node].label}."
+                        logger.warning(msg)
+                        result.errors.append(msg)
+                        result.is_valid = False
 
         # 4. Report unreachable rooms.
         for idx in range(n):

@@ -509,26 +509,42 @@ def auto_wire_topology(room_types: list) -> list:
     bed_idx = get_indices("bedroom")
     bath_idx = get_indices("bathroom")
     toilet_idx = get_indices("toilet")
-    corridor_idx = get_indices("corridor") + get_indices("hallway")
+    utility_idx = get_indices("utility")
+    corridor_idx = get_indices("corridor")
+    hall_idx = get_indices("hallway")
     
     all_baths = bath_idx + toilet_idx
     
-    # ENFORCE CORRIDOR: If there are multiple bedrooms or baths and no corridor, we MUST add one to satisfy Circulation Rules
-    if not corridor_idx and (len(bed_idx) + len(master_idx) > 1 or len(all_baths) > 1):
+    num_beds = len(bed_idx) + len(master_idx)
+    
+    # Adaptive Circulation Generation
+    # Large house (3+ beds) gets a private Corridor
+    if not corridor_idx and num_beds >= 3:
         room_specs.append({"type": "corridor", "connections": []})
         corridor_idx = [len(room_specs) - 1]
-    
+        
+    # Very large house (4+ beds) gets a public Hallway
+    if not hall_idx and num_beds >= 4:
+        room_specs.append({"type": "hallway", "connections": []})
+        hall_idx = [len(room_specs) - 1]
+
+    def add_conn(src_idx, target_type, intent, weight):
+        room_specs[src_idx]['connections'].append({
+            "target_room": target_type,
+            "intent": intent,
+            "weight": weight
+        })
+
     # Core Public Zone Flow
-    if living_idx and dining_idx:
-        room_specs[living_idx[0]]['connections'].append({"target_room": "dining_room", "intent": "open_flow"})
-    if dining_idx and kitchen_idx:
-        room_specs[dining_idx[0]]['connections'].append({"target_room": "kitchen", "intent": "open_flow"})
-    elif living_idx and kitchen_idx:
-        room_specs[living_idx[0]]['connections'].append({"target_room": "kitchen", "intent": "open_flow"})
+    if living_idx and dining_idx: add_conn(living_idx[0], "dining_room", "open_flow", 10)
+    if dining_idx and kitchen_idx: add_conn(dining_idx[0], "kitchen", "open_flow", 10)
+    elif living_idx and kitchen_idx: add_conn(living_idx[0], "kitchen", "open_flow", 10)
+        
+    if kitchen_idx and utility_idx: add_conn(kitchen_idx[0], "utility", "standard", 7)
         
     # Wet Zone Attachments (Master gets first bath)
     if master_idx and all_baths:
-        room_specs[master_idx[0]]['connections'].append({"target_room": room_specs[all_baths[0]]['type'], "intent": "standard"})
+        add_conn(master_idx[0], room_specs[all_baths[0]]['type'], "standard", 10)
         all_baths.pop(0)
         
     # Private Zone Flow
@@ -536,28 +552,31 @@ def auto_wire_topology(room_types: list) -> list:
         corr_i = corridor_idx[0]
         corr_type = room_specs[corr_i]['type']
         
-        # Connect ALL bedrooms (including master) and remaining baths to the corridor
-        if master_idx:
-            room_specs[master_idx[0]]['connections'].append({"target_room": corr_type, "intent": "standard"})
-        for bi in bed_idx:
-            room_specs[bi]['connections'].append({"target_room": corr_type, "intent": "standard"})
-        for bi in all_baths:
-            room_specs[bi]['connections'].append({"target_room": corr_type, "intent": "standard"})
+        if master_idx: add_conn(master_idx[0], corr_type, "standard", 10)
+        for bi in bed_idx: add_conn(bi, corr_type, "standard", 10)
+        for bi in all_baths: add_conn(bi, corr_type, "standard", 8)
             
-        # Connect corridor to living or dining
-        if living_idx:
-            room_specs[corr_i]['connections'].append({"target_room": "living_room", "intent": "open_flow"})
-        elif dining_idx:
-            room_specs[corr_i]['connections'].append({"target_room": "dining_room", "intent": "open_flow"})
-    else:
-        # If no corridor (very small house), connect directly to living/dining
-        target = "living_room" if living_idx else ("dining_room" if dining_idx else None)
-        if target:
-            if master_idx:
-                room_specs[master_idx[0]]['connections'].append({"target_room": target, "intent": "standard"})
-            for bi in bed_idx:
-                room_specs[bi]['connections'].append({"target_room": target, "intent": "standard"})
-            for bi in all_baths:
-                room_specs[bi]['connections'].append({"target_room": target, "intent": "standard"})
+        if hall_idx: add_conn(corr_i, room_specs[hall_idx[0]]['type'], "open_flow", 10)
+        elif living_idx: add_conn(corr_i, "living_room", "open_flow", 10)
+        elif dining_idx: add_conn(corr_i, "dining_room", "open_flow", 10)
+            
+    # Hall logic
+    if hall_idx:
+        hall_i = hall_idx[0]
+        if living_idx: add_conn(hall_i, "living_room", "open_flow", 10)
+        if dining_idx: add_conn(hall_i, "dining_room", "open_flow", 8)
+        
+    # Small house logic (no corridor)
+    if not corridor_idx:
+        target_idx = hall_idx[0] if hall_idx else (living_idx[0] if living_idx else (dining_idx[0] if dining_idx else None))
+        if target_idx is not None:
+            target_type = room_specs[target_idx]['type']
+            if master_idx: add_conn(master_idx[0], target_type, "standard", 10)
+            for bi in bed_idx: add_conn(bi, target_type, "standard", 10)
+            for bi in all_baths: add_conn(bi, target_type, "standard", 8)
+
+    # Common bath living connection (Medium Priority)
+    if all_baths and living_idx:
+        add_conn(living_idx[0], room_specs[all_baths[-1]]['type'], "standard", 4)
                 
     return room_specs

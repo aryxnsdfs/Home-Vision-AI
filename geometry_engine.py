@@ -228,6 +228,42 @@ class CPSolver:
                 obj_vars.append((wet_max_x - wet_min_x) * 3)
                 obj_vars.append((wet_max_z - wet_min_z) * 3)
                 
+            # 4. Weighted Movement Graph Optimization (Manhattan Distances)
+            # Minimize walking distance between topologically connected rooms
+            for r_id, rv in room_vars.items():
+                cx1 = model.NewIntVar(0, plot_w * 2, f'cx_{r_id}')
+                cz1 = model.NewIntVar(0, plot_l * 2, f'cz_{r_id}')
+                model.Add(cx1 == 2 * rv['x'] + rv['w'])
+                model.Add(cz1 == 2 * rv['z'] + rv['l'])
+                
+                for conn in rv['connections']:
+                    target_type = conn.get('target_room', '')
+                    weight = conn.get('weight', 5)
+                    if not target_type: continue
+                    
+                    target_id = None
+                    for tid, trv in room_vars.items():
+                        if trv['type'] == target_type:
+                            target_id = tid
+                            break
+                    if not target_id: continue
+                    
+                    trv = room_vars[target_id]
+                    cx2 = model.NewIntVar(0, plot_w * 2, f'cx_{target_id}_{r_id}')
+                    cz2 = model.NewIntVar(0, plot_l * 2, f'cz_{target_id}_{r_id}')
+                    model.Add(cx2 == 2 * trv['x'] + trv['w'])
+                    model.Add(cz2 == 2 * trv['z'] + trv['l'])
+                    
+                    dx = model.NewIntVar(0, plot_w * 2, f'dx_{r_id}_{target_id}')
+                    dz = model.NewIntVar(0, plot_l * 2, f'dz_{r_id}_{target_id}')
+                    
+                    model.AddAbsEquality(dx, cx1 - cx2)
+                    model.AddAbsEquality(dz, cz1 - cz2)
+                    
+                    # Add to objective (distance * weight)
+                    obj_vars.append(weight * dx)
+                    obj_vars.append(weight * dz)
+                    
             model.Minimize(sum(obj_vars))
         
         solver = cp_model.CpSolver()
