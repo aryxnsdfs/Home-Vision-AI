@@ -1390,6 +1390,19 @@ class AdjacencyResolver:
                 # Check if door should be placed
                 r1, r2 = room_by_id[r1_id], room_by_id[r2_id]
                 
+                # --- TOPOLOGICAL EDGE ENFORCEMENT ---
+                def has_connection(src, dst):
+                    return any(c.get("target_room") == dst.type for c in src.connections)
+                
+                is_r1_private = "bed" in r1.type or "bath" in r1.type or "toilet" in r1.type or "closet" in r1.type
+                is_r2_private = "bed" in r2.type or "bath" in r2.type or "toilet" in r2.type or "closet" in r2.type
+                
+                if is_r1_private or is_r2_private:
+                    if not (has_connection(r1, r2) or has_connection(r2, r1)):
+                        # Skip placing a door if the strict architectural graph doesn't permit it.
+                        # This prevents bedrooms from becoming passages, and stops bathrooms from connecting to each other.
+                        continue
+                
                 # Ensure bathrooms only get one door max (prefer bedrooms)
                 is_r1_bath = "bath" in r1.type or "toilet" in r1.type
                 is_r2_bath = "bath" in r2.type or "toilet" in r2.type
