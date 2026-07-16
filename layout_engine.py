@@ -91,6 +91,7 @@ class RoomNode:
             "wallThicknessIn": self.wallThicknessIn,
             "main_entrance": self.main_entrance,
             "shared_walls": self.shared_walls,
+            "connections": self.connections,
             "suppress_wall_faces": self.suppress_wall_faces,
             "floorColor": self.floorColor,
             "wallColor": self.wallColor,
@@ -99,7 +100,7 @@ class RoomNode:
             "furnitureColor": self.furnitureColor,
             "furniture": getattr(self, 'furniture', []),
             "mep_nodes": self.mep_nodes,
-            "doors": [{"x": round(d.x, 2), "z": round(d.z, 2), "wall_orientation": d.wall_orientation, "width": d.width, "height": getattr(d, 'height', 7.0)} for d in getattr(self, 'doors', [])],
+            "doors": [{"x": round(d.x, 2), "z": round(d.z, 2), "wall_orientation": d.wall_orientation, "width": d.width, "height": getattr(d, 'height', 7.0), "is_main": bool(getattr(d, 'is_main', False))} for d in getattr(self, 'doors', [])],
             "windows": [{"x": round(w.x, 2), "z": round(w.z, 2), "wall_orientation": w.wall_orientation, "width": w.width, "height": getattr(w, 'height', 4.0), "sill_height": getattr(w, 'sill_height', 3.0)} for w in getattr(self, 'windows', [])],
         }
 
@@ -135,15 +136,27 @@ class ContextualFurniturePlacementEngine:
             w, l = item.get("width", 2.0), item.get("length", 2.0)
             affinity = item.get("affinity", "center")
             
+            # Helper: clamp a position so the item stays inside the room
+            def clamp_pos(fx, fz, item_w, item_l, room_w, room_l):
+                fx = max(item_w / 2.0, min(fx, room_w - item_w / 2.0))
+                fz = max(item_l / 2.0, min(fz, room_l - item_l / 2.0))
+                return fx, fz
+
+            rw, rl = node.rect.width, node.rect.length
+
             if affinity == "center":
-                placed.append({"type": item["type"], "x": node.rect.width / 2.0, "z": node.rect.length / 2.0})
+                fx, fz = rw / 2.0, rl / 2.0
             else:
                 if item.get("relationship") == "faces_sofa":
-                    placed.append({"type": item["type"], "x": node.rect.width / 2.0, "z": node.rect.length - l/2})
+                    fx, fz = rw / 2.0, rl - l / 2.0
                 elif item.get("relationship") == "next_to_bed":
-                    placed.append({"type": item["type"], "x": node.rect.width / 2.0 + 3.0, "z": l/2})
+                    fx, fz = min(rw / 2.0 + 3.0, rw - w / 2.0), l / 2.0
                 else:
-                    placed.append({"type": item["type"], "x": node.rect.width / 2.0, "z": l/2})
+                    # Wall-affinity items go against the top wall
+                    fx, fz = rw / 2.0, l / 2.0
+
+            fx, fz = clamp_pos(fx, fz, w, l, rw, rl)
+            placed.append({"type": item["type"], "x": round(fx, 2), "z": round(fz, 2)})
                     
         node.furniture = placed
 
@@ -250,16 +263,46 @@ def compute_shared_walls(rooms: List[RoomNode]) -> List[Dict]:
         length = math.sqrt((x2 - x1)**2 + (z2 - z1)**2)
         
         # rotationAngle in radians (0 for horizontal, PI/2 for vertical)
-        rot = 0.0 if w["orientation"] == "horizontal" else math.pi / 2.0
+        is_vertical = w["orientation"] == "vertical"
+        rot = math.pi / 2.0 if is_vertical else 0.0
+        thickness = 0.15
+
+        # Shorten vertical walls by thickness to prevent Z-fighting at corners
+        if is_vertical and length > thickness * 2:
+            length -= thickness
         
         frontend_walls.append({
             "centerX": round(cx, 3),
             "centerY": round(cy, 3),
             "length": round(length, 3),
             "rotationAngle": round(rot, 3),
-            "thickness": 0.15,
-            "id": w["id"]
+            "thickness": thickness,
+            "id": w["id"],
+            # Preserve the finite-wall topology for the 3D renderer.  The
+            # frontend must not infer facade status from a room's bounding box:
+            # stepped plans and partial shared walls make that ambiguous.
+            "orientation": w["orientation"],
+            "isExterior": bool(w.get("is_exterior")),
+            "roomIds": w["room_ids"],
+            "x1": round(x1, 3),
+            "z1": round(z1, 3),
+            "x2": round(x2, 3),
+            "z2": round(z2, 3),
         })
+
+    exterior_walls = [w for w in frontend_walls if w["isExterior"]]
+    logger.info(
+        "[FACADE DEBUG] Serialized %d finite walls (%d exterior). Exterior records: %s",
+        len(frontend_walls),
+        len(exterior_walls),
+        [
+            {
+                "rooms": w["roomIds"], "orientation": w["orientation"],
+                "line": (w["x1"], w["z1"], w["x2"], w["z2"])
+            }
+            for w in exterior_walls
+        ],
+    )
         
     return frontend_walls
 
@@ -711,7 +754,7 @@ def generate_walls_from_aabbs(rooms: List[RoomNode]) -> List[Dict]:
         for c, min_c, max_c, rid in segments:
             found_key = None
             for k in grouped:
-                if abs(k - c) < 1.0:  # Increased tolerance from 0.1 to 1.0 to merge close walls
+                if abs(k - c) < 0.1:
                     found_key = k
                     break
             if found_key is None:
@@ -759,23 +802,7 @@ def generate_walls_from_aabbs(rooms: List[RoomNode]) -> List[Dict]:
                                 open_flow = True
                                 break
 
-                    # Suppress implicit room wall faces for ALL shared segments (to avoid double walls in frontend)
-                    for rid in touching_rooms:
-                        room = next((r for r in rooms if r.id == rid), None)
-                        if room:
-                            if orientation == "vertical":
-                                if abs(room.rect.x - c) < 0.1:
-                                    if "west" not in room.suppress_wall_faces: room.suppress_wall_faces.append("west")
-                                elif abs((room.rect.x + room.rect.width) - c) < 0.1:
-                                    if "east" not in room.suppress_wall_faces: room.suppress_wall_faces.append("east")
-                            else: # horizontal
-                                if abs(room.rect.z - c) < 0.1:
-                                    if "north" not in room.suppress_wall_faces: room.suppress_wall_faces.append("north")
-                                elif abs((room.rect.z + room.rect.length) - c) < 0.1:
-                                    if "south" not in room.suppress_wall_faces: room.suppress_wall_faces.append("south")
-                
-                if open_flow:
-                    continue
+                # We do not skip wall generation for open flow anymore. We place walls and doors to satisfy validator.
                 
                 x1 = c if orientation == "vertical" else p1
                 z1 = p1 if orientation == "vertical" else c
@@ -810,12 +837,25 @@ def generate_walls_from_aabbs(rooms: List[RoomNode]) -> List[Dict]:
                             room_by_id[rid].shared_walls.append(oid)
                             
     # Suppress corridor walls on shared faces
+    # CRITICAL FIX: Only suppress a wall if BOTH rooms touching it include a passage type.
+    # Previously, any wall touching a corridor was suppressed — this incorrectly silenced
+    # bedroom↔bathroom walls when the bathroom also happened to touch the corridor.
+    # Now we only suppress the wall if it is *exclusively* between passage-type rooms,
+    # OR if one side is a passage and there are no private rooms on the other side.
     _PASSAGE_TYPES = {"corridor", "hallway", "foyer", "staircase", "passage"}
+    _PRIVATE_TYPES  = {"bathroom", "toilet", "bedroom", "master_bedroom", "closet",
+                       "pooja_room", "powder_room", "store_room", "utility"}
     for w in walls:
         if w.get("is_shared"):
-            if any(room_by_id[rid].type in _PASSAGE_TYPES for rid in w["room_ids"]):
+            types_on_wall = {room_by_id[rid].type for rid in w["room_ids"] if rid in room_by_id}
+            is_any_passage = bool(types_on_wall & _PASSAGE_TYPES)
+            is_any_private = bool(types_on_wall & _PRIVATE_TYPES)
+            # Only suppress if passage is involved but no private room needs a direct door here
+            # i.e. the wall is purely between two passage rooms OR between a passage and a
+            # non-private public room (living/dining/kitchen) that already gets an open-flow opening.
+            if is_any_passage and not is_any_private:
                 w["suppressed"] = True
-                
+
     return walls
 
 
@@ -873,61 +913,29 @@ class LayoutEngine:
                 # Doors and Windows will be generated deterministically by the layout engine!
                 nodes.append(node)
 
-            # --- SNAPPING ALGORITHM ---
-            # Snaps adjacent room coordinates together if they are within 3.0 ft of each other
-            if nodes:
-                # Snap X
-                x_coords = []
-                for n in nodes:
-                    x_coords.extend([n.rect.x, n.rect.x + n.rect.width])
-                x_coords.sort()
-                
-                merged_x = {}
-                cur = [x_coords[0]]
-                for x in x_coords[1:]:
-                    if x - cur[0] <= 3.0:
-                        cur.append(x)
-                    else:
-                        avg = sum(cur) / len(cur)
-                        for cx in cur: merged_x[cx] = avg
-                        cur = [x]
-                if cur:
-                    avg = sum(cur) / len(cur)
-                    for cx in cur: merged_x[cx] = avg
-                        
-                # Snap Z
-                z_coords = []
-                for n in nodes:
-                    z_coords.extend([n.rect.z, n.rect.z + n.rect.length])
-                z_coords.sort()
-                
-                merged_z = {}
-                cur = [z_coords[0]]
-                for z in z_coords[1:]:
-                    if z - cur[0] <= 3.0:
-                        cur.append(z)
-                    else:
-                        avg = sum(cur) / len(cur)
-                        for cz in cur: merged_z[cz] = avg
-                        cur = [z]
-                if cur:
-                    avg = sum(cur) / len(cur)
-                    for cz in cur: merged_z[cz] = avg
-                        
-                # Apply snapped coordinates
-                for n in nodes:
-                    nx1, nx2 = merged_x[n.rect.x], merged_x[n.rect.x + n.rect.width]
-                    nz1, nz2 = merged_z[n.rect.z], merged_z[n.rect.z + n.rect.length]
-                    n.rect.x, n.rect.width = nx1, nx2 - nx1
-                    n.rect.z, n.rect.length = nz1, nz2 - nz1
+            # --- SNAPPING ALGORITHM (DISABLED) ---
+            # Snapping is now natively handled by CP-SAT Macro-Zone alignment.
+            # Legacy snapping destroyed minimum dimension constraints by averaging coordinates.
 
             # --- ORIGIN ANCHORING ---
             if nodes:
+                # 1. Find the absolute boundaries of the generated house
                 min_x = min(n.rect.x for n in nodes)
+                max_x = max(n.rect.x + n.rect.width for n in nodes)
                 min_z = min(n.rect.z for n in nodes)
+                max_z = max(n.rect.z + n.rect.length for n in nodes)
+                
+                house_width = max_x - min_x
+                house_length = max_z - min_z
+                
+                # 2. Calculate exactly how much empty space belongs on each side
+                offset_x = (self.plot_width - house_width) / 2.0
+                offset_z = (self.plot_length - house_length) / 2.0
+                
+                # 3. Shift all rooms to the true center of the plot
                 for n in nodes:
-                    n.rect.x -= min_x
-                    n.rect.z -= min_z
+                    n.rect.x = (n.rect.x - min_x) + offset_x
+                    n.rect.z = (n.rect.z - min_z) + offset_z
 
             # Compute shared walls using new finite AABB logic
             self.last_walls = generate_walls_from_aabbs(nodes)
@@ -960,10 +968,16 @@ class LayoutEngine:
             from geometry_engine import LayoutGeometryEngine
             engine = LayoutGeometryEngine()
             
+            attempt = 0
+            if rooms_spec:
+                # Extract attempt number if present (injected during retry loops)
+                attempt = next((r.get("attempt", 0) for r in rooms_spec if isinstance(r, dict)), 0)
+
             floor_data = {
                 'plot_width': self.buildable_width,
                 'plot_length': self.buildable_length,
-                'rooms': rooms_spec
+                'rooms': rooms_spec,
+                'attempt': attempt
             }
             solved_data = engine.solve_phase_2_csp(floor_data)
             
@@ -1317,6 +1331,19 @@ class LayoutEngine:
                              
         logger.info("  [Post-Processing] Computing shared and exterior wall segments...")
         self.last_walls = compute_shared_walls(nodes)
+
+        # The normal AI generation path must also materialize doors/windows.
+        # Without this call, living_room.main_entrance is only metadata and
+        # no visible main door is serialized for the frontend.
+        WindowPlacer(nodes, self.plot_width, self.plot_length).place_windows()
+        logger.info(
+            "[MAIN DOOR DEBUG] Entrance rooms: %s",
+            [
+                {"id": n.id, "type": n.type, "main": getattr(n, "main_entrance", False),
+                 "doors": len(n.doors)}
+                for n in nodes if getattr(n, "main_entrance", False)
+            ],
+        )
         place_furniture(nodes, indian_options)
 
         # Validation fix: the Master Bedroom must be the largest bedroom.
@@ -1408,14 +1435,46 @@ class AdjacencyResolver:
                 is_r2_bath = "bath" in r2.type or "toilet" in r2.type
                 if is_r1_bath and any(d for d in r1.doors): continue
                 if is_r2_bath and any(d for d in r2.doors): continue
-                
+
+                # --- ATTACHED BATHROOM ENFORCEMENT ---
+                # Bathrooms can be connected to bedrooms, corridors, or living rooms.
+                # We need to verify that a connection exists between these specific two rooms.
+                if is_r1_bath or is_r2_bath:
+                    bath_room = r1 if is_r1_bath else r2
+                    other_room = r2 if is_r1_bath else r1
+                    
+                    # Ensure there's a topological connection explicitly between these two rooms.
+                    # It could be `other_room -> bath_room` OR `bath_room -> other_room`
+                    has_bath_conn = (
+                        has_connection(other_room, bath_room) or 
+                        has_connection(bath_room, other_room)
+                    )
+                    
+                    if not has_bath_conn:
+                        # No architectural link between this specific bath and this room
+                        continue
+
                 # --- PHASE 5: DETERMINISTIC DOOR PLANNER ---
                 is_vert = w["orientation"] == "vertical"
                 wall_len = (w["z2"] - w["z1"]) if is_vert else (w["x2"] - w["x1"])
-                door_w = 2.5 if (is_r1_bath or is_r2_bath) else 3.0
+                
+                is_open_flow = False
+                for conn in r1.connections:
+                    if conn.get("target_room") == r2.type and conn.get("intent") == "open_flow":
+                        is_open_flow = True
+                        break
+                for conn in r2.connections:
+                    if conn.get("target_room") == r1.type and conn.get("intent") == "open_flow":
+                        is_open_flow = True
+                        break
+
+                if is_open_flow:
+                    door_w = max(4.0, wall_len - 0.5) # Huge opening for open flow
+                else:
+                    door_w = 2.5 if (is_r1_bath or is_r2_bath) else 3.0
                 
                 # Rule: 3x3 Landing + Corner Clearance (needs at least door_w + 1ft buffer)
-                if wall_len < door_w + 1.0:
+                if not is_open_flow and wall_len < door_w + 1.0:
                     logger.warning(f"[DOOR PLANNER] Shared wall {r1_id}-{r2_id} is too short ({wall_len:.1f}ft) for a {door_w}ft door.")
                     continue # Skip placement; validator will fail layout if required
                 
@@ -1458,6 +1517,7 @@ class WindowPlacer:
         
         main_door_added = False
         
+        # --- PASS 1: Try placing the main door exactly on the designated facade ---
         for w in walls:
             if w.get("is_exterior"):
                 rid = w["room_ids"][0]
@@ -1474,12 +1534,58 @@ class WindowPlacer:
                        "east" if is_vert else \
                        "north" if rel_z < r.rect.length / 2.0 else "south"
                 
-                # Main Door logic
-                if r.type == "living_room" and not main_door_added:
-                    r.doors.append(Door(x=rel_x, z=rel_z, width=3.5, height=8.0, is_main=True, wall_orientation=face))
-                    main_door_added = True
-                    logger.info(f"    Placed main entrance door on '{r.name}'")
+                is_designated_entrance = getattr(r, "main_entrance", False)
+                designated_face = getattr(r, "main_entrance_wall", face)
+                
+                if is_designated_entrance and not main_door_added:
+                    if face == designated_face:
+                        r.doors.append(Door(x=rel_x, z=rel_z, width=4.0, height=7.0, is_main=True, wall_orientation=face))
+                        main_door_added = True
+                        logger.info(f"    Placed main entrance door on '{r.name}' (face {face})")
+        
+        # --- PASS 2: If the designated face was blocked by a room, place it on ANY exterior wall ---
+        if not main_door_added:
+            for w in walls:
+                if w.get("is_exterior"):
+                    rid = w["room_ids"][0]
+                    r = room_by_id.get(rid)
+                    if r and getattr(r, "main_entrance", False):
+                        cx = (w["x1"] + w["x2"]) / 2.0
+                        cz = (w["z1"] + w["z2"]) / 2.0
+                        is_vert = w["orientation"] == "vertical"
+                        face = "west" if is_vert and (cx - r.rect.x) < r.rect.width / 2.0 else "east" if is_vert else "north" if (cz - r.rect.z) < r.rect.length / 2.0 else "south"
+                        r.doors.append(Door(x=cx - r.rect.x, z=cz - r.rect.z, width=4.0, height=7.0, is_main=True, wall_orientation=face))
+                        main_door_added = True
+                        logger.info(f"    Placed fallback main entrance door on '{r.name}' (face {face})")
+                        break
+                        
+        # --- PASS 3: Hard force injection (if the living room has zero exterior walls) ---
+        if not main_door_added:
+            for r in self.rooms:
+                if getattr(r, "main_entrance", False):
+                    face = getattr(r, "main_entrance_wall", "south")
+                    x = r.rect.width / 2.0 if face in ("north", "south") else (0.0 if face == "west" else r.rect.width)
+                    z = r.rect.length / 2.0 if face in ("east", "west") else (0.0 if face == "north" else r.rect.length)
+                    r.doors.append(Door(x=x, z=z, width=4.0, height=7.0, is_main=True, wall_orientation=face))
+                    logger.info(f"    Forced main entrance door on '{r.name}' (face {face})")
+                    break
+
+        # --- PASS 4: Place Standard Windows ---
+        for w in walls:
+            if w.get("is_exterior"):
+                rid = w["room_ids"][0]
+                if rid not in room_by_id:
                     continue
+                r = room_by_id[rid]
+                
+                cx = (w["x1"] + w["x2"]) / 2.0
+                cz = (w["z1"] + w["z2"]) / 2.0
+                rel_x, rel_z = cx - r.rect.x, cz - r.rect.z
+                
+                is_vert = w["orientation"] == "vertical"
+                face = "west" if is_vert and rel_x < r.rect.width / 2.0 else \
+                       "east" if is_vert else \
+                       "north" if rel_z < r.rect.length / 2.0 else "south"
                 
                 # Window logic
                 if r.type not in ["corridor", "hallway", "balcony", "parking", "veranda"]:
@@ -1489,9 +1595,12 @@ class WindowPlacer:
                     h = 2.0 if is_vent else 4.0
                     sill = 5.0 if is_vent else 3.0
                     
-                    r.windows.append(Window(x=rel_x, z=rel_z, width=win_width, height=h, sill_height=sill, wall_orientation=face))
-                    logger.info(f"    Placed {'ventilator' if is_vent else 'window'} on '{r.name}'")
-
+                    # Prevent clipping by ensuring we don't place a window precisely where the main door was just placed
+                    has_door_here = any(d for d in getattr(r, 'doors', []) if d.wall_orientation == face and abs(d.x - rel_x) < 2.0 and abs(d.z - rel_z) < 2.0)
+                    
+                    if not has_door_here:
+                        r.windows.append(Window(x=rel_x, z=rel_z, width=win_width, height=h, sill_height=sill, wall_orientation=face))
+                        logger.info(f"    Placed {'ventilator' if is_vent else 'window'} on '{r.name}'")
 # ---------------------------------------------------------------------------
 # Architectural Rules
 # ---------------------------------------------------------------------------

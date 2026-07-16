@@ -1,4 +1,4 @@
-import React, { useMemo, useState, useRef } from "react";
+import React, { useEffect, useMemo, useState, useRef } from "react";
 import * as THREE from "three";
 import { useFrame } from "@react-three/fiber";
 import { a, useSpring } from "@react-spring/three";
@@ -91,10 +91,10 @@ const roomFloor = (room, style) => {
 
 const roomWallColor = (room, style) => {
   if (room.wallColor) return room.wallColor;
+  if (style?.wallFinish?.startsWith('#')) return style.wallFinish;
   if (room.type === "kitchen") return "#e8ecf0";
   if (room.type === "bathroom") return "#dce8f0";
   if (room.type === "garage" || room.type === "parking") return "#b8bec6";
-  if (style?.wallFinish?.startsWith('#')) return style.wallFinish;
   return wallPalette[style?.wallFinish] || wallPalette.warm_white;
 };
 
@@ -276,18 +276,15 @@ function ExpansionArrow({ position, rotation, direction, roomId, accent }) {
 /* ── Wall Builder Helper ── */
 // Generates wall segments with cutouts for doors and windows
 function buildWallSegmentsWithOpenings(wallKind, length, thickness, openings, wallHeight) {
-  // openings: { center: float, width: float, height: float, sill: float, isWindow: boolean }
   const segments = [];
-  
-  // Sort openings by position
   openings.sort((a, b) => a.center - b.center);
-  
   let currentPos = 0;
-  
+
   for (const op of openings) {
-    const opStart = op.center - op.width / 2;
-    const opEnd = op.center + op.width / 2;
-    
+    // Safely clamp the opening to the wall's boundaries
+    const opStart = Math.max(currentPos, Math.min(length, op.center - op.width / 2));
+    const opEnd = Math.max(currentPos, Math.min(length, op.center + op.width / 2));
+
     // Solid wall before the opening
     if (opStart > currentPos + 0.01) {
       const segLength = opStart - currentPos;
@@ -297,40 +294,44 @@ function buildWallSegmentsWithOpenings(wallKind, length, thickness, openings, wa
         kind: `${wallKind}-solid`,
         px,
         py: wallHeight / 2,
-        sx: segLength,
-        sy: wallHeight,
-        sz: thickness
+        sx: Math.max(0.01, segLength),
+        sy: Math.max(0.01, wallHeight),
+        sz: Math.max(0.01, thickness)
       });
     }
-    
-    // Above opening (Header)
-    const headerHeight = wallHeight - (op.sill + op.height);
-    if (headerHeight > 0.01) {
-      segments.push({
-        kind: `${wallKind}-header`,
-        px: op.center,
-        py: op.sill + op.height + headerHeight / 2,
-        sx: op.width,
-        sy: headerHeight,
-        sz: thickness
-      });
+
+    const actualWidth = opEnd - opStart;
+    if (actualWidth > 0.01) {
+      const actualCenter = opStart + actualWidth / 2;
+      const headerHeight = Math.max(0, wallHeight - (op.sill + op.height));
+
+      // Header (Above opening)
+      if (headerHeight > 0.01) {
+        segments.push({
+          kind: `${wallKind}-header`,
+          px: actualCenter,
+          py: op.sill + op.height + headerHeight / 2,
+          sx: Math.max(0.01, actualWidth),
+          sy: Math.max(0.01, headerHeight),
+          sz: Math.max(0.01, thickness)
+        });
+      }
+      
+      // Sill (Below opening)
+      if (op.sill > 0.01) {
+        segments.push({
+          kind: `${wallKind}-sill`,
+          px: actualCenter,
+          py: op.sill / 2,
+          sx: Math.max(0.01, actualWidth),
+          sy: Math.max(0.01, op.sill),
+          sz: Math.max(0.01, thickness)
+        });
+      }
     }
-    
-    // Below opening (Sill) - for windows
-    if (op.sill > 0.01) {
-      segments.push({
-        kind: `${wallKind}-sill`,
-        px: op.center,
-        py: op.sill / 2,
-        sx: op.width,
-        sy: op.sill,
-        sz: thickness
-      });
-    }
-    
     currentPos = Math.max(currentPos, opEnd);
   }
-  
+
   // Solid wall after the last opening
   if (currentPos < length - 0.01) {
     const segLength = length - currentPos;
@@ -340,12 +341,12 @@ function buildWallSegmentsWithOpenings(wallKind, length, thickness, openings, wa
       kind: `${wallKind}-solid`,
       px,
       py: wallHeight / 2,
-      sx: segLength,
-      sy: wallHeight,
-      sz: thickness
+      sx: Math.max(0.01, segLength),
+      sy: Math.max(0.01, wallHeight),
+      sz: Math.max(0.01, thickness)
     });
   }
-  
+
   return segments;
 }
 
@@ -369,29 +370,35 @@ function wallSegmentsFor(room, bounds, wallThickness) {
   
   // Parse doors
   (room.doors || []).forEach(d => {
-    const w = (d.width || 3.0) * SCALE;
-    const h = Math.min((d.height || 7.0) * SCALE, roomHeight - 0.2);
+    const orientation = d?.wall_orientation;
+    if (!['north', 'south', 'east', 'west'].includes(orientation)) return;
+    const rawWidth = Number(d.width);
+    const rawHeight = Number(d.height);
+    const w = (Number.isFinite(rawWidth) && rawWidth > 0 ? rawWidth : 3.0) * SCALE;
+    const h = Math.min((Number.isFinite(rawHeight) && rawHeight > 0 ? rawHeight : 7.0) * SCALE, Math.max(0.01, roomHeight - 0.2));
+    const rawCenter = Number(orientation === 'north' || orientation === 'south' ? d.x : d.z);
+    const center = Number.isFinite(rawCenter) ? rawCenter * SCALE : (orientation === 'north' || orientation === 'south' ? bounds.width : bounds.length) / 2;
     
-    if (d.wall_orientation === 'north' || d.wall_orientation === 'south') {
-      walls[d.wall_orientation].openings.push({
-        center: d.x * SCALE, width: w, height: h, sill: 0, isWindow: false
+    if (orientation === 'north' || orientation === 'south') {
+      walls[orientation].openings.push({
+        center, width: w, height: h, sill: 0, isWindow: false
       });
       // Only render main doors for exterior or explicitly marked
       if (d.is_main) {
         doorPanes.push({
-          pos: [d.x * SCALE, h / 2, d.wall_orientation === 'north' ? 0 : bounds.length],
+          pos: [center, h / 2, orientation === 'north' ? 0 : bounds.length],
           size: [w, h, wallThickness + 0.02],
           rot: [0, 0, 0],
           is_main: d.is_main
         });
       }
-    } else if (d.wall_orientation === 'east' || d.wall_orientation === 'west') {
-      walls[d.wall_orientation].openings.push({
-        center: d.z * SCALE, width: w, height: h, sill: 0, isWindow: false
+    } else if (orientation === 'east' || orientation === 'west') {
+      walls[orientation].openings.push({
+        center, width: w, height: h, sill: 0, isWindow: false
       });
       if (d.is_main) {
         doorPanes.push({
-          pos: [d.wall_orientation === 'west' ? 0 : bounds.width, h / 2, d.z * SCALE],
+          pos: [orientation === 'west' ? 0 : bounds.width, h / 2, center],
           size: [wallThickness + 0.02, h, w],
           rot: [0, 0, 0],
           is_main: d.is_main
@@ -400,8 +407,8 @@ function wallSegmentsFor(room, bounds, wallThickness) {
     }
   });
   
-  // Parse windows
-  (room.windows || []).forEach(w => {
+  // Parse windows (Skipped per user request to remove windows)
+  /* (room.windows || []).forEach(w => {
     const width = (w.width || 4.0) * SCALE;
     const height = (w.height || 4.0) * SCALE;
     const sill = (w.sill_height || 3.0) * SCALE;
@@ -425,7 +432,7 @@ function wallSegmentsFor(room, bounds, wallThickness) {
         rot: [0, 0, 0]
       });
     }
-  });
+  }); */
 
   // Build segments for each wall.
   // The backend marks circulation rooms (corridor/hallway/staircase) with
@@ -435,26 +442,54 @@ function wallSegmentsFor(room, bounds, wallThickness) {
 
   // North wall (z = 0, along x)
   if (!suppress.has('north')) {
-    const northSegs = buildWallSegmentsWithOpenings('north', bounds.width, wallThickness, walls.north.openings, roomHeight);
-    northSegs.forEach(s => segments.push({ ...s, pz: 0 }));
+    const northSegs = buildWallSegmentsWithOpenings('north', Math.max(0.01, bounds.width), wallThickness, walls.north.openings, roomHeight);
+    northSegs.forEach(s => segments.push({ ...s, pz: wallThickness / 2 }));
   }
 
-  // South wall (z = bounds.length, along x)
+  // South wall (z = bounds.length, along x) spans full width
   if (!suppress.has('south')) {
-    const southSegs = buildWallSegmentsWithOpenings('south', bounds.width, wallThickness, walls.south.openings, roomHeight);
-    southSegs.forEach(s => segments.push({ ...s, pz: bounds.length }));
+    const southSegs = buildWallSegmentsWithOpenings('south', Math.max(0.01, bounds.width), wallThickness, walls.south.openings, roomHeight);
+    southSegs.forEach(s => segments.push({ ...s, pz: bounds.length - wallThickness / 2 }));
   }
 
-  // West wall (x = 0, along z) -> Need to rotate coordinates
+  // West wall (x = 0, along z) is clipped between North and South walls
   if (!suppress.has('west')) {
-    const westSegs = buildWallSegmentsWithOpenings('west', bounds.length, wallThickness, walls.west.openings, roomHeight);
-    westSegs.forEach(s => segments.push({ ...s, pz: s.px, px: 0, sx: wallThickness, sz: s.sx }));
+    const northThick = suppress.has('north') ? 0 : wallThickness;
+    const southThick = suppress.has('south') ? 0 : wallThickness;
+    const ewLength = Math.max(0.01, bounds.length - northThick - southThick);
+    
+    const shiftedOpenings = walls.west.openings.map(op => ({ ...op, center: op.center - northThick }));
+    const westSegs = buildWallSegmentsWithOpenings('west', ewLength, wallThickness, shiftedOpenings, roomHeight);
+    
+    westSegs.forEach(s => {
+      segments.push({
+        ...s,
+        pz: s.px + northThick, // Shift back to global Z
+        px: wallThickness / 2,
+        sx: s.sz, 
+        sz: s.sx  
+      });
+    });
   }
 
-  // East wall (x = bounds.width, along z)
+  // East wall (x = bounds.width, along z) is clipped between North and South walls ONLY if they exist
   if (!suppress.has('east')) {
-    const eastSegs = buildWallSegmentsWithOpenings('east', bounds.length, wallThickness, walls.east.openings, roomHeight);
-    eastSegs.forEach(s => segments.push({ ...s, pz: s.px, px: bounds.width, sx: wallThickness, sz: s.sx }));
+    const northThick = suppress.has('north') ? 0 : wallThickness;
+    const southThick = suppress.has('south') ? 0 : wallThickness;
+    const ewLength = Math.max(0.01, bounds.length - northThick - southThick);
+    
+    const shiftedOpenings = walls.east.openings.map(op => ({ ...op, center: op.center - northThick }));
+    const eastSegs = buildWallSegmentsWithOpenings('east', ewLength, wallThickness, shiftedOpenings, roomHeight);
+    
+    eastSegs.forEach(s => {
+      segments.push({
+        ...s,
+        pz: s.px + northThick,
+        px: bounds.width - wallThickness / 2,
+        sx: s.sz,
+        sz: s.sx
+      });
+    });
   }
 
   // Filter out any walls that were deleted
@@ -463,6 +498,155 @@ function wallSegmentsFor(room, bounds, wallThickness) {
     : segments;
 
   return { segments: filteredSegments, windowPanes, doorPanes };
+}
+function splitSegmentByExteriorWalls(segment, room, walls, rooms = []) {
+  const orientation = segment.kind.split('-')[0];
+  const isHorizontal = orientation === 'north' || orientation === 'south';
+  const segmentStart = isHorizontal
+    ? room.x + (segment.px - segment.sx / 2) / SCALE
+    : room.z + (segment.pz - segment.sz / 2) / SCALE;
+  const segmentEnd = isHorizontal
+    ? room.x + (segment.px + segment.sx / 2) / SCALE
+    : room.z + (segment.pz + segment.sz / 2) / SCALE;
+  const boundary = isHorizontal
+    ? (orientation === 'north' ? room.z : room.z + room.length)
+    : (orientation === 'west' ? room.x : room.x + room.width);
+
+  // Derive shared intervals from the actual room topology. This is more
+  // reliable than relying only on serialized isExterior flags: a stepped or
+  // compact plan can have a perimeter segment represented by another room ID.
+  const sharedIntervals = [];
+  for (const other of rooms || []) {
+    if (!other || other.id === room.id) continue;
+    let touches = false;
+    let otherStart;
+    let otherEnd;
+    if (isHorizontal) {
+      const otherBoundary = orientation === 'north'
+        ? other.z + other.length
+        : other.z;
+      touches = Math.abs(otherBoundary - boundary) < 0.2;
+      otherStart = Math.max(segmentStart, other.x);
+      otherEnd = Math.min(segmentEnd, other.x + other.width);
+    } else {
+      const otherBoundary = orientation === 'west'
+        ? other.x + other.width
+        : other.x;
+      touches = Math.abs(otherBoundary - boundary) < 0.2;
+      otherStart = Math.max(segmentStart, other.z);
+      otherEnd = Math.min(segmentEnd, other.z + other.length);
+    }
+    if (touches && otherEnd - otherStart > 0.01) {
+      sharedIntervals.push([otherStart, otherEnd]);
+    }
+  }
+
+  // If room topology is available, exterior is the complement of shared
+  // intervals. Backend exterior metadata is retained only as a fallback for
+  // callers that do not provide the room list.
+  let exteriorIntervals = [];
+  if (rooms && rooms.length > 0) {
+    const cuts = [...new Set([
+      segmentStart,
+      segmentEnd,
+      ...sharedIntervals.flatMap(([start, end]) => [start, end])
+    ])].sort((a, b) => a - b);
+    exteriorIntervals = cuts.slice(0, -1).flatMap((start, index) => {
+      const end = cuts[index + 1];
+      const midpoint = (start + end) / 2;
+      const shared = sharedIntervals.some(([from, to]) => midpoint > from + 0.001 && midpoint < to - 0.001);
+      return !shared && end - start > 0.001 ? [[start, end]] : [];
+    });
+  } else {
+    for (const wall of walls || []) {
+      if (!wall?.isExterior) continue;
+      if (wall.orientation !== (isHorizontal ? 'horizontal' : 'vertical')) continue;
+      const wallBoundary = isHorizontal ? wall.z1 : wall.x1;
+      if (Math.abs(wallBoundary - boundary) > 0.15) continue;
+      const start = Math.max(segmentStart, isHorizontal ? Math.min(wall.x1, wall.x2) : Math.min(wall.z1, wall.z2));
+      const end = Math.min(segmentEnd, isHorizontal ? Math.max(wall.x1, wall.x2) : Math.max(wall.z1, wall.z2));
+      if (end - start > 0.001) exteriorIntervals.push([start, end]);
+    }
+  }
+
+  if (exteriorIntervals.length === 0) return [{ ...segment, _isExterior: false }];
+  exteriorIntervals.sort((a, b) => a[0] - b[0]);
+  
+  const merged = [];
+  for (const interval of exteriorIntervals) {
+    const previous = merged[merged.length - 1];
+    // FIX 1: Massive 0.5 tolerance bridges all layout engine math gaps
+    if (previous && interval[0] <= previous[1] + 0.5) {
+      previous[1] = Math.max(previous[1], interval[1]);
+    } else {
+      merged.push([...interval]);
+    }
+  }
+
+  const cuts = [...new Set([
+    segmentStart,
+    segmentEnd,
+    ...merged.flatMap(([start, end]) => [start, end])
+  ])].sort((a, b) => a - b);
+  
+  return cuts.slice(0, -1).flatMap((start, index) => {
+    const end = cuts[index + 1];
+    
+    // FIX 2: Never drop segments unless they are mathematically zero. 
+    // Dropping segments is what caused the physical "holes" in the 3D mesh!
+    if (end - start <= 0.0001) return []; 
+    
+    const midpoint = (start + end) / 2;
+    // FIX 3: Massive 0.5 tolerance guarantees tiny slivers are painted as exterior!
+    const isExterior = merged.some(([from, to]) => midpoint >= from - 0.5 && midpoint <= to + 0.5);
+    
+    const child = { ...segment, _isExterior: isExterior, id: `${segment.id || segment.kind}-${index}` };
+    
+    if (isHorizontal) {
+      child.sx = (end - start) * SCALE;
+      child.px = ((start + end) / 2 - room.x) * SCALE;
+    } else {
+      child.sz = (end - start) * SCALE;
+      child.pz = ((start + end) / 2 - room.z) * SCALE;
+    }
+    return [child];
+  });
+}
+function facadeDebugForSegment(segment, room, walls) {
+  const orientation = segment.kind.split('-')[0];
+  const isHorizontal = orientation === 'north' || orientation === 'south';
+  const roomId = room.sourceId || room.id;
+
+  const boundary = isHorizontal
+    ? (orientation === 'north' ? room.z : room.z + room.length)
+    : (orientation === 'west' ? room.x : room.x + room.width);
+  const start = isHorizontal
+    ? room.x + (segment.px - segment.sx / 2) / SCALE
+    : room.z + (segment.pz - segment.sz / 2) / SCALE;
+  const end = isHorizontal
+    ? room.x + (segment.px + segment.sx / 2) / SCALE
+    : room.z + (segment.pz + segment.sz / 2) / SCALE;
+  const expectedOrientation = isHorizontal ? 'horizontal' : 'vertical';
+  const matchingWalls = (walls || [])
+    .filter(wall => wall?.isExterior)
+    .filter(wall => wall.orientation === expectedOrientation)
+    .filter(wall => Math.abs((isHorizontal ? wall.z1 : wall.x1) - boundary) < 0.05)
+    .map(wall => ({
+      id: wall.id,
+      roomIds: wall.roomIds,
+      line: [wall.x1, wall.z1, wall.x2, wall.z2],
+      span: isHorizontal ? [Math.min(wall.x1, wall.x2), Math.max(wall.x1, wall.x2)] : [Math.min(wall.z1, wall.z2), Math.max(wall.z1, wall.z2)]
+    }));
+
+  return {
+    segment: segment.kind,
+    roomId,
+    boundary: Number(boundary.toFixed(3)),
+    span: [Number(start.toFixed(3)), Number(end.toFixed(3))],
+    receivedExteriorWalls: (walls || []).filter(wall => wall?.isExterior).length,
+    matchingWalls,
+    classifiedExterior: matchingWalls.some(({ span }) => Math.min(end, span[1]) - Math.max(start, span[0]) > 0.001)
+  };
 }
 
 /* ── Selection outline ──
@@ -483,16 +667,21 @@ function OutlineBox({ size, color, position = [0, 0, 0] }) {
 }
 
 /* ── Main Room component ── */
+/* ── Main Room component ── */
+/* ── Main Room component ── */
 export default function Room({
   room,
   selected,
   style,
   accent,
-  showLabel,
-  onSelect,
+  showLabel = true,
+  onSelect = () => {},
   transparent = false,
   buildingBounds = null,
-  exteriorColor = null
+  exteriorColor = null,
+  globalProperties = null,
+  exteriorWalls = [],
+  rooms = []
 }) {
   const [hovered, setHovered] = useState(false);
   const floor = roomFloor(room, style);
@@ -507,23 +696,29 @@ export default function Room({
   const isChhajja = indianOptions.chhajja;
   const isMaliya = indianOptions.maliya && (room.type.includes("bedroom") || room.type.includes("kitchen"));
 
-  // Safety guard: skip rooms with invalid geometry to prevent Three.js NaN errors
-  if (!Number.isFinite(bounds.width) || bounds.width <= 0.01 ||
+  if (!Number.isFinite(bounds.x) || !Number.isFinite(bounds.z) ||
+      !Number.isFinite(bounds.width) || bounds.width <= 0.01 ||
       !Number.isFinite(bounds.length) || bounds.length <= 0.01) {
     return null;
   }
 
-  
   const { segments: wallSegments, windowPanes, doorPanes } = useMemo(
     () => wallSegmentsFor(room, bounds, wallThickness),
     [bounds.length, bounds.width, room, wallThickness]
   );
+  const validWallSegments = wallSegments.filter(segment =>
+    ['px', 'py', 'pz', 'sx', 'sy', 'sz'].every(key => Number.isFinite(segment[key])) &&
+    segment.sx > 0 && segment.sy > 0 && segment.sz > 0
+  );
+
   
-  const actualWallColor = room.wallColor || wallColor || "#f8fafc";
+  
+  const actualWallColor = room.wallColor || room.color || wallColor || "#f8fafc";
   const actualFloorColor = room.floorColor || floor.color || "#e2e8f0";
 
-  // Which of this room's walls face the building exterior? (raw room coords vs
-  // building perimeter). Exterior walls get the exterior facade color.
+  useEffect(() => {
+  }, [room.id, room.wallColor, room.floorColor, room.furnitureColor, actualWallColor, actualFloorColor, style?.wallFinish, exteriorColor, style?.vastuColors]);
+
   const EXT_TOL = 1.0;
   const exteriorSides = {
     north: buildingBounds && Math.abs(room.z - buildingBounds.minZ) < EXT_TOL,
@@ -531,17 +726,20 @@ export default function Room({
     west:  buildingBounds && Math.abs(room.x - buildingBounds.minX) < EXT_TOL,
     east:  buildingBounds && Math.abs((room.x + room.width) - buildingBounds.maxX) < EXT_TOL,
   };
+
+  // FIX: .replace(/\s+/g, '') converts "light blue" to "lightblue" so Three.js doesn't crash
   const extHex = exteriorColor
     ? (exteriorColor.startsWith("#") ? exteriorColor
-        : (wallPalette[exteriorColor.toLowerCase().replace(/ /g, "_")] || null))
+        : (wallPalette[exteriorColor.toLowerCase().replace(/ /g, "_")] || exteriorColor.replace(/\s+/g, '')))
     : null;
+
   const floorRoughness = floor.roughness ?? 0.6;
   const floorMetalness = floor.metalness ?? 0.01;
   
   const glow = hovered ? "#38bdf8" : "#000000";
   const spring = useSpring({ scaleY: 1, from: { scaleY: 0.04 }, delay: 90 });
 
-  const handleClick = (kind) => (event) => {
+  const handleClick = (clickedKind) => (event) => {
     event.stopPropagation();
     const mode = useProjectStore.getState().selectionMode;
 
@@ -550,11 +748,11 @@ export default function Room({
       return;
     }
 
-    if (mode === "wall" && !kind.includes("solid")) return;
-    if (mode === "floor" && kind !== "floor") return;
-    if (mode === "furniture" && kind !== "furniture") return;
-    
-    onSelect(room.id, kind, event.shiftKey);
+    if (mode === "wall" && !clickedKind.includes("solid")) return;
+    if (mode === "floor" && clickedKind !== "floor") return;
+    if (mode === "furniture" && clickedKind !== "furniture") return;
+
+    onSelect(room.id, clickedKind, event.shiftKey);
   };
 
   const selectedObject = useProjectStore((state) => state.selectedObject);
@@ -563,6 +761,72 @@ export default function Room({
 
   const isTransparentMode = useProjectStore((state) => state.isTransparentMode);
   const isXRay = showWiring || showPlumbing || isTransparentMode;
+
+  const matArrays = useMemo(() => {
+    const baseColor = isXRay ? "#ffffff" : actualWallColor;
+    
+    // FIX 2: Stop the "bleed". If exterior isn't explicitly painted, fallback to a global neutral 
+    // color (like Off-White) rather than copying the room's interior wall color.
+    const globalFallback = (style && style.wallFinish && wallPalette[style.wallFinish]) || "#F8F8FF";
+    const extColor = isXRay ? "#ffffff" : (extHex || globalFallback);
+
+    const bm = new THREE.MeshPhysicalMaterial({
+      color: baseColor,
+      roughness: floorRoughness,
+      metalness: floorMetalness,
+      clearcoat: 0.25,
+      reflectivity: 0.3,
+      transparent: isXRay,
+      opacity: isXRay ? 0.3 : 1,
+      depthWrite: !isXRay,
+      emissive: glow,
+      emissiveIntensity: hovered ? 0.04 : 0,
+    });
+
+    const em = new THREE.MeshPhysicalMaterial({
+      color: extColor,
+      roughness: floorRoughness,
+      metalness: floorMetalness,
+      clearcoat: 0.25,
+      reflectivity: 0.3,
+      transparent: isXRay,
+      opacity: isXRay ? 0.3 : 1,
+      depthWrite: !isXRay,
+      emissive: glow,
+      emissiveIntensity: hovered ? 0.04 : 0,
+    });
+
+    return {
+      interior: [bm, bm, bm, bm, bm, bm],
+      east:  [em, bm, em, em, em, em],
+      west:  [bm, em, em, em, em, em],
+      south: [em, em, em, em, em, bm],
+      north: [em, em, em, em, bm, em],
+      baseMat: bm,  // Added so we can access it below
+      extMat: em    // Added so we can access it below
+    };
+  }, [isXRay, actualWallColor, extHex, glow, hovered, floorRoughness, floorMetalness]);
+
+  const customMaterials = useMemo(() => {
+    const mats = {};
+    if (room.wallColors) {
+      Object.entries(room.wallColors).forEach(([key, color]) => {
+        mats[key] = new THREE.MeshPhysicalMaterial({
+          color: isXRay ? "#ffffff" : color,
+          roughness: floorRoughness,
+          metalness: floorMetalness,
+          clearcoat: 0.25,
+          reflectivity: 0.3,
+          transparent: isXRay,
+          opacity: isXRay ? 0.3 : 1,
+          depthWrite: !isXRay,
+          emissive: glow,
+          emissiveIntensity: hovered ? 0.04 : 0,
+        });
+      });
+    }
+    return mats;
+  }, [room.wallColors, isXRay, glow, hovered, floorRoughness, floorMetalness]);
 
   return (
     <group position={[bounds.x, 0, bounds.z]}>
@@ -576,7 +840,12 @@ export default function Room({
           position={[bounds.width / 2, 0.01, bounds.length / 2]}
           userData={{ hideInBlueprint: true }}
         >
-          <boxGeometry args={[bounds.width, 0.04, bounds.length]} />
+          {/* FIX: Pull the floor edge in by 0.01 on all sides so it hides behind the exterior wall paint */}
+          <boxGeometry args={[
+            Math.max(0.01, bounds.width - 0.02), 
+            0.04, 
+            Math.max(0.01, bounds.length - 0.02)
+          ]} />
           <meshPhysicalMaterial
             color={actualFloorColor}
             roughness={floorRoughness}
@@ -616,86 +885,89 @@ export default function Room({
 
       {/* ── Walls with spring anim ── */}
       <a.group scale-y={spring.scaleY}>
-        {wallSegments.map(({ id, kind, px, py, pz, sx, sy, sz }, idx) => {
+        {validWallSegments
+          .flatMap(segment => extHex
+            ? splitSegmentByExteriorWalls(segment, room, exteriorWalls, rooms)
+            : [segment])
+          .map(({ id, kind, px, py, pz, sx, sy, sz, _isExterior }, idx) => {
           const _selKind = selectedObject?.kind || "";
-          const isSelectedWall = selected && !!id && _selKind.includes(id);
-          let segWallColor = room.wallColors?.[id];
-          if (segWallColor) {
-            segWallColor = wallPalette[segWallColor] || (segWallColor.startsWith('#') ? segWallColor : wallPalette.warm_white);
+          const isSelectedWall = selected && (_selKind === "wall" || _selKind === id || _selKind === kind);
+
+          let isExt = false;
+          const orientation = kind.split('-')[0];
+
+          if (_isExterior !== undefined) {
+            isExt = _isExterior;
           } else {
-            // Exterior-facing walls take the facade color; interior walls take
-            // the room's interior paint.
-            const orientation = (kind || "").split("-")[0];
-            if (extHex && exteriorSides[orientation]) {
-              segWallColor = extHex;
-            } else {
-              segWallColor = actualWallColor;
-            }
+            isExt = exteriorSides[orientation];
           }
-          
-          // Slightly overlap walls to prevent floating point gaps, but use very tiny overlap to prevent Z-fighting blurriness.
-          // Exterior facade segments overlap by a full wall thickness so the
-          // colored facade is continuous — no white strips where interior
-          // partition walls or corners meet the outer face.
-          // Overlap walls along their long axis so perpendicular segments meet
-          // INSIDE the corner instead of leaving a square hole. Exterior facade
-          // segments overlap more (continuous painted facade); interior walls
-          // overlap a full thickness so every corner intersection is filled.
-          const isExtSeg = !!extHex && segWallColor === extHex;
-          const extBump = isExtSeg ? wallThickness * 2.2 : wallThickness * 1.1;
-          const overSx = sx > wallThickness ? sx + extBump : sx;
-          const overSz = sz > wallThickness ? sz + extBump : sz;
+
+          const overSx = Math.max(0.01, sx);
+          const overSy = Math.max(0.01, sy);
+          const overSz = Math.max(0.01, sz);
+
+          // 1. Safely clone the material array so we can mutate faces without breaking cache
+          let segmentMats = [...matArrays.interior];
+
+          if (isExt) {
+            if (orientation === 'north') segmentMats = [...matArrays.north];
+            else if (orientation === 'south') segmentMats = [...matArrays.south];
+            else if (orientation === 'west') segmentMats = [...matArrays.west];
+            else if (orientation === 'east') segmentMats = [...matArrays.east];
+          }
+
+          const customMat = customMaterials[id] || customMaterials[kind];
+          if (customMat) {
+            segmentMats = segmentMats.map(m => m === matArrays.baseMat ? customMat : m);
+          }
+
+          // 2. Calculate global bounds safely from the existing `rooms` prop
+          let bMinX = -9999, bMaxX = 9999, bMinZ = -9999, bMaxZ = 9999;
+          if (rooms && rooms.length > 0) {
+            bMinX = Math.min(...rooms.map(r => (r.x - 12) * SCALE));
+            bMaxX = Math.max(...rooms.map(r => ((r.x - 12) + r.width) * SCALE));
+            bMinZ = Math.min(...rooms.map(r => (r.z - 10) * SCALE));
+            bMaxZ = Math.max(...rooms.map(r => ((r.z - 10) + r.length) * SCALE));
+          }
+
+          // 3. Absolute World Collision: Does this specific face touch the global perimeter?
+          const sMinX = bounds.x + px - overSx / 2;
+          const sMaxX = bounds.x + px + overSx / 2;
+          const sMinZ = bounds.z + pz - overSz / 2;
+          const sMaxZ = bounds.z + pz + overSz / 2;
+
+          const TOL = 0.05;
+          const isEastEdge = Math.abs(sMaxX - bMaxX) < TOL;
+          const isWestEdge = Math.abs(sMinX - bMinX) < TOL;
+          const isSouthEdge = Math.abs(sMaxZ - bMaxZ) < TOL;
+          const isNorthEdge = Math.abs(sMinZ - bMinZ) < TOL;
+
+          // 4. THE FIX: Force paint the specific face Mustard if it pokes out to the global edge
+          // Faces: [0:East, 1:West, 2:Top, 3:Bottom, 4:South, 5:North]
+          if (isEastEdge)  segmentMats[0] = matArrays.extMat;
+          if (isWestEdge)  segmentMats[1] = matArrays.extMat;
+          if (isSouthEdge) segmentMats[4] = matArrays.extMat;
+          if (isNorthEdge) segmentMats[5] = matArrays.extMat;
+
+          if (isEastEdge || isWestEdge || isSouthEdge || isNorthEdge) {
+            console.log(`[EDGE WALL] Room: ${room.name} | Kind: ${kind} | Ext:${isExt} | E:${isEastEdge} W:${isWestEdge} S:${isSouthEdge} N:${isNorthEdge}`);
+          }
 
           return (
-          <React.Fragment key={`${id || kind}-${idx}`}>
-          <mesh
-            castShadow={!isXRay}
-            receiveShadow={!isXRay}
-            position={[px, py, pz]}
-            onClick={handleClick(id || kind)}
-          >
-            <boxGeometry args={[overSx, sy, overSz]} />
-              <meshPhysicalMaterial
-                color={isXRay ? "#ffffff" : segWallColor}
-                roughness={isXRay ? 0.1 : 0.9}
-                metalness={isXRay ? 0.1 : 0}
-                transmission={isXRay ? 0.95 : 0}
-                clearcoat={isXRay ? 1 : 0}
-                emissive={glow}
-                emissiveIntensity={hovered ? 0.04 : 0}
-                transparent={isXRay}
-                opacity={isXRay ? 0.15 : 1}
-                depthWrite={!isXRay}
-              />
-          </mesh>
-          {isSelectedWall && <OutlineBox size={[overSx, sy, overSz]} color="#34d399" position={[px, py, pz]} />}
-          </React.Fragment>
-        )})}
-
-        {/* ── Corner posts ──
-            Each wall is a box centred ON its edge line, so the OUTER corner
-            square (beyond both wall faces) is covered by neither wall → a white
-            notch at every building corner. A short post at each corner fills
-            that notch and inherits the facade colour when the corner is on the
-            building exterior, so corners are always solid and correctly painted. */}
-        {!isXRay && (() => {
-          const cornerH = room.is_double_height ? WALL_HEIGHT * 2 : WALL_HEIGHT;
-          const t = wallThickness * 1.35; // overlap both meeting walls + the notch
-          const postColor = (sa, sb) =>
-            (extHex && (exteriorSides[sa] || exteriorSides[sb])) ? extHex : actualWallColor;
-          const corners = [
-            { x: 0, z: 0, c: postColor("north", "west") },
-            { x: bounds.width, z: 0, c: postColor("north", "east") },
-            { x: 0, z: bounds.length, c: postColor("south", "west") },
-            { x: bounds.width, z: bounds.length, c: postColor("south", "east") },
-          ];
-          return corners.map((p, i) => (
-            <mesh key={`post-${i}`} position={[p.x, cornerH / 2, p.z]} castShadow receiveShadow>
-              <boxGeometry args={[t, cornerH, t]} />
-              <meshPhysicalMaterial color={p.c} roughness={0.9} metalness={0} />
-            </mesh>
-          ));
-        })()}
+            <React.Fragment key={`${id || kind}-${idx}`}>
+              <mesh
+                castShadow={!isXRay}
+                receiveShadow={!isXRay}
+                position={[px, py, pz]}
+                onClick={handleClick(id || kind)}
+                material={segmentMats}
+              >
+                <boxGeometry args={[overSx, overSy, overSz]} />
+              </mesh>
+              {isSelectedWall && <OutlineBox size={[overSx, overSy, overSz]} color="#34d399" position={[px, py, pz]} />}
+            </React.Fragment>
+          );
+          })}
       </a.group>
 
       {/* ── Glass windows ── */}
@@ -950,7 +1222,7 @@ export default function Room({
       />
 
       {/* ── Selection highlight glow on floor ── */}
-      {selected && (
+      {isSelectedFloor && (
         <mesh position={[bounds.width / 2, 0.006, bounds.length / 2]}>
           <boxGeometry
             args={[bounds.width + 0.04, 0.005, bounds.length + 0.04]}
@@ -965,7 +1237,7 @@ export default function Room({
       )}
 
       {/* ── Selection perimeter outline ── */}
-      {selected && (
+      {isSelectedRoom && (
         <OutlineBox size={[bounds.width, WALL_HEIGHT, bounds.length]} color="#34d399" position={[bounds.width / 2, WALL_HEIGHT / 2, bounds.length / 2]} />
       )}
 
@@ -986,7 +1258,7 @@ export default function Room({
       )}
 
       {/* ── Expansion arrows (only visible when room is selected) ── */}
-      {selected && (
+      {isSelectedRoom && (
         <>
           {/* East (+X) */}
           <ExpansionArrow

@@ -191,6 +191,7 @@ Output NOTHING but valid JSON matching this schema. Do not include markdown code
             )
         )
         content = response.text
+        logger.info(f"[GEMINI RAW OUTPUT]\n{content}")
         
         # Sometimes models output markdown code blocks despite instructions
         if content.startswith("```json"):

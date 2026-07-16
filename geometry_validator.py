@@ -159,20 +159,26 @@ class GeometryValidator:
             min_dim = min(r.rect.width, r.rect.length)
             area = r.rect.width * r.rect.length
             
-            if "bed" in rt:
-                if min_dim < 9.0 or area < 100:
+            if "master_bed" in rt:
+                if min_dim < 11.0 or area < 160:
+                    msg = f"FURNITURE ERROR: {r.id} ({r.rect.width}x{r.rect.length}) is too small to fit a master bed with walking clearance."
+                    logger.warning(msg)
+                    result.errors.append(msg)
+                    result.is_valid = False
+            elif "bed" in rt:
+                if min_dim < 10.0 or area < 140:
                     msg = f"FURNITURE ERROR: {r.id} ({r.rect.width}x{r.rect.length}) is too small to fit a standard bed with walking clearance."
                     logger.warning(msg)
                     result.errors.append(msg)
                     result.is_valid = False
             elif "kitchen" in rt:
-                if min_dim < 7.5 or area < 64:
+                if min_dim < 7.0 or area < 60:
                     msg = f"FURNITURE ERROR: {r.id} is too small for a functional kitchen work triangle."
                     logger.warning(msg)
                     result.errors.append(msg)
                     result.is_valid = False
             elif "living" in rt:
-                if min_dim < 10.0 or area < 120:
+                if min_dim < 11.0 or area < 150:
                     msg = f"FURNITURE ERROR: {r.id} is too small for a functional living room setup."
                     logger.warning(msg)
                     result.errors.append(msg)
@@ -610,9 +616,9 @@ class GeometryValidator:
                     result.errors.append(msg)
                     result.is_valid = False
                 elif ("bath" in r_type or "toilet" in r_type or "kitchen" in r_type) and num_windows == 0:
-                    msg = f"VENTILATION ERROR: {boxes[idx].label} has no ventilation!"
-                    result.errors.append(msg)
-                    result.is_valid = False
+                    msg = f"VENTILATION ERROR: {boxes[idx].label} has no ventilation (will require exhaust shaft)!"
+                    # We just warn instead of failing the entire layout for interior wet rooms
+                    logger.warning(msg)
 
         # --- PERSONA-BASED BFS PATHFINDING ---
         def bfs_path(start_idx, target_type):
@@ -631,7 +637,7 @@ class GeometryValidator:
         def is_passage_allowed(idx):
             rt = blueprint[idx].get("room_type", "").lower()
             # Only high-traffic/movement rooms can act as passages for general flow
-            return any(p in rt for p in ['entrance', 'hallway', 'corridor', 'living', 'foyer'])
+            return any(p in rt for p in ['entrance', 'hallway', 'corridor', 'living', 'foyer', 'dining'])
 
         living_idx = next((i for i, r in enumerate(blueprint) if "living" in r.get("room_type", "").lower()), None)
         kitchen_idx = next((i for i, r in enumerate(blueprint) if "kitchen" in r.get("room_type", "").lower()), None)

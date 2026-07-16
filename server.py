@@ -66,10 +66,62 @@ from vocabulary import (
     TYPOLOGY,
 )
 from cloud_extractor import extract_keywords_groq, reason_modifications_deepseek
+from local_extractor import extract_keywords_to_json
 from semantic_analyzer import evaluate_complexity
 from geometry_engine import LayoutGeometryEngine
 
-USE_SLM_ENGINE = False
+USE_SLM_ENGINE = True
+# Frontend palette IDs are normalized here so template and AI generation use
+# exactly the colors selected in ProjectSetupModal, including custom hex values.
+PALETTE_HEX = {
+    "off_white": "#F8F8FF", "warm_beige": "#F5F5DC", "light_grey": "#D3D3D3",
+    "red": "#E2725B", "sage": "#9CA986", "charcoal": "#36454F", "beige": "#F5F5DC",
+    "mustard": "#E4A010", "yellow": "#E4A010", "terracotta": "#E2725B",
+    "cream": "#FDF5E6", "peach": "#FFDAB9", "sea_green": "#2E8B57",
+    "indigo": "#4B0082", "white": "#FFFFFF", "concrete": "#808080",
+    "brick": "#B22222", "wood": "#DEB887",
+    "light_wood": "#C8A878", "dark_wood": "#5A3A22", "walnut": "#4B3621",
+    "modern_gray": "#6B7280", "white_oak": "#D8C2A0", "teak": "#9C6B3F",
+    "marble_white": "#F1F0EC", "beige_marble": "#E6DCC8", "granite": "#4A4A52",
+    "wooden_flooring": "#8B5A2B", "ceramic_tile": "#D7DDE5", "concrete_finish": "#8B929D",
+    "dark_grey": "#2F4F4F", "brown": "#654321",
+}
+
+def _palette_color(value: Any) -> Optional[str]:
+    if not isinstance(value, str) or not value.strip():
+        return None
+    value = value.strip()
+    if value.startswith("#"):
+        return value
+    return PALETTE_HEX.get(value.lower().replace(" ", "_"), value)
+
+
+def _apply_selected_palette(nodes: List[RoomNode], colors: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    colors = colors or {}
+    interior = _palette_color(colors.get("interior"))
+    exterior = _palette_color(colors.get("exterior"))
+    floor = _palette_color(colors.get("floor"))
+    furniture = _palette_color(colors.get("furniture"))
+    roof = _palette_color(colors.get("roof"))
+    logger.info("[PALETTE DEBUG] Resolved palette request=%s resolved=%s node_count=%d", colors, {"interior": interior, "exterior": exterior, "floor": floor, "furniture": furniture, "roof": roof}, len(nodes))
+    for node in nodes:
+        if interior:
+            node.wallColor = interior
+        if floor:
+            node.floorColor = floor
+        if furniture:
+            node.furnitureColor = furniture
+    return {
+        **({"wallFinish": interior} if interior else {}),
+        **({"exteriorColor": exterior} if exterior else {}),
+        **({"floorMaterial": floor} if floor else {}),
+        **({"furnitureColor": furniture} if furniture else {}),
+        **({"roofColor": roof} if roof else {}),
+        "selectedColors": {k: v for k, v in {
+            "interior": interior, "exterior": exterior, "floor": floor,
+            "furniture": furniture, "roof": roof,
+        }.items() if v},
+    }
 
 
 def smart_layout_validation(
@@ -181,8 +233,10 @@ def apply_bedroom_intelligence(rooms: list, prompt: str = "", requested_types=No
 # Logging
 # ---------------------------------------------------------------------------
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(name)s | %(levelname)s | %(message)s")
+logging.basicConfig(level=logging.WARNING, format="%(asctime)s | %(name)s | %(levelname)s | %(message)s")
 logger = logging.getLogger("homevision")
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("google_genai.models").setLevel(logging.WARNING)
 
 # ---------------------------------------------------------------------------
 # FastAPI app
@@ -1002,24 +1056,53 @@ def build_room_changes(
                 "x": round(nx, 2),
                 "z": round(nz, 2),
                 "wallThicknessIn": 8 if norm in ("kitchen", "bathroom", "utility") else 6,
+                # Keep the new room connected to its donor.  Coordinates are
+                # local to the new room, as expected by the React renderer.
+                "doors": [{
+                    "x": 0 if pw >= pl else round(nwid / 2, 2),
+                    "z": round(nlen / 2, 2) if pw >= pl else 0,
+                    "wall_orientation": "west" if pw >= pl else "north",
+                    "width": min(3.0, nwid * 0.6, nlen * 0.6),
+                    "height": 7.0,
+                }],
+                "windows": [],
+                "floorColor": "",
+                "furnitureColor": "",
+                "wallColor": "",
+                "wallColors": {},
+                "furniture": [],
+                "mep_nodes": [],
+                "connections": [{"target_room": parent.get("type", "corridor"), "weight": 10}],
             })
         return rooms
 
     # REMOVE intent
-    if "remove" in intents and room_types:
+    if ("remove" in intents or "delete" in intents) and room_types:
         prompt_lower = prompt.lower()
         # If they want to remove a sub-element, DO NOT remove the entire room!
         if "door" not in prompt_lower and "window" not in prompt_lower and "furniture" not in prompt_lower:
-            for rtype in room_types:
-                rooms = [
-                    r for r in rooms
-                    if rtype not in r.get("name", "").lower()
-                    and rtype not in r.get("type", "").lower()
-                    and rtype.replace(" ", "_") != r.get("type", "")
-                ]
+            removed_any = False
+            # First pass: look for exact ID/Name match in the prompt
+            for i, r in enumerate(rooms):
+                r_id = r.get("id", "").lower()
+                r_name = r.get("name", "").lower()
+                if (r_id and r_id in prompt_lower) or (r_name and r_name in prompt_lower):
+                    rooms.pop(i)
+                    removed_any = True
+                    break
+            
+            # Second pass: generic type match if no exact match found
+            if not removed_any:
+                for rtype in room_types:
+                    for i, r in enumerate(rooms):
+                        if (rtype in r.get("name", "").lower()
+                            or rtype in r.get("type", "").lower()
+                            or rtype.replace(" ", "_") == r.get("type", "")):
+                            rooms.pop(i)
+                            break
+            
             if len(rooms) != len(current_rooms):
                 return rooms
-
     # RESIZE intent
     if "resize" in intents and room_types:
         size_delta = 0
@@ -1040,11 +1123,21 @@ def build_room_changes(
         if size_delta != 0:
             for rtype in room_types:
                 for room in rooms:
-                    if (rtype in room.get("name", "").lower()
-                            or rtype in room.get("type", "").lower()
-                            or rtype.replace(" ", "_") == room.get("type", "")):
+                    r_name = room.get("name", "").lower()
+                    r_type = room.get("type", "").lower()
+                    r_id = room.get("id", "").lower()
+                    
+                    # If the prompt explicitly mentions this room's exact ID or Name, ONLY scale this one!
+                    if (r_id and r_id in text) or (r_name and r_name in text):
                         room["width"] = max(6, room.get("width", 10) + size_delta)
                         room["length"] = max(6, room.get("length", 10) + size_delta)
+                    # Fallback generic match
+                    elif (rtype in r_name or rtype in r_type or rtype.replace(" ", "_") == r_type):
+                        # Make sure they didn't explicitly request a DIFFERENT room
+                        any_id_in_text = any((r2.get("id", "").lower() in text or r2.get("name", "").lower() in text) for r2 in rooms)
+                        if not any_id_in_text:
+                            room["width"] = max(6, room.get("width", 10) + size_delta)
+                            room["length"] = max(6, room.get("length", 10) + size_delta)
             return rooms
 
     # MOVE intent
@@ -1108,6 +1201,49 @@ def build_room_changes(
     return None
 
 
+def _preserve_modified_project_rooms(rooms: List[Dict[str, Any]]) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
+    """Return modified rooms plus fresh finite wall metadata without relayout.
+
+    Prompt edits must not go through the fresh-generation pipeline.  It creates
+    a new BSP plan and therefore discards the user's existing room-level data.
+    This helper only rebuilds the wall graph from the already-edited rectangles.
+    """
+    by_floor: Dict[bool, List[Dict[str, Any]]] = {False: [], True: []}
+    for room in rooms:
+        if not isinstance(room, dict):
+            continue
+        if all(math.isfinite(float(room.get(k, 0))) for k in ("x", "z", "width", "length")):
+            by_floor[bool(room.get("isFloor1", False))].append(room)
+
+    layout_data: Dict[str, Any] = {
+        "floor_0": by_floor[False],
+        "walls_floor_0": [],
+    }
+    if by_floor[True]:
+        layout_data["floor_1"] = by_floor[True]
+        layout_data["walls_floor_1"] = []
+
+    for is_floor1, floor_rooms in by_floor.items():
+        if not floor_rooms:
+            continue
+        nodes = [RoomNode(
+            id=str(r.get("id")),
+            type=str(r.get("type", "living_room")),
+            name=str(r.get("name", r.get("type", "Room"))),
+            rect=Rect(float(r["x"]), float(r["z"]), float(r["width"]), float(r["length"])),
+            wallThicknessIn=float(r.get("wallThicknessIn", 6) or 6),
+            floorColor=r.get("floorColor", "") or "",
+            wallColor=r.get("wallColor", "") or "",
+            furnitureColor=r.get("furnitureColor", "") or "",
+            furniture=r.get("furniture", []) or [],
+            mep_nodes=r.get("mep_nodes", []) or [],
+        ) for r in floor_rooms]
+        walls = compute_shared_walls(nodes)
+        layout_data["walls_floor_1" if is_floor1 else "walls_floor_0"] = walls
+
+    return layout_data, [*by_floor[False], *by_floor[True]]
+
+
 # ---------------------------------------------------------------------------
 # API endpoints
 # ---------------------------------------------------------------------------
@@ -1135,6 +1271,12 @@ async def generate_plan(req: GenerateRequest):
     """
     try:
         request_start = time.time()
+        _logs = []  # Collect backend logs to send to frontend
+        def _log(level, msg):
+            _logs.append({"type": level, "message": msg, "time": f"{(time.time() - request_start)*1000:.0f}ms"})
+            logger.info(f"[GEN-LOG][{level.upper()}] {msg}")
+
+        _log("info", f"Prompt received: \"{req.prompt}\"")
         logger.info("[PERF] /api/generate API endpoint hit.")
         if not req.prompt or not req.prompt.strip():
             raise HTTPException(status_code=400, detail={
@@ -1147,6 +1289,7 @@ async def generate_plan(req: GenerateRequest):
         # Dual-Path Gateway
         slm_result = None
         complexity = evaluate_complexity(req.prompt)
+        _log("info", f"Complexity evaluated: {complexity}")
         ai_start = time.time()
         
         # Check if project is actually empty (initial generation)
@@ -1159,37 +1302,41 @@ async def generate_plan(req: GenerateRequest):
             elif req.currentProject.get("floors") and req.currentProject["floors"][0].get("rooms"):
                 is_empty = False
 
+        _log("info", f"Project state: {'EMPTY (initial generation)' if is_empty else 'HAS ROOMS (modification)'}")
+
         if not is_empty and complexity == "HIGH":
             # Path B: High Complexity Cloud LLM (OpenRouter/DeepSeek-R1)
-            logger.info("Routing to High Complexity Cloud Engine (DeepSeek-R1)")
+            _log("info", "Routing → HIGH complexity Cloud Engine (DeepSeek-R1)")
             try:
                 slm_result = reason_modifications_deepseek(req.prompt, req.currentProject)
-                logger.info(f"[PERF] DeepSeek took {(time.time() - ai_start)*1000:.2f} ms")
-                return {"status": "success", "project": slm_result}
+                elapsed = (time.time() - ai_start)*1000
+                _log("success", f"DeepSeek responded in {elapsed:.0f}ms")
+                return {"status": "success", "project": slm_result, "logs": _logs}
             except Exception as e:
-                logger.error(f"High Complexity Routing Failed: {e}")
+                _log("error", f"DeepSeek failed: {e}")
                 
         elif not is_empty and complexity == "LOW":
             # Path B-Low: Local CSP Matrix Solver
-            # The geometry_engine.py is just a skeleton for now. 
-            # We will use Groq to extract the modification intent, then let the legacy layout_engine handle the CSP local bounding.
-            logger.info("Routing to Initial Generation Engine (Groq) for LOW complexity modification")
+            _log("info", "Routing → LOW complexity modification via Gemini")
             try:
                 slm_result = extract_keywords_groq(req.prompt, ALL_VOCABULARIES)
-                logger.info(f"[PERF] Groq took {(time.time() - ai_start)*1000:.2f} ms")
+                elapsed = (time.time() - ai_start)*1000
+                _log("success", f"Gemini extraction done in {elapsed:.0f}ms")
             except Exception as e:
-                logger.error(f"Groq Extraction Failed: {e}")
+                _log("error", f"Gemini extraction failed: {e}")
                 
         else:
-            # Path A: Initial Generation via Groq
-            logger.info("Routing to Initial Generation Engine (Groq)")
+            # Path A: Initial Generation via Gemini
+            _log("info", "Routing → Initial generation via Gemini")
             try:
                 slm_result = extract_keywords_groq(req.prompt, ALL_VOCABULARIES)
-                logger.info(f"[PERF] Groq took {(time.time() - ai_start)*1000:.2f} ms")
+                elapsed = (time.time() - ai_start)*1000
+                _log("success", f"Gemini extraction done in {elapsed:.0f}ms")
             except Exception as e:
-                logger.error(f"Groq Extraction Failed: {e}")
+                _log("error", f"Gemini extraction failed: {e}")
 
         if slm_result:
+            _log("success", f"AI extracted: intent={slm_result.get('intent', '?')}, bhk={slm_result.get('bhk', '?')}, rooms={slm_result.get('target_rooms', [])}, style={slm_result.get('style', '?')}")
             # Map SLM result to the data structures expected by the rest of the pipeline
             layout_params = {}
             if slm_result.get("bhk"):
@@ -1202,7 +1349,20 @@ async def generate_plan(req: GenerateRequest):
                 for r in slm_result.get("target_rooms", []):
                     room_str = r.lower().replace("_", " ")
                     prompt_clean = prompt_lower.replace("_", " ")
-                    if room_str in prompt_clean or room_str.replace(" ", "") in prompt_clean.replace(" ", ""):
+                    
+                    # 1. Check for exact match
+                    is_match = room_str in prompt_clean or room_str.replace(" ", "") in prompt_clean.replace(" ", "")
+                    
+                    # 2. Check for AI synonym upgrades (e.g., prompt="bedroom", AI="master_bedroom")
+                    if not is_match:
+                        if "bedroom" in prompt_clean and "bedroom" in room_str:
+                            is_match = True
+                        elif "bath" in prompt_clean and "bath" in room_str:
+                            is_match = True
+                        elif "living" in prompt_clean and "living" in room_str:
+                            is_match = True
+
+                    if is_match:
                         valid_rooms.append(r)
                 
                 # Check for explicit furniture keywords in the prompt to trigger room generation or flag
@@ -1242,7 +1402,10 @@ async def generate_plan(req: GenerateRequest):
                 "materials": [{"canonical": m} for m in slm_result.get("materials", [])],
                 "sizes": [],
                 "move_target": slm_result.get("move_target_room", ""),
-                "move_dest": slm_result.get("move_destination", "")
+                "move_dest": slm_result.get("move_destination", ""),
+                # NEW: Pass AI extracted colors natively
+                "room_colors": slm_result.get("room_colors", []),
+                "global_color": slm_result.get("global_color", "")
             }
 
             understood = [f"Intent: {slm_result.get('intent')}"]
@@ -1275,6 +1438,7 @@ async def generate_plan(req: GenerateRequest):
 
             warnings = []
         else:
+            _log("warn", "AI extraction returned None — falling back to rule-based NLP")
             # Fallback to Old NLP analysis
             analysis = analyze_prompt(req.prompt)
             layout_params = analysis["layout_params"]
@@ -1336,11 +1500,11 @@ async def generate_plan(req: GenerateRequest):
             "brown": "#654321"
         }
 
-        wall_finish = active_preset.get("wall_material", "AAC Block")
-        if colors_dict.get("interior"):
+        wall_finish = theme.get("wall") or active_preset.get("wall_material", "AAC Block")
+        if colors_dict.get("interior") and not theme.get("wall"):
             wall_finish = interior_map.get(colors_dict["interior"], colors_dict["interior"])
 
-        ext_color = colors_dict.get("exterior", "White")
+        ext_color = theme.get("exterior") or colors_dict.get("exterior", "White")
         ext_color = exterior_map.get(ext_color, ext_color)
 
         roof_color = active_preset.get("roof_type", "RCC Slab")
@@ -1369,12 +1533,25 @@ async def generate_plan(req: GenerateRequest):
         # Room modifications (if existing project)
         current_rooms = []
         if req.currentProject:
-            current_rooms = req.currentProject.get("rooms", [])
+            if req.currentProject.get("rooms"):
+                current_rooms = req.currentProject.get("rooms", [])
+                _log("info", f"Loaded {len(current_rooms)} existing rooms from project.rooms")
+            elif req.currentProject.get("floors"):
+                for floor in req.currentProject.get("floors", []):
+                    if floor.get("rooms"):
+                        current_rooms.extend(floor.get("rooms", []))
+                _log("info", f"Loaded {len(current_rooms)} existing rooms from project.floors")
+            else:
+                _log("warn", "currentProject provided but NO rooms found in .rooms or .floors")
+        else:
+            _log("info", "No currentProject sent — will generate from scratch")
 
         if current_rooms:
+            _log("info", f"Existing rooms: {[r.get('name', r.get('type', '?')) for r in current_rooms]}")
             # First check for MEP modifications
             mep_adds = slm_result.get("mep_additions", []) if slm_result else []
             if mep_adds and slm_result.get("intent") == "MODIFY_MEP":
+                _log("info", f"MEP modification detected: adding {len(mep_adds)} item(s)")
                 import copy
                 updated_rooms = copy.deepcopy(current_rooms)
                 for addition in mep_adds:
@@ -1393,28 +1570,86 @@ async def generate_plan(req: GenerateRequest):
                 
                 response["layout_data"] = {"floor_0": updated_rooms} # Provide as layout_data so UI applies it
                 response["understood"].append(f"Modified MEP: added items to {len(mep_adds)} rooms")
+                _log("success", f"MEP modification complete — returning updated rooms")
+                response["logs"] = _logs
                 logger.info(f"[PERF] /api/generate total request completed in {(time.time() - request_start)*1000:.2f} ms")
                 return response
 
 
-            # Pre-filter rooms to exclude 'door' and 'window'
             valid_rooms_spec = [r for r in details.get("rooms", []) if r.get("canonical") not in ("door", "window", "furniture", "wiring", "plumbing")]
+            _log("info", f"Room modification intent: intents={[i.get('canonical','?') for i in details.get('intents',[])]}")
             
-            modified_rooms = build_room_changes(
-                req.prompt,
-                current_rooms,
-                details.get("intents", []),
-                valid_rooms_spec,
-                details.get("sizes", []),
-                details.get("move_target", ""),
-                details.get("move_dest", "")
-            )
-            
+            # --- START AI SPATIAL DELEGATION ---
+            intent_val = details.get("intents", [{"canonical": ""}])[0].get("canonical")
+            if intent_val in ["add", "remove", "resize"] and valid_rooms_spec:
+                _log("info", "Delegating topological reasoning to Gemini...")
+                try:
+                    from cloud_extractor import modify_validated_blueprint
+                    
+                    current_bp = []
+                    for r in current_rooms:
+                        current_bp.append({
+                            "room_type": r.get("type", "room"),
+                            "position_x": r.get("x", 0),
+                            "position_z": r.get("z", 0),
+                            "width": r.get("width", 10),
+                            "length": r.get("length", 10),
+                            "connections": r.get("connections", [])
+                        })
+                        
+                    plot_w = layout_params.get("plot_width", req.width or 40.0)
+                    plot_l = layout_params.get("plot_length", req.length or 40.0)
+                    
+                    # Single, fast Gemini call (under 4 seconds)
+                    gemini_result = modify_validated_blueprint(req.prompt, current_bp, plot_w, plot_l)
+                    master_bp = gemini_result.get("master_blueprint", [])
+                    
+                    # Convert Gemini's rough output into layout constraints for the CP-Solver
+                    layout_params["rooms"] = [
+                        {
+                            "type": bp.get("room_type"), 
+                            "confidence": 100, 
+                            "width": bp.get("width"), 
+                            "length": bp.get("length"),
+                            "x": bp.get("position_x"),      # CP Solver will use these as hints
+                            "z": bp.get("position_z"),      # CP Solver will use these as hints
+                            "connections": bp.get("connections", []) # Forces corridor to connect!
+                        } 
+                        for bp in master_bp
+                    ]
+                    
+                    # Explicitly remove the hard lock so the CP-Solver runs and fixes overlaps natively
+                    if "master_blueprint" in layout_params:
+                        del layout_params["master_blueprint"]
+                    
+                    modified_rooms = None 
+                    current_rooms = []
+                    _log("success", "Gemini mapped the connections. Handing off to CP-Solver for instant packing.")
+                    response["understood"].append("AI updated the spatial topology.")
+                    
+                except Exception as e:
+                    _log("error", f"Gemini geometry engine failed: {e}. Falling back to Python rules.")
+                    modified_rooms = build_room_changes(
+                        req.prompt, current_rooms, details.get("intents", []), valid_rooms_spec, details.get("sizes", []), details.get("move_target", ""), details.get("move_dest", "")
+                    )
+            else:
+                modified_rooms = build_room_changes(
+                    req.prompt, current_rooms, details.get("intents", []), valid_rooms_spec, details.get("sizes", []), details.get("move_target", ""), details.get("move_dest", "")
+                )
+            # --- END AI SPATIAL DELEGATION ---
+
+            if modified_rooms is not None:
+                _log("success", f"build_room_changes returned {len(modified_rooms)} room(s)")
+            else:
+                _log("warn", "build_room_changes returned None (no structural change detected)")
+
             # Fix 2: Preserve colors when modifying rooms
             if modified_rooms:
                 for mr in modified_rooms:
                     for cr in current_rooms:
-                        if cr.get("id") == mr.get("id") or cr.get("type") == mr.get("type"):
+                        # IDs are stable in the frontend. Matching by type can
+                        # copy Bedroom-1's furniture/colors onto Bedroom-2.
+                        if cr.get("id") == mr.get("id"):
                             if "floorColor" in cr and not mr.get("floorColor"): mr["floorColor"] = cr["floorColor"]
                             if "wallColor" in cr and not mr.get("wallColor"): mr["wallColor"] = cr["wallColor"]
                             # Fix 3: Also preserve furniture
@@ -1446,66 +1681,217 @@ async def generate_plan(req: GenerateRequest):
                                 cr.setdefault("furniture", []).append({"type": "sofa", "x": cr.get("x",0)+1, "z": cr.get("z",0)+1})
                     modified_rooms = current_rooms
 
-            
             if modified_rooms is None and "bhk" in layout_params:
                 # The user specified a new BHK configuration without any modification verbs.
                 # Assume they want to generate a new layout from scratch!
                 current_rooms = []
-            elif modified_rooms is not None:
-                # If intent was MOVE, we return the rooms immediately (in-place modification)
-                if (isinstance(details.get("intent"), str) and details.get("intent").upper() == "MOVE") or (isinstance(details.get("intents"), list) and any(isinstance(i, dict) and i.get("canonical") == "move" for i in details.get("intents", []))):
-                    response["layout_data"] = {"floor_0": modified_rooms}
-                    response["understood"].append(f"Moved {details.get('move_target')} to {details.get('move_dest')}")
-                    return response
+            elif modified_rooms is None and current_rooms:
+                _log("info", "No structural changes — applying AI-parsed style/color changes")
                 
-                # Any modification (add/resize/delete) should trigger auto-arrange!
-                # We extract the room types and let the BSP layout engine regenerate the house layout perfectly.
-                layout_params["rooms"] = [{"type": r["type"], "confidence": 100} for r in modified_rooms]
-                current_rooms = []
+                painted_count = 0
+                room_colors = details.get("room_colors", [])
+                
+                if "style" not in response:
+                    response["style"] = {}
+                if req.currentProject and "style" in req.currentProject:
+                    response["style"].update(req.currentProject.get("style", {}))
+                
+                # 1. Apply specific room and surface colors parsed by the AI
+                if room_colors:
+                    for rc in room_colors:
+                        target_r = rc.get("room", "").lower()
+                        color_val = rc.get("color", "")
+                        surface = rc.get("surface", "wall").lower()
+                        
+                        if not color_val: continue
+                        
+                        # Route Global Surfaces
+                        if "exterior" in surface or "outside" in surface or "exterior" in target_r:
+                            response["style"]["exteriorColor"] = color_val
+                            painted_count += 1
+                            continue
+                        elif "roof" in surface or "roof" in target_r:
+                            response["style"]["roofStyle"] = color_val
+                            response["style"]["roofColor"] = color_val
+                            painted_count += 1
+                            continue
+                            
+                        # Route Room Surfaces
+                        for r in current_rooms:
+                            room_name = r.get("name", "").lower()
+                            room_type = r.get("type", "").lower()
+                            
+                            global_aliases = ["all", "house", "every", "floor", "floors", "wall", "walls", "interior", ""]
+                            
+                            if target_r in global_aliases or target_r in room_name or target_r in room_type:
+                                if "floor" in surface or "floor" in target_r:
+                                    r["floorColor"] = color_val
+                                elif "furniture" in surface or "furniture" in target_r:
+                                    r["furnitureColor"] = color_val
+                                else:
+                                    r["wallColor"] = color_val
+                                    r["wallColors"] = [color_val, color_val, color_val, color_val]
+                                painted_count += 1
+
+                # 2. Fallback: Global Intent
+                if painted_count == 0:
+                    target_color = details.get("global_color") or details.get("color_hex")
+                    if getattr(req, "colors", None) and req.colors:
+                        target_color = target_color or req.colors.get("ai_color")
+                    
+                    if not target_color:
+                        match = re.search(r'\b(red|blue|green|yellow|orange|purple|pink|white|black|gray|grey|brown|beige|cream|light\s+[a-z]+|dark\s+[a-z]+)\b', req.prompt.lower())
+                        if match:
+                            target_color = match.group(1)
+                        
+                    if target_color:
+                        target_rooms = details.get("target_rooms", [])
+                        if not target_rooms and isinstance(details.get("intents"), list) and len(details["intents"]) > 0:
+                            target_rooms = details["intents"][0].get("target_rooms", [])
+                        
+                        prompt_lower = req.prompt.lower()
+                        if any(x in prompt_lower for x in ["exterior", "outside", "facade", "extrior", "exterio", "extr"]):
+                            response["style"]["exteriorColor"] = target_color
+                            painted_count += 1
+                        elif "roof" in prompt_lower:
+                            response["style"]["roofColor"] = target_color
+                            response["style"]["roofStyle"] = target_color
+                            painted_count += 1
+                        else:
+                            for r in current_rooms:
+                                room_name = r.get("name", "").lower()
+                                room_type = r.get("type", "").lower()
+                                
+                                global_aliases = ["all", "house", "every", "floor", "floors", "wall", "walls", "interior"]
+                                is_global = not target_rooms or any(t.lower() in global_aliases for t in target_rooms)
+                                
+                                if is_global or any(t.lower() in room_name or t.lower() in room_type for t in target_rooms):
+                                    if "floor" in prompt_lower:
+                                        r["floorColor"] = target_color
+                                    elif "furniture" in prompt_lower:
+                                        r["furnitureColor"] = target_color
+                                    else:
+                                        r["wallColor"] = target_color
+                                        r["wallColors"] = [target_color, target_color, target_color, target_color] 
+                                    painted_count += 1
+
+                if painted_count > 0:
+                    response["understood"].append(f"Painted {painted_count} surface(s) via AI intent")
+                else:
+                    response["understood"].append("Applied style changes without modifying layout structure")
+                
+                # Format the data as the frontend expects
+                response["layout_data"], _ = _preserve_modified_project_rooms(current_rooms)
+                
+                # --- THE FIX: SAFELY EXTRACT ROOMS BEFORE MAPPING COLORS ---
+                layout_data = response["layout_data"]
+                rooms_to_update = []
+                
+                # Handle both Dictionary formats (Full Project) and List formats (Flat Array)
+                if isinstance(layout_data, list):
+                    rooms_to_update = layout_data
+                elif isinstance(layout_data, dict):
+                    rooms_to_update.extend(layout_data.get("rooms", []))
+                    for f in layout_data.get("floors", []):
+                        rooms_to_update.extend(f.get("rooms", []))
+                
+                for serialized_room in rooms_to_update:
+                    if not isinstance(serialized_room, dict): 
+                        continue # Extra safety check
+                        
+                    for active_room in current_rooms:
+                        # Match the rooms by ID or Name
+                        if serialized_room.get("id") == active_room.get("id") or serialized_room.get("type") == active_room.get("type"):
+                            if "wallColor" in active_room:
+                                serialized_room["wallColor"] = active_room["wallColor"]
+                                serialized_room["wallColors"] = active_room.get("wallColors")
+                            if "floorColor" in active_room:
+                                serialized_room["floorColor"] = active_room["floorColor"]
+                            if "furnitureColor" in active_room:
+                                serialized_room["furnitureColor"] = active_room["furnitureColor"]
+                            break
+                # ------------------------------------------------------------
+                
+                response["logs"] = _logs
+                return response
+
+                # NEW: Construct Master Blueprint to preserve precise carved coordinates!
+                from cloud_extractor import auto_wire_topology
+                wired_specs = auto_wire_topology([r["type"] for r in modified_rooms])
+                
+                master_bp = []
+                for i, r in enumerate(modified_rooms):
+                    master_bp.append({
+                        "room_type": r["type"],
+                        "position_x": r.get("x", 0),
+                        "position_z": r.get("z", 0),
+                        "width": r.get("width", 10),
+                        "length": r.get("length", 10),
+                        "connections": wired_specs[i].get("connections", []),
+                        "floor_number": 1 if r.get("isFloor1") else 0
+                    })
+                layout_params["master_blueprint"] = master_bp
+
+                # Update layout params so the downstream pipeline has the wired topology
+                layout_params["rooms"] = [
+                    {
+                        "type": r["type"], 
+                        "confidence": 100, 
+                        "width": r.get("width"), 
+                        "length": r.get("length"),
+                        "connections": wired_specs[i].get("connections", [])
+                    } 
+                    for i, r in enumerate(modified_rooms)
+                ]
+                current_rooms = [] # This forces generation down below, but now it uses the blueprint
+                _log("info", f"Triggering full layout reconstruction with {len(modified_rooms)} precisely modified room(s)")
+                response["understood"].append("Reconstructed the layout precisely to accommodate changes")
 
         if layout_params.get("rooms") or layout_params.get("bhk"):
+            _log("info", f"Generation trigger: bhk={layout_params.get('bhk', '?')}, rooms={len(layout_params.get('rooms', []))}")
             # If we aren't modifying an existing project, generate from scratch
             if not current_rooms:
-                bhk_val = layout_params.get("bhk", 0)
-                requested_rooms = layout_params.get("rooms", [])
-                
-                # Check if user explicitly listed core rooms
-                core_room_types = {"kitchen", "bedroom", "bathroom", "living_room", "master_bedroom"}
-                requested_types = {r["type"] for r in requested_rooms}
-                has_core_rooms = len(core_room_types.intersection(requested_types)) >= 2
-                
-                base_rooms = []
-                if bhk_val > 0:
-                    # If BHK is specified, ALWAYS use it as the base to guarantee proper core rooms
-                    base_rooms = get_base_rooms_for_bhk(bhk_val)
-
-                    # Append any EXTRA requested rooms (e.g. store room).
-                    existing_types = {r["type"] for r in base_rooms}
-                    for r in requested_rooms:
-                        if r["type"] in ("bedroom", "master_bedroom"):
-                            continue
-                        if r["type"] not in existing_types or r["type"] in ["store_room", "pooja_room", "balcony", "study_room", "laundry"]:
-                            base_rooms.append(r)
-                elif has_core_rooms:
-                    # No BHK specified, but user explicitly defined the layout composition! Use exactly what they gave.
-                    base_rooms = requested_rooms
+                if layout_params.get("master_blueprint"):
+                    # We are in precise modification mode, skip injecting base rooms
+                    pass 
                 else:
-                    # No BHK and no core rooms specified, append matched rooms to a default 1 BHK
-                    base_rooms = get_base_rooms_for_bhk(1)
-                    existing_types = {r["type"] for r in base_rooms}
-                    for r in requested_rooms:
-                        if r["type"] not in existing_types:
-                            base_rooms.append(r)
+                    bhk_val = layout_params.get("bhk", 0)
+                    requested_rooms = layout_params.get("rooms", [])
+                    
+                    # Check if user explicitly listed core rooms
+                    core_room_types = {"kitchen", "bedroom", "bathroom", "living_room", "master_bedroom"}
+                    requested_types = {r["type"] for r in requested_rooms}
+                    has_core_rooms = len(core_room_types.intersection(requested_types)) >= 2
+                    
+                    base_rooms = []
+                    if bhk_val > 0:
+                        base_rooms = get_base_rooms_for_bhk(bhk_val)
+                        existing_types = {r["type"] for r in base_rooms}
+                        for r in requested_rooms:
+                            if r["type"] in ("bedroom", "master_bedroom"):
+                                continue
+                            if r["type"] not in existing_types or r["type"] in ["store_room", "pooja_room", "balcony", "study_room", "laundry"]:
+                                base_rooms.append(r)
+                    elif has_core_rooms:
+                        base_rooms = requested_rooms
+                    else:
+                        base_rooms = get_base_rooms_for_bhk(1)
+                        existing_types = {r["type"] for r in base_rooms}
+                        for r in requested_rooms:
+                            if r["type"] not in existing_types:
+                                base_rooms.append(r)
 
-                # Master Bedroom only when explicitly requested or an attached bath is asked for.
-                base_rooms = apply_bedroom_intelligence(
-                    base_rooms, req.prompt, requested_types=requested_types
-                )
+                    base_rooms = apply_bedroom_intelligence(base_rooms, req.prompt, requested_types=requested_types)
+                    layout_params["rooms"] = base_rooms
 
-                layout_params["rooms"] = base_rooms
-
-                if not layout_params["rooms"]:
-                    layout_params["rooms"] = get_base_rooms_for_bhk(1)
+                    if not layout_params["rooms"]:
+                        layout_params["rooms"] = get_base_rooms_for_bhk(1)
+                        
+                    # NEW: Auto-wire topology for from-scratch so doors generate correctly
+                    from cloud_extractor import auto_wire_topology
+                    wired_specs = auto_wire_topology([r["type"] for r in layout_params["rooms"]])
+                    for r, w in zip(layout_params["rooms"], wired_specs):
+                        r["connections"] = w.get("connections", [])
 
                 # HARD GUARD: no Pooja Room unless explicitly selected or typed.
                 _prompt_l = (req.prompt or "").lower()
@@ -1560,8 +1946,18 @@ async def generate_plan(req: GenerateRequest):
                 else:
                     floor_0_rooms = sort_spec_by_generation_order(room_pool)
 
+                # Extract floor 0 blueprint
+                master_bp = layout_params.get("master_blueprint")
+                bp0 = [b for b in master_bp if b.get("floor_number", 0) == 0] if master_bp else None
+
                 eng_start = time.time()
-                generated_nodes_0 = engine.generate(floor_0_rooms, indian_options=layout_params.get("indian_options", {}), layout_rules=req.layoutRules, restrict_slots=(floors > 1))
+                generated_nodes_0 = engine.generate(
+                    floor_0_rooms, 
+                    indian_options=layout_params.get("indian_options", {}), 
+                    layout_rules=req.layoutRules, 
+                    restrict_slots=(floors > 1),
+                    master_blueprint=bp0
+                )
                 logger.info(f"[PERF] Engine generation took {(time.time() - eng_start)*1000:.2f} ms")
 
                 _req_types = requested_type_set(layout_params["rooms"], layout_params.get("indian_options", {}))
@@ -1596,6 +1992,7 @@ async def generate_plan(req: GenerateRequest):
                 }
                 layout_data["indianOptions"] = layout_params.get("indian_options", req.indianOptions or {})
                 
+                generated_nodes_1 = []
                 # Floor 1 (Spatial Inheritance)
                 if floors > 1:
                     blocked_zones = []
@@ -1617,9 +2014,16 @@ async def generate_plan(req: GenerateRequest):
                                     if r["type"] == "master_bedroom":
                                         r["type"] = "bedroom"
                         
+                        # Extract floor 1 blueprint
+                        bp1 = [b for b in master_bp if b.get("floor_number", 0) == 1] if master_bp else None
                         floor_1_rooms = sort_spec_by_generation_order(safe_first_spec)
                         eng_start = time.time()
-                        generated_nodes_1 = engine.generate(floor_1_rooms, blocked_zones=blocked_zones, restrict_slots=True)
+                        generated_nodes_1 = engine.generate(
+                            floor_1_rooms, 
+                            blocked_zones=blocked_zones, 
+                            restrict_slots=True,
+                            master_blueprint=bp1
+                        )
                         logger.info(f"[PERF] Engine generation took {(time.time() - eng_start)*1000:.2f} ms")
                         
                         _io = layout_params.get("indian_options", {})
@@ -1640,6 +2044,34 @@ async def generate_plan(req: GenerateRequest):
                         layout_data["mep_data_f1"] = compute_mep_heuristics(generated_nodes_1)
 
                 all_nodes = list(generated_nodes_0) + (generated_nodes_1 if floors > 1 else [])
+                
+                # --- RESTORE PRESERVED COLORS/FURNITURE ---
+                try:
+                    old_rooms = []
+                    if req.currentProject:
+                        old_rooms = req.currentProject.get("rooms", [])
+                        if not old_rooms and req.currentProject.get("floors"):
+                            for floor in req.currentProject.get("floors", []):
+                                old_rooms.extend(floor.get("rooms", []))
+                                
+                    if old_rooms and master_bp:
+                        used_old = set()
+                        for node in all_nodes:
+                            for i, old in enumerate(old_rooms):
+                                if i not in used_old and old.get("type") == node.type:
+                                    used_old.add(i)
+                                    if "furniture" in old: node.furniture = old["furniture"]
+                                    if "wallColor" in old and old["wallColor"]: node.wallColor = old["wallColor"]
+                                    if "floorColor" in old and old["floorColor"]: node.floorColor = old["floorColor"]
+                                    if "wallColors" in old and old["wallColors"]: node.wallColors = old["wallColors"]
+                                    break
+                except Exception as e:
+                    logger.warning(f"Failed to restore preserved properties: {e}")
+
+                selected_palette = _apply_selected_palette(all_nodes, req.colors)
+                layout_data["floor_0"] = [n.to_dict() for n in generated_nodes_0]
+                if generated_nodes_1:
+                    layout_data["floor_1"] = [n.to_dict() for n in generated_nodes_1]
                 validation_report = final_layout_validation(
                     all_nodes,
                     indian_options=layout_params.get("indian_options", {}),
@@ -1699,7 +2131,14 @@ async def generate_plan(req: GenerateRequest):
             len(understood), len(warnings), list(layout_params.keys()),
         )
 
-        logger.info(f"[PERF] /api/generate total request completed in {(time.time() - request_start)*1000:.2f} ms")
+        total_ms = (time.time() - request_start)*1000
+        _log("success", f"Total request completed in {total_ms:.0f}ms")
+        if response.get("layout_data"):
+            f0_count = len(response["layout_data"].get("floor_0", []))
+            f1_count = len(response["layout_data"].get("floor_1", []))
+            _log("success", f"Final output: {f0_count} ground-floor rooms" + (f", {f1_count} first-floor rooms" if f1_count else ""))
+        response["logs"] = _logs
+        logger.info(f"[PERF] /api/generate total request completed in {total_ms:.2f} ms")
         return response
 
     except HTTPException:
@@ -1963,7 +2402,7 @@ async def generate_from_template(req: TemplateRequest):
             "understood": understood,
             "warnings": template_warnings,
             "validation": template_validation,
-            "style": style_out,
+            "style": {**style_out, **selected_palette},
             "layout_data": layout_data,
         }
 
@@ -2170,7 +2609,12 @@ def _stream_generate_work(req: "GenerateRequest", emit_fn: Callable) -> None:
         # Handle modification of existing project
         current_rooms: List[Dict] = []
         if req.currentProject:
-            current_rooms = req.currentProject.get("rooms", [])
+            if req.currentProject.get("rooms"):
+                current_rooms = req.currentProject.get("rooms", [])
+            elif req.currentProject.get("floors"):
+                for floor in req.currentProject.get("floors", []):
+                    if floor.get("rooms"):
+                        current_rooms.extend(floor.get("rooms", []))
 
         if current_rooms:
             mep_adds = slm_result.get("mep_additions", []) if slm_result else []
@@ -2199,14 +2643,73 @@ def _stream_generate_work(req: "GenerateRequest", emit_fn: Callable) -> None:
             )
             if modified_rooms is None and "bhk" in layout_params:
                 current_rooms = []
+            elif modified_rooms is None and current_rooms:
+                # 1. Figure out which color the user wants
+                target_color = details.get("global_color") or details.get("color_hex")
+                
+                # Fallback text search
+                if not target_color:
+                    match = re.search(r'\b(red|blue|green|yellow|orange|purple|pink|white|black|gray|grey|brown|beige|cream)\b', req.prompt.lower())
+                    if match:
+                        target_color = match.group(1)
+                        
+                if target_color:
+                    target_rooms = details.get("target_rooms", [])
+                    if not target_rooms and isinstance(details.get("intents"), list) and len(details["intents"]) > 0:
+                        target_rooms = details["intents"][0].get("target_rooms", [])
+                    
+                    painted_count = 0
+                    for r in current_rooms:
+                        room_name = r.get("name", "").lower()
+                        room_type = r.get("type", "").lower()
+                        
+                        if not target_rooms or any(t.lower() in room_name or t.lower() in room_type for t in target_rooms):
+                            r["wallColor"] = target_color
+                            r["wallColors"] = [target_color, target_color, target_color, target_color] 
+                            painted_count += 1
+                    
+                    if painted_count > 0:
+                        response["understood"].append(f"Painted {painted_count} room(s) {target_color}")
+                
+                response["layout_data"], _ = _preserve_modified_project_rooms(current_rooms)
+                if not any("Painted" in u for u in response["understood"]):
+                    response["understood"].append("Applied style changes without modifying layout structure")
+                emit_fn({"done": True, "result": response})
+                return
             elif modified_rooms is not None:
                 if (isinstance(details.get("intent"), str) and details.get("intent").upper() == "MOVE") or (isinstance(details.get("intents"), list) and any(isinstance(i, dict) and i.get("canonical") == "move" for i in details.get("intents", []))):
-                    response["layout_data"] = {"floor_0": modified_rooms}
+                    response["layout_data"], _ = _preserve_modified_project_rooms(modified_rooms)
                     emit_fn({"done": True, "result": response})
                     return
-                layout_params["rooms"] = [{"type": r["type"], "confidence": 100} for r in modified_rooms]
-                current_rooms = []
-
+                    
+                from cloud_extractor import auto_wire_topology
+                wired_specs = auto_wire_topology([r["type"] for r in modified_rooms])
+                
+                master_bp = []
+                for i, r in enumerate(modified_rooms):
+                    master_bp.append({
+                        "room_type": r["type"],
+                        "position_x": r.get("x", 0),
+                        "position_z": r.get("z", 0),
+                        "width": r.get("width", 10),
+                        "length": r.get("length", 10),
+                        "connections": wired_specs[i].get("connections", []),
+                        "floor_number": 1 if r.get("isFloor1") else 0
+                    })
+                layout_params["master_blueprint"] = master_bp
+                
+                layout_params["rooms"] = [
+                    {
+                        "type": r["type"], 
+                        "confidence": 100, 
+                        "width": r.get("width"), 
+                        "length": r.get("length"),
+                        "connections": wired_specs[i].get("connections", [])
+                    } 
+                    for i, r in enumerate(modified_rooms)
+                ]
+                current_rooms = [] 
+                response["understood"].append("Reconstructed the layout to properly accommodate changes")
         if not (layout_params.get("rooms") or layout_params.get("bhk")):
             emit_fn({"done": True, "result": response})
             return
@@ -2268,6 +2771,11 @@ def _stream_generate_work(req: "GenerateRequest", emit_fn: Callable) -> None:
         if any(kw in prompt_lower for kw in ["stair", "upstair", "first floor", "second floor", "duplex"]):
             floors = max(floors, 2)
             
+        # Wire topology on the final list of rooms to guarantee graph/door semantics!
+        from cloud_extractor import auto_wire_topology
+        final_room_types = [r["type"] for r in layout_params["rooms"]]
+        layout_params["rooms"] = auto_wire_topology(final_room_types)
+
         layout_params["floors"] = floors
 
         plot_w = req.width if req.width else layout_params.get("plot_width", 40.0)
@@ -2309,87 +2817,125 @@ def _stream_generate_work(req: "GenerateRequest", emit_fn: Callable) -> None:
         bp0 = None
         logger.info("[ZERO-STATIC] Bypassing Gemini Stage 2 coordinates (slow/redundant). Routing directly to high-speed CP Solver.")
 
-        generated_nodes_0 = engine.generate(
-            floor_0_rooms,
-            indian_options=indian_opts,
-            layout_rules=req.layoutRules,
-            restrict_slots=(floors > 1),
-            master_blueprint=bp0 if master_bp else None,
-            plot_info=slm_result if slm_result else None
-        )
-        _req_types = requested_type_set(layout_params["rooms"], indian_opts)
-        enforce_requested_only(generated_nodes_0, _req_types)
+        # ─── GEOMETRIC GENERATION & VALIDATION PIPELINE (RETRY LOOP) ───
+        max_attempts = 3
+        generated_nodes_0 = []
+        generated_nodes_1 = []
+        layout_data = {}
 
-        emit(4, "Generating Architectural Features...", "Adjacency · windows · wet walls")
-
-        ArchitecturalRules.optimize_wet_walls(generated_nodes_0)
-        arch_warnings = ArchitecturalRules.validate_rules(generated_nodes_0)
-        warnings.extend(arch_warnings)
-        AdjacencyResolver(generated_nodes_0, open_rooms=layout_params.get("open_rooms", [])).resolve()
-        WindowPlacer(generated_nodes_0, engine.plot_width, engine.plot_length,
-                     setback_x=engine.setback_x, setback_z=engine.setback_z).place_windows()
-        warnings.extend(validate_layout(generated_nodes_0))
-        from geometry_validator import GeometryValidator
-        warnings.extend(GeometryValidator.validate_post_placement(generated_nodes_0).errors)
-
-        emit(5, "Generating Furniture...", "Room furnishing & clearances")
-
-        shared_walls_0 = compute_shared_walls(generated_nodes_0)
-        layout_data: Dict[str, Any] = {
-            "floor_0": [n.to_dict() for n in generated_nodes_0],
-            "walls_floor_0": shared_walls_0,
-            "mep_data": compute_mep_heuristics(generated_nodes_0),
-            "setbacks": {
-                "x": engine.setback_x, "z": engine.setback_z,
-                "buildable_width": engine.buildable_width, "buildable_length": engine.buildable_length,
-            },
-            "indianOptions": indian_opts,
-        }
-
-        generated_nodes_1: List = []
-        if floors > 1:
-            emit(6, "Generating Electrical Layout...", "First floor rooms")
-
-            blocked_zones = []
-            staircase = next((n for n in generated_nodes_0 if n.type == "staircase"), None)
-            if staircase: blocked_zones.append(staircase.rect)
-            living_dh = next((n for n in generated_nodes_0 if getattr(n, "is_double_height", False)), None)
-            if living_dh: blocked_zones.append(living_dh.rect)
-
-            # SAFE FIRST SPEC FIX
-            import copy
-            safe_first_spec = copy.deepcopy(first_spec) if first_spec else []
-            if not safe_first_spec:
-                safe_first_spec = [copy.deepcopy(r) for r in layout_params["rooms"] if r["type"] in ("bedroom", "bathroom", "master_bedroom")]
-                if any(r["type"] == "master_bedroom" for r in floor_0_rooms):
-                    for r in safe_first_spec:
-                        if r["type"] == "master_bedroom":
-                            r["type"] = "bedroom"
-                            
-            floor_1_rooms = sort_spec_by_generation_order(safe_first_spec)
-            floor1_bp = None
-            if master_bp:
-                floor1_bp = [b for b in master_bp if b.get("floor_number", 0) == 1]
-            generated_nodes_1 = engine.generate(floor_1_rooms, blocked_zones=blocked_zones, restrict_slots=True, master_blueprint=floor1_bp if floor1_bp else None)
-
-            emit(7, "Generating Plumbing Layout...", "Aligning duplex floors · drainage")
-
-            _io = layout_params.get("indian_options", {})
-            align_duplex_floors(generated_nodes_0, generated_nodes_1,
-                                make_void=bool(_io.get("double_height") or _io.get("void")))
-            enforce_requested_only(generated_nodes_1, _req_types)
-            ArchitecturalRules.optimize_wet_walls(generated_nodes_1)
-            AdjacencyResolver(generated_nodes_1, open_rooms=layout_params.get("open_rooms", [])).resolve()
-            WindowPlacer(generated_nodes_1, engine.plot_width, engine.plot_length,
-                         setback_x=engine.setback_x, setback_z=engine.setback_z).place_windows()
+        for attempt in range(max_attempts):
+            logger.info(f"[PIPELINE] Attempt {attempt + 1}/{max_attempts} to generate valid layout...")
             
-            from geometry_validator import GeometryValidator
-            warnings.extend(GeometryValidator.validate_post_placement(generated_nodes_1).errors)
-            
-            shared_walls_1 = compute_shared_walls(generated_nodes_1)
-            layout_data["floor_1"] = [n.to_dict() for n in generated_nodes_1]
-            layout_data["walls_floor_1"] = shared_walls_1
-            layout_data["mep_data_f1"] = compute_mep_heuristics(generated_nodes_1)
+            # Inject attempt parameter into rooms to trigger CP-SAT seed variation
+            for r in floor_0_rooms:
+                r["attempt"] = attempt
+            for r in first_spec:
+                r["attempt"] = attempt
+
+            try:
+                # Generate Floor 0
+                generated_nodes_0 = engine.generate(
+                    floor_0_rooms,
+                    indian_options=indian_opts,
+                    layout_rules=req.layoutRules,
+                    restrict_slots=(floors > 1),
+                    master_blueprint=bp0 if master_bp else None,
+                    plot_info=slm_result if slm_result else None
+                )
+                _req_types = requested_type_set(layout_params["rooms"], indian_opts)
+                enforce_requested_only(generated_nodes_0, _req_types)
+
+                ArchitecturalRules.optimize_wet_walls(generated_nodes_0)
+                arch_warnings = ArchitecturalRules.validate_rules(generated_nodes_0)
+                AdjacencyResolver(generated_nodes_0, open_rooms=layout_params.get("open_rooms", [])).resolve()
+                WindowPlacer(generated_nodes_0, engine.plot_width, engine.plot_length,
+                             setback_x=engine.setback_x, setback_z=engine.setback_z).place_windows()
+                
+                # Post-placement validation Floor 0
+                from geometry_validator import GeometryValidator
+                val_0 = GeometryValidator.validate_post_placement(generated_nodes_0)
+
+                if not val_0.is_valid:
+                    logger.warning(f"[PIPELINE] Floor 0 validation failed on attempt {attempt + 1}: {val_0.errors}")
+                    if attempt < max_attempts - 1:
+                        continue  # Retry!
+                    else:
+                        raise ValueError(f"Layout failed Floor 0 validation: {val_0.errors}")
+
+                # Initialize layout_data
+                shared_walls_0 = compute_shared_walls(generated_nodes_0)
+                layout_data = {
+                    "floor_0": [n.to_dict() for n in generated_nodes_0],
+                    "walls_floor_0": shared_walls_0,
+                    "mep_data": compute_mep_heuristics(generated_nodes_0),
+                    "setbacks": {
+                        "x": engine.setback_x, "z": engine.setback_z,
+                        "buildable_width": engine.buildable_width, "buildable_length": engine.buildable_length,
+                    },
+                    "indianOptions": indian_opts,
+                }
+
+                # Generate Floor 1 if Duplex
+                if floors > 1:
+                    logger.info("[PIPELINE] Generating Floor 1 (Duplex)...")
+                    blocked_zones = []
+                    staircase = next((n for n in generated_nodes_0 if n.type == "staircase"), None)
+                    if staircase:
+                        blocked_zones.append(staircase.rect)
+                    living_dh = next((n for n in generated_nodes_0 if getattr(n, "is_double_height", False)), None)
+                    if living_dh:
+                        blocked_zones.append(living_dh.rect)
+
+                    import copy
+                    safe_first_spec = copy.deepcopy(first_spec) if first_spec else []
+                    if not safe_first_spec:
+                        safe_first_spec = [copy.deepcopy(r) for r in layout_params["rooms"] if r["type"] in ("bedroom", "bathroom", "master_bedroom")]
+                        if any(r["type"] == "master_bedroom" for r in floor_0_rooms):
+                            for r in safe_first_spec:
+                                if r["type"] == "master_bedroom":
+                                    r["type"] = "bedroom"
+
+                    floor_1_rooms = sort_spec_by_generation_order(safe_first_spec)
+                    floor1_bp = None
+                    if master_bp:
+                        floor1_bp = [b for b in master_bp if b.get("floor_number", 0) == 1]
+                    
+                    generated_nodes_1 = engine.generate(
+                        floor_1_rooms,
+                        blocked_zones=blocked_zones,
+                        restrict_slots=True,
+                        master_blueprint=floor1_bp if floor1_bp else None
+                    )
+
+                    align_duplex_floors(generated_nodes_0, generated_nodes_1,
+                                        make_void=bool(indian_opts.get("double_height") or indian_opts.get("void")))
+                    enforce_requested_only(generated_nodes_1, _req_types)
+                    ArchitecturalRules.optimize_wet_walls(generated_nodes_1)
+                    AdjacencyResolver(generated_nodes_1, open_rooms=layout_params.get("open_rooms", [])).resolve()
+                    WindowPlacer(generated_nodes_1, engine.plot_width, engine.plot_length,
+                                 setback_x=engine.setback_x, setback_z=engine.setback_z).place_windows()
+
+                    val_1 = GeometryValidator.validate_post_placement(generated_nodes_1)
+                    if not val_1.is_valid:
+                        logger.warning(f"[PIPELINE] Floor 1 validation failed on attempt {attempt + 1}: {val_1.errors}")
+                        if attempt < max_attempts - 1:
+                            continue  # Retry!
+                        else:
+                            raise ValueError(f"Layout failed Floor 1 validation: {val_1.errors}")
+
+                    shared_walls_1 = compute_shared_walls(generated_nodes_1)
+                    layout_data["floor_1"] = [n.to_dict() for n in generated_nodes_1]
+                    layout_data["walls_floor_1"] = shared_walls_1
+                    layout_data["mep_data_f1"] = compute_mep_heuristics(generated_nodes_1)
+
+                # If we made it here, both floors succeeded (or we hit max retries)
+                logger.info(f"[PIPELINE] Layout generation succeeded on attempt {attempt + 1}!")
+                break
+
+            except Exception as gen_err:
+                logger.error(f"[PIPELINE] Exception during generation attempt {attempt + 1}: {gen_err}")
+                if attempt == max_attempts - 1:
+                    raise gen_err
         else:
             emit(6, "Generating Electrical Layout...", "Switch positions · lighting · power")
             emit(7, "Generating Plumbing Layout...", "Water supply · drainage · bathroom services")
@@ -2397,7 +2943,28 @@ def _stream_generate_work(req: "GenerateRequest", emit_fn: Callable) -> None:
         emit(8, "Generating Materials & Structures...", "Structural analysis · cost estimation")
 
         all_nodes = list(generated_nodes_0) + list(generated_nodes_1)
-        
+        selected_palette = _apply_selected_palette(all_nodes, req.colors)
+        layout_data["floor_0"] = [n.to_dict() for n in generated_nodes_0]
+        if generated_nodes_1:
+            layout_data["floor_1"] = [n.to_dict() for n in generated_nodes_1]
+
+        # If we reconstructed the layout from an existing project, restore preserved properties!
+        try:
+            mr_list = locals().get("modified_rooms")
+            if req.currentProject and mr_list:
+                used_mr = set()
+                for node in all_nodes:
+                    for i, mr in enumerate(mr_list):
+                        if i not in used_mr and mr.get("type") == node.type:
+                            used_mr.add(i)
+                            if "furniture" in mr: node.furniture = mr["furniture"]
+                            if "wallColor" in mr and mr["wallColor"]: node.wallColor = mr["wallColor"]
+                            if "floorColor" in mr and mr["floorColor"]: node.floorColor = mr["floorColor"]
+                            if "wallColors" in mr and mr["wallColors"]: node.wallColors = mr["wallColors"]
+                            break
+        except Exception as e:
+            logger.warning(f"Failed to restore preserved properties in stream: {e}")
+
         # FIX: Color Injection
         global_color = details.get("global_color") or details.get("color_hex")
         if global_color:
@@ -2463,6 +3030,7 @@ def _stream_template_work(req: "TemplateRequest", emit_fn: Callable) -> None:
         emit_fn({"stage": stage, "label": label, "substage": substage})
 
     try:
+        details = {}  # Templates do not use prompt color extraction.
         emit(1, "Analyzing Requirements...", f"Template {req.template}")
 
         template_upper = req.template.upper().replace(" ", "")
@@ -2597,6 +3165,10 @@ def _stream_template_work(req: "TemplateRequest", emit_fn: Callable) -> None:
         emit(8, "Generating Materials & Structures...", "Material assignment · structural check")
 
         all_nodes = list(generated_nodes_0) + list(generated_nodes_1)
+        selected_palette = _apply_selected_palette(all_nodes, req.colors)
+        layout_data["floor_0"] = [n.to_dict() for n in generated_nodes_0]
+        if generated_nodes_1:
+            layout_data["floor_1"] = [n.to_dict() for n in generated_nodes_1]
         
         # FIX: Color Injection
         global_color = details.get("global_color") or details.get("color_hex")
@@ -2636,12 +3208,30 @@ def _stream_template_work(req: "TemplateRequest", emit_fn: Callable) -> None:
         
         style_out = {"environment": "sunset", "lighting": "warm", "accentColor": theme.get("accent") or "#10b981"}
 
+        # If we reconstructed the layout from an existing project, restore preserved properties!
+        try:
+            # Check if modified_rooms is in locals()
+            mr_list = locals().get("modified_rooms")
+            if req.currentProject and mr_list:
+                used_mr = set()
+                for node in all_nodes:
+                    for i, mr in enumerate(mr_list):
+                        if i not in used_mr and mr.get("type") == node.type:
+                            used_mr.add(i)
+                            if "furniture" in mr: node.furniture = mr["furniture"]
+                            if "wallColor" in mr and mr["wallColor"]: node.wallColor = mr["wallColor"]
+                            if "floorColor" in mr and mr["floorColor"]: node.floorColor = mr["floorColor"]
+                            if "wallColors" in mr and mr["wallColors"]: node.wallColors = mr["wallColors"]
+                            break
+        except Exception as e:
+            logger.warning(f"Failed to restore preserved properties: {e}")
+
         response = {
             "layout_params": layout_params,
             "understood": understood,
             "warnings": template_warnings,
             "validation": template_validation,
-            "style": style_out,
+            "style": {**style_out, **selected_palette},
             "layout_data": layout_data,
             "physics": {"is_safe": True, "safety_confidence": 95.0,
                         "cost_inr": int(cost_estimate["Total"]), "carbon_kg": 15000},
@@ -2885,4 +3475,4 @@ async def health():
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="127.0.0.1", port=8000)
+    uvicorn.run(app, host="127.0.0.1", port=8000, log_level="warning")

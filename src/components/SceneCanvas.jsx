@@ -18,7 +18,6 @@ import { useProjectStore } from "../store/useProjectStore.js";
 const SCALE = 0.18;
 const EYE_LEVEL = 1.6;
 const WALL_HEIGHT = ROOM_WALL_HEIGHT;
-const HOUSE_OFFSET = [0, 0, 0];
 
 /* ── Native edge outline ──
    Replaces drei <Edges>, whose derived material has no addEventListener and
@@ -50,10 +49,14 @@ const glassFurniture = {
 
 function GlassPhysicalMaterial({ type = "sofa", opacity = 0.66, customColor }) {
   const tint = glassFurniture[type] || glassFurniture.sofa;
+  const activeColor = customColor || tint.color;
+  const activeEmiss = customColor || tint.emissive;
+  
   return (
     <meshPhysicalMaterial
-      color={customColor || tint.color}
-      emissive={customColor || tint.emissive}
+      key={`glass-${activeColor}`} // FIX: Busts the 3D cache so furniture repaints
+      color={activeColor}
+      emissive={activeEmiss}
       emissiveIntensity={0.08}
       transmission={1}
       transparent
@@ -67,7 +70,6 @@ function GlassPhysicalMaterial({ type = "sofa", opacity = 0.66, customColor }) {
     />
   );
 }
-
 /* ── Screenshot helpers ── */
 const sanitizeCanvasDataUrl = (value) => {
   if (typeof value !== "string") return null;
@@ -273,7 +275,7 @@ function SiteContext({ site, accent }) {
    offset) or inside an already-offset floor group (pass [0,0,0]).
    `label` prints a floor caption (e.g. "DUPLEX" / "GROUND FLOOR") above the
    plot-size text — used in compare mode to tell the two plans apart. */
-function PlotBoundary({ plot, accent, offset = HOUSE_OFFSET, label = null }) {
+function PlotBoundary({ plot, accent, offset = [0,0,0], label = null }) {
   if (!plot) return null;
   const n = SCALE;
   const u = offset[0];
@@ -356,8 +358,13 @@ function InterflorSlab({ rooms }) {
 /* ── Furniture Models ── */
 function BedModel({ x, z, roomWidth, roomLength, isSelected, accent, onClick, color }) {
   const i = Math.min(1, (roomWidth * SCALE) / 1.5, (roomLength * SCALE) / 1.5);
-  const zOffset = roomLength * SCALE - 0.8 * i;
-  const xOffset = roomWidth * SCALE * 0.45;
+  const roomW = roomWidth * SCALE;
+  const roomL = roomLength * SCALE;
+  const bedW = 0.95 * i;
+  const bedL = 1.16 * i;
+  const clearance = 0.08;
+  const zOffset = clamp(roomL - 0.8 * i, bedL / 2 + clearance, roomL - bedL / 2 - clearance);
+  const xOffset = clamp(roomW * 0.45, bedW / 2 + clearance, roomW - bedW / 2 - clearance);
   return (
     <group position={[x + xOffset, 0.23 * i, z + zOffset]} scale={i} onClick={onClick}>
       <mesh castShadow receiveShadow>
@@ -381,8 +388,13 @@ function BedModel({ x, z, roomWidth, roomLength, isSelected, accent, onClick, co
 
 function WardrobeModel({ x, z, roomWidth, roomLength, isSelected, accent, onClick, color }) {
   const f = Math.min(1, (roomWidth * SCALE) / 1.2, (roomLength * SCALE) / 1.2);
-  const xOffset = roomWidth * SCALE * 0.8;
-  const zOffset = roomLength * SCALE * 0.2;
+  const roomW = roomWidth * SCALE;
+  const roomL = roomLength * SCALE;
+  const wardrobeW = 0.28 * f;
+  const wardrobeL = 0.82 * f;
+  const clearance = 0.08;
+  const xOffset = clamp(roomW * 0.8, wardrobeW / 2 + clearance, roomW - wardrobeW / 2 - clearance);
+  const zOffset = clamp(roomL * 0.2, wardrobeL / 2 + clearance, roomL - wardrobeL / 2 - clearance);
   return (
     <group position={[x + xOffset, 0.7 * f, z + zOffset]} scale={f} onClick={onClick}>
       <mesh castShadow receiveShadow>
@@ -398,9 +410,9 @@ function WardrobeModel({ x, z, roomWidth, roomLength, isSelected, accent, onClic
   );
 }
 
-function BathroomModel({ x, z, isSelected, accent, onClick, color }) {
+function BathroomModel({ x, z, scale = 1, isSelected, accent, onClick, color }) {
   return (
-    <group position={[x, 0.15, z]} onClick={onClick}>
+    <group position={[x, 0.15 * scale, z]} scale={scale} onClick={onClick}>
       <mesh castShadow receiveShadow position={[-0.2, 0, 0]}>
         <boxGeometry args={[0.3, 0.25, 0.45]} />
         <GlassPhysicalMaterial type="bath" opacity={0.7} customColor={color} />
@@ -451,6 +463,7 @@ function CarModel({ x, z, accent, isSelected, onClick }) {
     </group>
   );
 }
+const clamp = (val, min, max) => Math.max(min, Math.min(max, val));
 
 function InteriorObjects({ rooms, accent }) {
   const selectedRoomId = useProjectStore(state => state.selectedRoomId);
@@ -465,8 +478,11 @@ function InteriorObjects({ rooms, accent }) {
 
         const xPos = room.x * SCALE;
         const zPos = room.z * SCALE;
-        const color = room.furnitureColor || null;
+        const roomW = room.width * SCALE;
+        const roomL = room.length * SCALE;
+        const clearance = 0.08;
         const isSelected = selectedRoomId === room.id && selectedObject?.kind === "furniture";
+        const color = room.furnitureColor || (isSelected ? room.color : null);
 
         const handleFurnitureClick = e => {
           if (selectionMode === "furniture") {
@@ -509,10 +525,16 @@ function InteriorObjects({ rooms, accent }) {
             </>
           );
         } else if (room.type === "bathroom") {
+          const bf = Math.min(1, (room.width * SCALE) / 1.5);
+          const bathW = 0.86 * bf;
+          const bathL = 0.90 * bf;
+          const clampedX = clamp(roomW * 0.5, bathW / 2 + clearance, roomW - bathW / 2 - clearance);
+          const clampedZ = clamp(roomL * 0.5, bathL / 2 + clearance, roomL - bathL / 2 - clearance);
           furnitureElement = (
             <BathroomModel
-              x={0.7}
-              z={0.7}
+              x={clampedX}
+              z={clampedZ}
+              scale={bf}
               isSelected={isSelected}
               accent={accent}
               onClick={handleFurnitureClick}
@@ -520,19 +542,24 @@ function InteriorObjects({ rooms, accent }) {
             />
           );
         } else if (room.type === "parking") {
+          const cf = Math.min(1, (room.width * SCALE) / 2.0);
           furnitureElement = (
             <CarModel
-              x={0}
-              z={0}
+              x={room.width * SCALE * 0.5}
+              z={room.length * SCALE * 0.5}
               accent={accent}
               isSelected={isSelected}
               onClick={handleFurnitureClick}
             />
           );
         } else if (room.type === "kitchen") {
-          const kitchenDepth = room.length * SCALE - 0.5;
+          const kf = Math.min(1, (room.width * SCALE) / 1.5);
+          const counterW = 1.28 * kf;
+          const counterD = 0.32 * kf;
+          const kitchenX = clamp(roomW * 0.5, counterW / 2 + clearance, roomW - counterW / 2 - clearance);
+          const kitchenDepth = clamp(roomL - 0.4 * kf, counterD / 2 + clearance, roomL - counterD / 2 - clearance);
           furnitureElement = (
-            <group position={[0.9, 0.32, kitchenDepth]} onClick={handleFurnitureClick}>
+            <group position={[kitchenX, 0.32 * kf, kitchenDepth]} scale={kf} onClick={handleFurnitureClick}>
               <mesh castShadow receiveShadow>
                 <boxGeometry args={[1.28, 0.48, 0.32]} />
                 {color ? <meshStandardMaterial color={color} roughness={0.5} /> : <GlassPhysicalMaterial type="kitchen" opacity={0.58} />}
@@ -545,12 +572,18 @@ function InteriorObjects({ rooms, accent }) {
             </group>
           );
         } else {
-          const f = Math.min(1, (room.width * SCALE) / 2);
-          const sofaZ = room.length * SCALE - 0.6 * f;
-          const tableZ = room.length * SCALE * 0.5;
+          const f = Math.min(1, roomW / 2, roomL / 2);
+          const sofaW = 1.1 * f;
+          const sofaD = 0.42 * f;
+          const sofaX = clamp(roomW * 0.4, sofaW / 2 + clearance, roomW - sofaW / 2 - clearance);
+          const sofaZ = clamp(roomL - 0.6 * f, sofaD / 2 + clearance, roomL - sofaD / 2 - clearance);
+          const tableW = 0.65 * f;
+          const tableD = 0.35 * f;
+          const tableX = clamp(roomW * 0.55, tableW / 2 + clearance, roomW - tableW / 2 - clearance);
+          const tableZ = clamp(roomL * 0.5, tableD / 2 + clearance, roomL - tableD / 2 - clearance);
           furnitureElement = (
             <group onClick={handleFurnitureClick}>
-              <mesh castShadow receiveShadow position={[room.width * SCALE * 0.4, 0.25 * f, sofaZ]} scale={f}>
+              <mesh castShadow receiveShadow position={[sofaX, 0.25 * f, sofaZ]} scale={f}>
                 <boxGeometry args={[1.1, 0.36, 0.42]} />
                 {color ? (
                   <meshStandardMaterial color={color} roughness={0.55} />
@@ -559,7 +592,7 @@ function InteriorObjects({ rooms, accent }) {
                 )}
                 <BoxEdges args={[1.1, 0.36, 0.42]} color={isSelected ? accent : "#cbd5e1"} scale={isSelected ? 1.05 : 1} />
               </mesh>
-              <mesh castShadow receiveShadow position={[room.width * SCALE * 0.55, 0.18 * f, tableZ]} scale={f}>
+              <mesh castShadow receiveShadow position={[tableX, 0.18 * f, tableZ]} scale={f}>
                 <boxGeometry args={[0.65, 0.22, 0.35]} />
                 <GlassPhysicalMaterial type="table" opacity={0.4} />
                 {isSelected && <BoxEdges args={[0.65, 0.22, 0.35]} color={accent} scale={1.05} />}
@@ -571,18 +604,10 @@ function InteriorObjects({ rooms, accent }) {
         if (!furnitureElement) return null;
 
         if (isSelected && selectionMode === "furniture") {
-          const halfW = (room.width * SCALE) / 2;
-          const halfL = (room.length * SCALE) / 2;
-          const limit = 0.2;
           return (
             <DragControls
               key={room.id}
               axisLock="y"
-              dragLimits={[
-                [xPos - halfW + limit, xPos + halfW - limit],
-                undefined,
-                [zPos - halfL + limit, zPos + halfL - limit]
-              ]}
             >
               <group position={[xPos, 0, zPos]}>
                 {furnitureElement}
@@ -602,21 +627,28 @@ function InteriorObjects({ rooms, accent }) {
 }
 
 /* ── Roof slab rendering ── */
-function RoofSlab({ rooms, visible, accent, baseY = 0, isTopFloor = false, indianOptions = {} }) {
+/* ── Roof slab rendering ── */
+function RoofSlab({ rooms, visible, accent, baseY = 0, isTopFloor = false, indianOptions = {}, roofColor }) {
   const roofStyle = useProjectStore(state => state.project?.style?.roofStyle) || "terracotta";
   const roofColorHex = useProjectStore(state => state.project?.style?.roofColor);
   const vastuOn = useProjectStore(state => state.project?.style?.vastuColors);
 
-  let roofColor = "#1e293b"; // Default slate
-  if (roofStyle === "terracotta") roofColor = "#9c3b27";
-  if (roofStyle === "concrete") roofColor = "#64748b";
-  if (roofStyle === "slate") roofColor = "#0f172a";
-  if (roofStyle === "metal") roofColor = "#475569";
-  if (roofStyle === "shingle") roofColor = "#3f3f46";
+  let fallbackColor = "#1e293b"; // Default slate
+  if (roofStyle === "terracotta") fallbackColor = "#9c3b27";
+  if (roofStyle === "concrete") fallbackColor = "#64748b";
+  if (roofStyle === "slate") fallbackColor = "#0f172a";
+  if (roofStyle === "metal") fallbackColor = "#475569";
+  if (roofStyle === "shingle") fallbackColor = "#3f3f46";
+  
   // Explicit roof palette color wins (unless Vastu mode controls colors).
   if (!vastuOn && typeof roofColorHex === "string" && roofColorHex.startsWith("#")) {
-    roofColor = roofColorHex;
+    fallbackColor = roofColorHex;
   }
+
+  // --- THE FIX: Prioritize the injected roofColor, and STRIP SPACES! ---
+  const rawColor = roofColor || fallbackColor;
+  const finalRoofColor = typeof rawColor === "string" ? rawColor.replace(/\s+/g, "") : rawColor;
+  // --------------------------------------------------------------------
 
   const bounds = useMemo(() => {
     if (!rooms || rooms.length === 0) return null;
@@ -652,11 +684,11 @@ function RoofSlab({ rooms, visible, accent, baseY = 0, isTopFloor = false, india
           <group key={`roof-${room.id}`} position={[b.x + b.width / 2, h + 0.08, b.z + b.length / 2]}>
             <mesh castShadow receiveShadow>
               <boxGeometry args={[b.width, 0.16, b.length]} />
-              <meshPhysicalMaterial color={roofColor} roughness={0.8} clearcoat={0.1} />
+              <meshPhysicalMaterial color={finalRoofColor} roughness={0.8} clearcoat={0.1} />
             </mesh>
             <mesh castShadow position={[0, 0.11, 0]}>
               <boxGeometry args={[b.width + 0.18, 0.06, b.length + 0.18]} />
-              <meshStandardMaterial color={roofColor} roughness={0.9} />
+              <meshStandardMaterial color={finalRoofColor} roughness={0.9} />
             </mesh>
           </group>
         );
@@ -700,7 +732,6 @@ function RoofSlab({ rooms, visible, accent, baseY = 0, isTopFloor = false, india
     </group>
   );
 }
-
 // Feet → scene-unit pan factor for the D-pad (store nudges in feet).
 const PAN_UNIT = SCALE * 2;
 
@@ -815,7 +846,7 @@ function CameraController({ focusCenter, focusDist, controlsRef }) {
 }
 
 /* ── Walkthrough controller ── */
-function WalkthroughController() {
+function WalkthroughController({ sceneOffset = [0, 0, 0] }) {
   const viewMode = useProjectStore(state => state.viewMode);
   const mobileMove = useProjectStore(state => state.mobileMove);
   const { camera, gl } = useThree();
@@ -836,7 +867,7 @@ function WalkthroughController() {
   useEffect(() => {
     if (viewMode === "walk") {
       const rooms = useProjectStore.getState().project.rooms || [];
-      const offset = HOUSE_OFFSET;
+      const offset = sceneOffset; // Offset spawn relative to centered geometry
       
       console.log("=== WALK MODE DEBUG ===");
       console.log("Total rooms:", rooms.length);
@@ -983,24 +1014,39 @@ function SceneContent() {
   const visibleFloor = useProjectStore(state => state.visibleFloor);
 
   const { houseCenter, maxDist } = useMemo(() => {
-    let cx = ((project.plot?.width || 40) / 2) * SCALE + HOUSE_OFFSET[0];
-    let cz = ((project.plot?.length || 40) / 2) * SCALE + HOUSE_OFFSET[2];
+    let cx = ((project.plot?.width || 40) / 2) * SCALE;
+    let cz = ((project.plot?.length || 40) / 2) * SCALE;
     let dist = 18;
-    const floorRooms = project.floors ? project.floors[project.current_floor_index || 0].rooms : [];
-    if (floorRooms.length > 0) {
-      const minX = Math.min(...floorRooms.map(r => r.x));
-      const maxX = Math.max(...floorRooms.map(r => r.x + r.width));
-      const minZ = Math.min(...floorRooms.map(r => r.z));
-      const maxZ = Math.max(...floorRooms.map(r => r.z + r.length));
-      cx = (minX + (maxX - minX) / 2) * SCALE + HOUSE_OFFSET[0];
-      cz = (minZ + (maxZ - minZ) / 2) * SCALE + HOUSE_OFFSET[2];
+
+    const floors = project?.floors || [];
+    const currentFloor = floors[project?.current_floor_index || 0] || {};
+    const floorRooms = currentFloor.rooms || project?.rooms || [];
+
+    // Safe filtering to prevent reference errors & Infinity math crashes
+    const validRooms = floorRooms.filter(r =>
+      r && Number.isFinite(r.x) && Number.isFinite(r.z) &&
+      Number.isFinite(r.width) && Number.isFinite(r.length)
+    );
+
+    if (validRooms.length > 0) {
+      const minX = Math.min(...validRooms.map(r => r.x));
+      const maxX = Math.max(...validRooms.map(r => r.x + r.width));
+      const minZ = Math.min(...validRooms.map(r => r.z));
+      const maxZ = Math.max(...validRooms.map(r => r.z + r.length));
+
+      cx = (minX + (maxX - minX) / 2) * SCALE;
+      cz = (minZ + (maxZ - minZ) / 2) * SCALE;
       dist = Math.max(maxX - minX, maxZ - minZ) * SCALE * 1.5;
       if (dist < 18) dist = 18;
     }
+
     return { houseCenter: [cx, 0, cz], maxDist: dist };
   }, [project]);
 
-  // Per-floor orbit focus. Centers use the same -12/-10 + HOUSE_OFFSET transform
+  // This offset places the house perfectly at [0,0,0]
+  const sceneOffset = [-houseCenter[0], 0, -houseCenter[2]];
+
+  // Per-floor orbit focus. Centers use the same -12/-10 + sceneOffset transform
   // as roomBounds so the target lands on the true floor center, and sit at
   // floor mid-height so vertical orbit reads as "around" the floor.
   const { focusCenter, focusDist, focusMinDist, focusMaxDist } = useMemo(() => {
@@ -1017,8 +1063,8 @@ function SceneContent() {
       };
     };
     const toFocus = (b, yMid) => {
-      const cx = ((b.minX + b.maxX) / 2) * SCALE + HOUSE_OFFSET[0];
-      const cz = ((b.minZ + b.maxZ) / 2) * SCALE + HOUSE_OFFSET[2];
+      const cx = ((b.minX + b.maxX) / 2) * SCALE + sceneOffset[0];
+      const cz = ((b.minZ + b.maxZ) / 2) * SCALE + sceneOffset[2];
       const span = Math.max(b.maxX - b.minX, b.maxZ - b.minZ) * SCALE;
       return { center: [cx, yMid, cz], span };
     };
@@ -1044,7 +1090,7 @@ function SceneContent() {
     } else if (allb) {
       pick = toFocus(allb, (fb ? TOP_Y : WALL_HEIGHT) / 2);
     } else {
-      pick = { center: [HOUSE_OFFSET[0], WALL_HEIGHT / 2, HOUSE_OFFSET[2]], span: 12 };
+      pick = { center: [0, WALL_HEIGHT / 2, 0], span: 12 };
     }
 
     const dist = Math.max(pick.span * 1.5, 8);
@@ -1070,6 +1116,11 @@ function SceneContent() {
   const _safeRooms = ((project.floors ? project.floors[project.current_floor_index || 0].rooms : []) || []).filter(_finiteRoom);
   const groundFloorRooms = _safeRooms.filter(room => !room.isFloor1);
   const firstFloorRooms = _safeRooms.filter(room => room.isFloor1);
+  const floorWalls = project.walls?.length
+    ? project.walls
+    : (project.floors?.[project.current_floor_index || 0]?.walls || []);
+  const groundFloorWalls = floorWalls.filter(wall => !wall.isFloor1);
+  const firstFloorWalls = floorWalls.filter(wall => wall.isFloor1);
 
   // Building perimeter bounds (raw room coords) per floor — used to identify
   // exterior-facing walls so the exterior facade palette colors them.
@@ -1086,6 +1137,9 @@ function SceneContent() {
   const exteriorColor = project.style?.vastuColors
     ? null
     : (project.style?.exteriorColor || DEFAULT_FACADE);
+
+  useEffect(() => {
+  }, [project.colors, project.style?.wallFinish, project.style?.exteriorColor, project.style?.floorMaterial, project.style?.furnitureColor, _safeRooms.length]);
 
   // Compare mode: lay both floors side-by-side at ground level (view-only,
   // no geometry regen). First floor is shifted +X beside the ground floor.
@@ -1114,12 +1168,12 @@ function SceneContent() {
       </mesh>
 
       <SiteContext site={project.style.site} accent={accentColor} />
-      <PlotBoundary plot={project.plot} accent={accentColor} label={isCompare ? "GROUND FLOOR" : null} />
+      <PlotBoundary plot={project.plot} accent={accentColor} offset={sceneOffset} label={isCompare ? "GROUND FLOOR" : null} />
 
 
 
       {/* House Group */}
-      <group position={HOUSE_OFFSET}>
+      <group position={sceneOffset}>
         <Plinth rooms={groundFloorRooms} />
 
         {/* Ground Floor — mounted once; floor switching only toggles
@@ -1139,6 +1193,8 @@ function SceneContent() {
                 buildingBounds={groundBounds}
                 exteriorColor={exteriorColor}
                 globalProperties={project.globalProperties}
+                rooms={groundFloorRooms}
+                exteriorWalls={groundFloorWalls}
               />
             ))}
             <InteriorObjects rooms={groundFloorRooms} accent={accentColor} />
@@ -1179,30 +1235,34 @@ function SceneContent() {
                 buildingBounds={firstBounds}
                 exteriorColor={exteriorColor}
                 globalProperties={project.globalProperties}
+                rooms={firstFloorRooms}
+                exteriorWalls={firstFloorWalls}
               />
             ))}
             <InteriorObjects rooms={firstFloorRooms} accent={accentColor} />
             <RoofSlab
-              rooms={firstFloorRooms}
+              rooms={firstFloorRooms} // (or groundFloorRooms depending on which block you are in)
               visible={roofVisible && !isCompare}
               accent={accentColor}
               baseY={0}
               isTopFloor={true}
               indianOptions={project.indianOptions}
-            />
+              // ADD THIS EXACT LINE TO ALL ROOF SLABS:
+              roofColor={project?.style?.roofColor || project?.style?.roofStyle} 
+          />
           </group>
         )}
       </group>
 
       <CameraController focusCenter={focusCenter} focusDist={focusDist} controlsRef={controlsRef} />
-      <WalkthroughController />
+      <WalkthroughController sceneOffset={sceneOffset} />
 
       {viewMode !== "walk" ? (
         <OrbitControls
           ref={controlsRef}
           makeDefault
-          enableDamping
-          dampingFactor={0.08}
+          enableDamping={false}
+          autoRotate={false}
           enablePan={viewMode === "fly"}
           rotateSpeed={0.65}
           zoomSpeed={0.9}

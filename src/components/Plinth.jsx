@@ -9,7 +9,8 @@ const roomBounds = (room) => ({
   length: room.length * SCALE
 });
 
-export default function Plinth({ rooms }) {
+export default function Plinth({ rooms = [] }) {
+  if (!Array.isArray(rooms) || rooms.length === 0) return null;
   const bounds = useMemo(() => {
     const points = rooms.flatMap((room) => {
       const b = roomBounds(room);

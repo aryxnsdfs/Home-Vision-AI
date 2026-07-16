@@ -18,8 +18,9 @@ from geometry_validator import GeometryValidator
 # 1. Pydantic Schemas
 # ---------------------------------------------------------------------------
 class RoomColor(BaseModel):
-    room: str
-    color: str
+    room: str = Field(description="Room name (e.g. 'bedroom') or 'all'")
+    color: str = Field(description="The requested color or material")
+    surface: str = Field(default="wall", description="One of: wall, floor, furniture, exterior, roof")
 
 class VastuSpecific(BaseModel):
     room: str = Field(description="e.g. entrance, kitchen, master_bedroom")
@@ -32,6 +33,54 @@ class Connection(BaseModel):
 class MepAddition(BaseModel):
     room: str
     item: str
+MODIFICATION_SYSTEM_PROMPT = """You are a Spatial Engineer modifying an architectural floor plan.
+
+You will receive the CURRENT state of the layout and a modification request.
+
+## CRITICAL RULES
+1. PRESERVE INTENT: Keep existing rooms roughly in their relative positions.
+2. TOPOLOGY OVER MATH: Focus on the `connections` array. If adding a new room, you MUST add a connection between the new room and the `corridor` or `living_room` so it is accessible.
+3. ROUGH COORDINATES: Provide approximate position_x and position_z for the new room. The downstream CP-Solver will snap everything perfectly flush, so you do NOT need to worry about exact decimal precision or minor overlaps.
+
+Output the COMPLETE updated master_blueprint array in the JSON response matching the BlueprintOnlyResponse schema.
+"""
+
+def modify_validated_blueprint(
+    prompt: str,
+    current_blueprint: list,
+    plot_width: float,
+    plot_length: float,
+) -> Dict[str, Any]:
+    try:
+        from google import genai
+    except ImportError:
+        logger.error("google-genai not installed.")
+        return {}
+
+    # This uses the new SDK, clearing your deprecation warning for this call
+    client = genai.Client(api_key=GEMINI_API_KEY)
+    
+    user_content = (
+        f"Request: {prompt}\n"
+        f"CURRENT BLUEPRINT:\n{json.dumps(current_blueprint, indent=2)}\n"
+        f"Plot bounds: {plot_width}ft x {plot_length}ft\n"
+        f"Update the room roster and connections. Provide approximate coordinates for any new rooms."
+    )
+
+    response = client.models.generate_content(
+        model='gemini-2.5-flash',
+        contents=user_content,
+        config=genai.types.GenerateContentConfig(
+            system_instruction=MODIFICATION_SYSTEM_PROMPT,
+            response_mime_type="application/json",
+            response_schema=BlueprintOnlyResponse,
+            temperature=0.1,
+        ),
+    )
+
+    result = json.loads(response.text)
+    logger.info("[GEMINI] Extracted topological blueprint in a single fast pass.")
+    return result
 
 
 class BlueprintRoom(BaseModel):
@@ -424,7 +473,7 @@ Map styles, materials, and rooms ONLY to these exact words:
 ROOMS: {known_rooms}
 STYLES: {known_styles}
 MATERIALS: {known_materials}
-
+"room_colors": [{"room": str, "color": str, "surface": "wall" | "floor" | "furniture" | "exterior" | "roof"}],
 Schema: {{"intent": "CREATE" | "ADD" | "REMOVE" | "RESIZE" | "COLOR" | "MODIFY_MEP" | "MOVE", "bhk": int, "floors": int, "style": str, "materials": [str], "target_rooms": [str], "global_color": str, "room_colors": [{{"room": str, "color": str}}], "color_hex": str, "theme_description": str, "move_target_room": str, "move_destination": str, "vastu_specifics": [{{"room": str, "location": str}}], "negative_constraints": [str], "mep_additions": [{{"room": str, "item": str}}], "needs_pooja_room": bool, "utility_area": bool, "powder_room": bool, "elderly_suite": bool, "foyer": bool, "brahmasthan": bool, "angan": bool, "bhandar_ghar": bool, "maliya": bool, "sump_tank": bool, "overhead_tank": bool, "diwan": bool, "otta": bool, "portico": bool, "flat_terrace": bool, "parapet": bool, "mumty": bool, "double_height": bool, "jali": bool, "chhajja": bool, "jharokha": bool, "stack_vent": bool, "facing": "North" | "South" | "East" | "West" | ""}}
 
 If 'duplex' or 'two story' is mentioned, interpret floors as 2.
@@ -450,15 +499,8 @@ Output ONLY valid JSON. No markdown code blocks."""
     @classmethod
     def route(cls, user_prompt: str, vocabulary: dict, current_floorplan: Optional[dict] = None) -> Dict[str, Any]:
         """Traffic cop routing logic."""
-        if cls._is_heavy_reasoning(user_prompt, current_floorplan):
-            return cls._heavy_lane_gemini(user_prompt, vocabulary, current_floorplan)
-        else:
-            try:
-                logger.info("[ROUTER] Routing to Groq Fast Lane")
-                return cls._fast_lane_groq(user_prompt, vocabulary)
-            except Exception as e:
-                logger.warning(f"[ROUTER] Groq failed or hallucinated: {e}. Falling back to Gemini.")
-                return cls._heavy_lane_gemini(user_prompt, vocabulary, current_floorplan)
+        logger.info("[ROUTER] Routing directly to Gemini Heavy Lane (Groq disabled)")
+        return cls._heavy_lane_gemini(user_prompt, vocabulary, current_floorplan)
 
 # -------------------------------------------------------------
 # Backwards Compatible Wrappers for server.py
@@ -518,8 +560,8 @@ def auto_wire_topology(room_types: list) -> list:
     num_beds = len(bed_idx) + len(master_idx)
     
     # Adaptive Circulation Generation
-    # Large house (3+ beds) gets a private Corridor
-    if not corridor_idx and num_beds >= 3:
+    # Medium/Large house (2+ beds) gets a private Corridor
+    if not corridor_idx and num_beds >= 2:
         room_specs.append({"type": "corridor", "connections": []})
         corridor_idx = [len(room_specs) - 1]
         

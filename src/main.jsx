@@ -8,7 +8,7 @@ if (typeof window !== "undefined" && !window.Buffer) {
   window.Buffer = Buffer;
 }
 
-console.log("App loaded - PDF report updated");
+
 
 ReactDOM.createRoot(document.getElementById("root")).render(
   <React.StrictMode>

@@ -1039,30 +1039,50 @@ export const useProjectStore = create((set, get) => ({
 
   setRoomColor: (roomId, floorColor, furnitureColor, wallColor) => {
     get().pushHistory();
-    set((state) => ({
-      project: {
-        ...state.project,
-        rooms: state.project.floors[state.project.current_floor_index].rooms.map((r) =>
-          r.id === roomId ? { ...r, floorColor, furnitureColor, wallColor } : r
-        )
-      }
-    }));
+    set((state) => {
+      const { project } = state;
+      const fIdx = project.current_floor_index || 0;
+      if (!project.floors) return state;
+
+      const newRooms = project.floors[fIdx].rooms.map((r) =>
+        r.id === roomId ? { ...r, floorColor, furnitureColor, wallColor } : r
+      );
+      const newFloors = [...project.floors];
+      newFloors[fIdx] = { ...newFloors[fIdx], rooms: newRooms };
+
+      return {
+        project: {
+          ...project,
+          rooms: newRooms,
+          floors: newFloors
+        }
+      };
+    });
   },
 
   updateMaterial: (roomId, category, material) => {
     get().pushHistory();
     set((state) => {
-      if (!state.project) return state;
+      const { project } = state;
+      if (!project || !project.floors) return state;
+
+      const fIdx = project.current_floor_index || 0;
+      const newRooms = project.floors[fIdx].rooms.map((r) => {
+        if (r.id !== roomId) return r;
+        const newMaterials = { ...(r.materials || {}) };
+        newMaterials[category] = material;
+        return { ...r, materials: newMaterials };
+      });
+
+      const newFloors = [...project.floors];
+      newFloors[fIdx] = { ...newFloors[fIdx], rooms: newRooms };
+
       return {
         ...state,
         project: {
-          ...state.project,
-          rooms: state.project.floors[state.project.current_floor_index].rooms.map((r) => {
-            if (r.id !== roomId) return r;
-            const newMaterials = { ...(r.materials || {}) };
-            newMaterials[category] = material;
-            return { ...r, materials: newMaterials };
-          })
+          ...project,
+          rooms: newRooms,
+          floors: newFloors
         }
       };
     });
@@ -1121,17 +1141,27 @@ export const useProjectStore = create((set, get) => ({
       const wallIds = wallIdsString ? wallIdsString.split(',') : [];
       if (wallIds.length === 0) return state;
 
+      const { project } = state;
+      if (!project || !project.floors) return state;
+
+      const fIdx = project.current_floor_index || 0;
+      const newRooms = project.floors[fIdx].rooms.map((r) => {
+        if (r.id !== roomId) return r;
+        const newWallColors = { ...(r.wallColors || {}) };
+        wallIds.forEach(wid => {
+          newWallColors[wid] = color;
+        });
+        return { ...r, wallColors: newWallColors };
+      });
+
+      const newFloors = [...project.floors];
+      newFloors[fIdx] = { ...newFloors[fIdx], rooms: newRooms };
+
       return {
         project: {
-          ...state.project,
-          rooms: state.project.floors[state.project.current_floor_index].rooms.map((r) => {
-            if (r.id !== roomId) return r;
-            const newWallColors = { ...(r.wallColors || {}) };
-            wallIds.forEach(wid => {
-              newWallColors[wid] = color;
-            });
-            return { ...r, wallColors: newWallColors };
-          })
+          ...project,
+          rooms: newRooms,
+          floors: newFloors
         }
       };
     });

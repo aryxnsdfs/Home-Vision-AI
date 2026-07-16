@@ -1,287 +1,332 @@
 import logging
 from ortools.sat.python import cp_model
+from collections import deque
 from layout_engine import ROOM_MINIMUMS, _DEFAULT_MIN
 
 logger = logging.getLogger(__name__)
 
-class CPSolver:
-    def __init__(self):
-        pass
+# ─── FORBIDDEN ADJACENCIES ───
+# These room type pairs must NEVER share a physical wall (hygiene/vastu)
+FORBIDDEN_PAIRS = {
+    frozenset({'kitchen', 'bathroom'}),
+    frozenset({'kitchen', 'toilet'}),
+    frozenset({'dining_room', 'bathroom'}),
+    frozenset({'dining_room', 'toilet'}),
+}
 
-    def solve_phase_2_csp(self, floor_data: dict) -> dict:
+# Minimum shared wall length (feet) required to place a door
+MIN_DOOR_WALL_FT = 4.0
+
+
+class CPSolver:
+    """
+    Graph-First Geometry Solver.
+
+    Pipeline:
+        Required Door Graph (connections)
+            ↓
+        CP-SAT with HARD adjacency constraints
+            ↓
+        Post-solve BFS validation
+            ↓
+        Retry on failure (up to 3 attempts)
+    """
+
+    def solve_phase_2_csp(self, floor_data: dict, attempt: int = 0) -> dict:
         """
-        Phase 2: Continuous Constraint Satisfaction Problem Solver
-        Uses Google OR-Tools to solve the precise coordinates and dimensions 
-        of rooms based on the Room Graph, packing them without overlap.
+        Places rooms on a grid such that:
+        1. Connected rooms share ≥ 4ft wall (HARD) — doors are always feasible
+        2. Forbidden pairs never touch (HARD) — kitchen ≠ bathroom
+        3. Minimum room dimensions and areas (HARD)
+        4. Zonal clustering and walking distance (SOFT objectives)
+        5. Post-solve BFS connectivity check
         """
-        # We will parse the floor_data which is a dictionary of room specs
-        # Return a dictionary of modified floor_data
-        
         plot_w_ft = floor_data.get('plot_width', 30.0)
         plot_l_ft = floor_data.get('plot_length', 40.0)
-        
         rooms_spec = floor_data.get('rooms', [])
-        
-        # Grid Resolution: 1 unit = 0.5 feet
+
+        if not rooms_spec:
+            return floor_data
+
+        # Grid: 1 unit = 0.5 feet
         scale = 2
         plot_w = int(plot_w_ft * scale)
         plot_l = int(plot_l_ft * scale)
-        
+        door_w = int(MIN_DOOR_WALL_FT * scale)  # 8 grid units = 4 ft
+
         model = cp_model.CpModel()
-        
-        # Variables for each room
+
+        if attempt == 0:
+            attempt = floor_data.get('attempt', 0)
+
+        # ────────────────────────────────────────────
+        # PHASE 1 — Room Variables
+        # ────────────────────────────────────────────
         room_vars = {}
         for idx, room in enumerate(rooms_spec):
             r_type = room.get("type", "room")
             r_id = room.get("id", f"{r_type}_{idx}")
-            
-            min_dim = int(ROOM_MINIMUMS.get(r_type, _DEFAULT_MIN)["min_dim"] * scale)
-            # Enforce strict minimum widths per the architectural spec
-            if "bedroom" in r_type:
+
+            min_dim = int(ROOM_MINIMUMS.get(r_type, _DEFAULT_MIN).get("min_dim", 8) * scale)
+            # Enforce architectural minimums
+            if "master" in r_type:
+                min_dim = max(min_dim, int(11.0 * scale))
+            elif "bedroom" in r_type:
+                min_dim = max(min_dim, int(10.0 * scale))
+            elif "living" in r_type:
+                min_dim = max(min_dim, int(11.0 * scale))
+            elif "dining" in r_type:
                 min_dim = max(min_dim, int(9.0 * scale))
             elif "kitchen" in r_type:
                 min_dim = max(min_dim, int(8.0 * scale))
             elif "bath" in r_type or "toilet" in r_type:
                 min_dim = max(min_dim, int(5.0 * scale))
-                
-            min_area_ft = ROOM_MINIMUMS.get(r_type, _DEFAULT_MIN)["area"]
-            
+
+            min_area_ft = ROOM_MINIMUMS.get(r_type, _DEFAULT_MIN).get("area", 64)
+
             x = model.NewIntVar(0, plot_w - min_dim, f'x_{r_id}')
             z = model.NewIntVar(0, plot_l - min_dim, f'z_{r_id}')
-            
             w = model.NewIntVar(min_dim, plot_w, f'w_{r_id}')
             l = model.NewIntVar(min_dim, plot_l, f'l_{r_id}')
-            
-            # Aspect ratio constraint: 0.65 <= w/l <= 1.6
-            if "corridor" not in r_type:
-                model.Add(100 * w >= 65 * l)
-                model.Add(10 * w <= 16 * l)
+
+            # Aspect ratio (no super-elongated rooms)
+            if "corridor" not in r_type and "hallway" not in r_type:
+                model.Add(100 * w >= 50 * l)   # w/l ≥ 0.5
+                model.Add(100 * w <= 200 * l)   # w/l ≤ 2.0
             else:
-                # Corridor must be narrow (width <= 5 OR length <= 5)
-                b1 = model.NewBoolVar(f'corr_w_narrow_{r_id}')
-                b2 = model.NewBoolVar(f'corr_l_narrow_{r_id}')
+                # Corridor: at least one dimension must be narrow (≤ 5 ft)
+                b1 = model.NewBoolVar(f'corr_narrow_w_{r_id}')
+                b2 = model.NewBoolVar(f'corr_narrow_l_{r_id}')
                 model.Add(w <= int(5.0 * scale)).OnlyEnforceIf(b1)
                 model.Add(l <= int(5.0 * scale)).OnlyEnforceIf(b2)
                 model.AddBoolOr([b1, b2])
-            
-            x_end = model.NewIntVar(min_dim, plot_w, f'x_end_{r_id}')
-            z_end = model.NewIntVar(min_dim, plot_l, f'z_end_{r_id}')
-            
-            # x + w = x_end
+
+            x_end = model.NewIntVar(min_dim, plot_w, f'xe_{r_id}')
+            z_end = model.NewIntVar(min_dim, plot_l, f'ze_{r_id}')
             model.Add(x_end == x + w)
-            # z + l = z_end
             model.Add(z_end == z + l)
-            
-            x_interval = model.NewIntervalVar(x, w, x_end, f'x_interval_{r_id}')
-            z_interval = model.NewIntervalVar(z, l, z_end, f'z_interval_{r_id}')
-            
+
+            x_iv = model.NewIntervalVar(x, w, x_end, f'xi_{r_id}')
+            z_iv = model.NewIntervalVar(z, l, z_end, f'zi_{r_id}')
+
+            # Minimum area (HARD)
+            area = model.NewIntVar(0, plot_w * plot_l, f'area_{r_id}')
+            model.AddMultiplicationEquality(area, [w, l])
+            model.Add(area >= int(min_area_ft * scale * scale))
+
             room_vars[r_id] = {
                 'type': r_type,
                 'connections': room.get('connections', []),
                 'x': x, 'z': z, 'w': w, 'l': l,
-                'x_interval': x_interval, 'z_interval': z_interval,
-                'min_area_ft': min_area_ft
+                'x_end': x_end, 'z_end': z_end,
+                'x_iv': x_iv, 'z_iv': z_iv,
             }
-            
-        # Constraint: Non-overlap
-        if room_vars:
-            x_intervals = [rv['x_interval'] for rv in room_vars.values()]
-            z_intervals = [rv['z_interval'] for rv in room_vars.values()]
-            model.AddNoOverlap2D(x_intervals, z_intervals)
-            
-            # Constraint: Master Bedroom Area >= Other Bedrooms Area
-            master_rvs = [rv for rv in room_vars.values() if rv['type'] == 'master_bedroom']
-            bed_rvs = [rv for rv in room_vars.values() if rv['type'] == 'bedroom']
-            if master_rvs and bed_rvs:
-                mrv = master_rvs[0]
-                m_area = model.NewIntVar(0, plot_w * plot_l, 'm_area')
-                model.AddMultiplicationEquality(m_area, [mrv['w'], mrv['l']])
-                for i, brv in enumerate(bed_rvs):
-                    b_area = model.NewIntVar(0, plot_w * plot_l, f'b_area_{i}')
-                    model.AddMultiplicationEquality(b_area, [brv['w'], brv['l']])
-                    model.Add(m_area >= b_area)
-            
-        # Constraint: Adjacency (Rooms must touch if connected)
-        # We also want to ensure the graph is fully connected (all rooms touch the main cluster)
-        # For simplicity, we just enforce explicit connections from the room graph.
+
+        # ────────────────────────────────────────────
+        # PHASE 2 — Non-Overlap
+        # ────────────────────────────────────────────
+        model.AddNoOverlap2D(
+            [rv['x_iv'] for rv in room_vars.values()],
+            [rv['z_iv'] for rv in room_vars.values()],
+        )
+
+        # Master bedroom area ≥ any regular bedroom
+        masters = [rv for rv in room_vars.values() if rv['type'] == 'master_bedroom']
+        beds = [rv for rv in room_vars.values() if rv['type'] == 'bedroom']
+        if masters and beds:
+            m = masters[0]
+            ma = model.NewIntVar(0, plot_w * plot_l, 'master_area')
+            model.AddMultiplicationEquality(ma, [m['w'], m['l']])
+            for i, b in enumerate(beds):
+                ba = model.NewIntVar(0, plot_w * plot_l, f'bed_area_{i}')
+                model.AddMultiplicationEquality(ba, [b['w'], b['l']])
+                model.Add(ma >= ba)
+
+        # ────────────────────────────────────────────
+        # PHASE 3 — Required Door Graph (HARD)
+        # Every topology edge MUST produce ≥ 4 ft shared wall.
+        # ────────────────────────────────────────────
+        processed_edges = set()
         for r_id, rv in room_vars.items():
             for conn in rv['connections']:
                 target_type = conn.get('target_room', '')
-                if not target_type: continue
-                # Find target room id
+                if not target_type:
+                    continue
+
+                # Find the first room of target_type that isn't r_id
                 target_id = None
                 for tid, trv in room_vars.items():
-                    if trv['type'] == target_type:
+                    if trv['type'] == target_type and tid != r_id:
                         target_id = tid
                         break
-                if not target_id: continue
-                
+                if not target_id:
+                    continue
+
+                edge = frozenset([r_id, target_id])
+                if edge in processed_edges:
+                    continue
+                processed_edges.add(edge)
+
                 trv = room_vars[target_id]
-                
-                # A and B touch if:
-                # (A.x_end == B.x AND A.z_interval overlaps B.z_interval) OR ...
-                # We can define boolean variables for each of the 4 touching cases:
-                
-                # Case 1: A is to the left of B (A.x_end == B.x)
-                left_of = model.NewBoolVar(f'{r_id}_left_{target_id}')
-                model.Add(rv['x'] + rv['w'] == trv['x']).OnlyEnforceIf(left_of)
-                
-                # Case 2: A is to the right of B (B.x_end == A.x)
-                right_of = model.NewBoolVar(f'{r_id}_right_{target_id}')
-                model.Add(trv['x'] + trv['w'] == rv['x']).OnlyEnforceIf(right_of)
-                
-                # For left/right, Z intervals must overlap.
-                # Overlap means: max(A.z, B.z) < min(A.z_end, B.z_end)
-                z_overlap = model.NewBoolVar(f'{r_id}_z_overlap_{target_id}')
-                # A.z < B.z_end AND B.z < A.z_end
-                model.Add(rv['z'] < trv['z'] + trv['l']).OnlyEnforceIf(z_overlap)
-                model.Add(trv['z'] < rv['z'] + rv['l']).OnlyEnforceIf(z_overlap)
-                
-                # Case 3: A is above B (A.z_end == B.z)
-                above = model.NewBoolVar(f'{r_id}_above_{target_id}')
-                model.Add(rv['z'] + rv['l'] == trv['z']).OnlyEnforceIf(above)
-                
-                # Case 4: A is below B (B.z_end == A.z)
-                below = model.NewBoolVar(f'{r_id}_below_{target_id}')
-                model.Add(trv['z'] + trv['l'] == rv['z']).OnlyEnforceIf(below)
-                
-                # For above/below, X intervals must overlap.
-                x_overlap = model.NewBoolVar(f'{r_id}_x_overlap_{target_id}')
-                model.Add(rv['x'] < trv['x'] + trv['w']).OnlyEnforceIf(x_overlap)
-                model.Add(trv['x'] < rv['x'] + rv['w']).OnlyEnforceIf(x_overlap)
-                
-                # Exactly one directional touch must be true, AND its corresponding overlap must be true
-                touch_left = model.NewBoolVar(f'{r_id}_touch_left_{target_id}')
-                model.AddImplication(touch_left, left_of)
-                model.AddImplication(touch_left, z_overlap)
-                model.AddBoolAnd([left_of, z_overlap]).OnlyEnforceIf(touch_left)
-                
-                touch_right = model.NewBoolVar(f'{r_id}_touch_right_{target_id}')
-                model.AddImplication(touch_right, right_of)
-                model.AddImplication(touch_right, z_overlap)
-                model.AddBoolAnd([right_of, z_overlap]).OnlyEnforceIf(touch_right)
-                
-                touch_above = model.NewBoolVar(f'{r_id}_touch_above_{target_id}')
-                model.AddImplication(touch_above, above)
-                model.AddImplication(touch_above, x_overlap)
-                model.AddBoolAnd([above, x_overlap]).OnlyEnforceIf(touch_above)
-                
-                touch_below = model.NewBoolVar(f'{r_id}_touch_below_{target_id}')
-                model.AddImplication(touch_below, below)
-                model.AddImplication(touch_below, x_overlap)
-                model.AddBoolAnd([below, x_overlap]).OnlyEnforceIf(touch_below)
-                
-                model.AddBoolOr([touch_left, touch_right, touch_above, touch_below])
-            
-        # Architectural Objectives: Zoning, Clustering, and Packing
-        if room_vars:
-            obj_vars = []
-            
-            # 1. Soft Structural Alignment & Packing + Room Expansion
-            # We pull x and z to origin to pack rooms tightly.
-            # We subtract a heavily weighted width and length to maximize room utility instead of shrinking them.
-            for rv in room_vars.values():
-                t = rv['type']
-                weight = 1
-                if 'living' in t: weight = 10
-                elif 'master' in t: weight = 9
-                elif 'dining' in t: weight = 8
-                elif 'kitchen' in t: weight = 7
-                elif 'bed' in t: weight = 6
-                elif 'bath' in t or 'toilet' in t: weight = 3
-                elif 'corridor' in t: weight = -5 # Heavily penalize corridor size
-                
-                # Pull to origin
-                obj_vars.append(rv['x'])
-                obj_vars.append(rv['z'])
-                # Expand size
-                obj_vars.append(-weight * rv['w'])
-                obj_vars.append(-weight * rv['l'])
-                
-            # --- V4 MACRO ZONAL ARCHITECTURE ---
-            # Group rooms by zone
-            zones = {"public": [], "private": [], "service": []}
-            for rv in room_vars.values():
-                t = rv['type'].lower()
-                if t in ['living_room', 'foyer', 'dining_room', 'kitchen', 'porch', 'entrance']:
-                    zones["public"].append(rv)
-                elif t in ['master_bedroom', 'bedroom', 'closet']:
-                    zones["private"].append(rv)
-                elif t in ['bathroom', 'toilet', 'utility', 'laundry', 'store']:
-                    zones["service"].append(rv)
-                    
-            # 1. Macro-Zone Bounding Boxes (Minimize area to force clustering & wall alignment)
-            for z_name, z_rooms in zones.items():
-                if not z_rooms: continue
-                z_min_x = model.NewIntVar(0, plot_w, f'{z_name}_min_x')
-                z_max_x = model.NewIntVar(0, plot_w, f'{z_name}_max_x')
-                z_min_z = model.NewIntVar(0, plot_l, f'{z_name}_min_z')
-                z_max_z = model.NewIntVar(0, plot_l, f'{z_name}_max_z')
-                
-                for rv in z_rooms:
-                    model.Add(z_min_x <= rv['x'])
-                    model.Add(z_max_x >= rv['x'] + rv['w'])
-                    model.Add(z_min_z <= rv['z'])
-                    model.Add(z_max_z >= rv['z'] + rv['l'])
-                    
-                # Penalize the bounding box to cluster the zone tightly (Soft constraint for Alignment/Symmetry)
-                obj_vars.append((z_max_x - z_min_x) * 4)
-                obj_vars.append((z_max_z - z_min_z) * 4)
-                
-                # 2. Zonal Placement (Public at front, Private at rear)
-                if z_name == "public":
-                    obj_vars.append(z_min_z * 20) # Pull Public Zone to Entrance (z=0)
-                elif z_name == "private":
-                    obj_vars.append(-z_max_z * 20) # Push Private Zone to Rear (z=plot_l)
-                
-            # 4. Weighted Movement Graph Optimization (Manhattan Distances)
-            # Minimize walking distance between topologically connected rooms
-            for r_id, rv in room_vars.items():
-                cx1 = model.NewIntVar(0, plot_w * 2, f'cx_{r_id}')
-                cz1 = model.NewIntVar(0, plot_l * 2, f'cz_{r_id}')
-                model.Add(cx1 == 2 * rv['x'] + rv['w'])
-                model.Add(cz1 == 2 * rv['z'] + rv['l'])
-                
-                for conn in rv['connections']:
-                    target_type = conn.get('target_room', '')
-                    weight = conn.get('weight', 5)
-                    if not target_type: continue
-                    
-                    target_id = None
-                    for tid, trv in room_vars.items():
-                        if trv['type'] == target_type:
-                            target_id = tid
-                            break
-                    if not target_id: continue
-                    
-                    trv = room_vars[target_id]
-                    cx2 = model.NewIntVar(0, plot_w * 2, f'cx_{target_id}_{r_id}')
-                    cz2 = model.NewIntVar(0, plot_l * 2, f'cz_{target_id}_{r_id}')
-                    model.Add(cx2 == 2 * trv['x'] + trv['w'])
-                    model.Add(cz2 == 2 * trv['z'] + trv['l'])
-                    
-                    dx = model.NewIntVar(0, plot_w * 2, f'dx_{r_id}_{target_id}')
-                    dz = model.NewIntVar(0, plot_l * 2, f'dz_{r_id}_{target_id}')
-                    
-                    model.AddAbsEquality(dx, cx1 - cx2)
-                    model.AddAbsEquality(dz, cz1 - cz2)
-                    
-                    # Add to objective (distance * weight)
-                    obj_vars.append(weight * dx)
-                    obj_vars.append(weight * dz)
-                    
-            model.Minimize(sum(obj_vars))
-        
+                self._add_touch_constraint(model, rv, trv, r_id, target_id, door_w)
+
+        logger.info(f"[CP-SAT] {len(processed_edges)} required door edges encoded as HARD constraints.")
+
+        # ────────────────────────────────────────────
+        # PHASE 4 — Forbidden Adjacencies (HARD)
+        # Kitchen ≠ Bathroom, Dining ≠ Bathroom, etc.
+        # ────────────────────────────────────────────
+        all_ids = list(room_vars.keys())
+        forbidden_count = 0
+        for i in range(len(all_ids)):
+            for j in range(i + 1, len(all_ids)):
+                id_a, id_b = all_ids[i], all_ids[j]
+                t_a = room_vars[id_a]['type']
+                t_b = room_vars[id_b]['type']
+
+                if frozenset({t_a, t_b}) in FORBIDDEN_PAIRS:
+                    a, b = room_vars[id_a], room_vars[id_b]
+                    # Force ≥ 1 grid-unit gap in at least one direction
+                    s1 = model.NewBoolVar(f'fsep_l_{id_a}_{id_b}')
+                    s2 = model.NewBoolVar(f'fsep_r_{id_a}_{id_b}')
+                    s3 = model.NewBoolVar(f'fsep_a_{id_a}_{id_b}')
+                    s4 = model.NewBoolVar(f'fsep_b_{id_a}_{id_b}')
+
+                    model.Add(a['x'] + a['w'] + 1 <= b['x']).OnlyEnforceIf(s1)
+                    model.Add(b['x'] + b['w'] + 1 <= a['x']).OnlyEnforceIf(s2)
+                    model.Add(a['z'] + a['l'] + 1 <= b['z']).OnlyEnforceIf(s3)
+                    model.Add(b['z'] + b['l'] + 1 <= a['z']).OnlyEnforceIf(s4)
+
+                    model.AddBoolOr([s1, s2, s3, s4])
+                    forbidden_count += 1
+
+        logger.info(f"[CP-SAT] {forbidden_count} forbidden adjacency pairs encoded as HARD constraints.")
+
+        # ────────────────────────────────────────────
+        # PHASE 5 — Soft Objectives
+        # ────────────────────────────────────────────
+        obj_terms = []
+
+        # 5a. Zonal clustering
+        zones = {"public": [], "private": []}
+        for rv in room_vars.values():
+            t = rv['type'].lower()
+            if t in ('living_room', 'foyer', 'dining_room', 'kitchen', 'porch', 'entrance'):
+                zones["public"].append(rv)
+            elif t in ('master_bedroom', 'bedroom', 'closet'):
+                zones["private"].append(rv)
+
+        for z_name, z_rooms in zones.items():
+            if not z_rooms:
+                continue
+            zx0 = model.NewIntVar(0, plot_w, f'{z_name}_x0')
+            zx1 = model.NewIntVar(0, plot_w, f'{z_name}_x1')
+            zz0 = model.NewIntVar(0, plot_l, f'{z_name}_z0')
+            zz1 = model.NewIntVar(0, plot_l, f'{z_name}_z1')
+            for rv in z_rooms:
+                model.Add(zx0 <= rv['x'])
+                model.Add(zx1 >= rv['x'] + rv['w'])
+                model.Add(zz0 <= rv['z'])
+                model.Add(zz1 >= rv['z'] + rv['l'])
+            # Cluster tightly
+            obj_terms.append((zx1 - zx0) * 3)
+            obj_terms.append((zz1 - zz0) * 3)
+            # Public at front (South / Z=max), private at rear (North / Z=0)
+            if z_name == "public":
+                obj_terms.append(-zz1 * 15)
+            elif z_name == "private":
+                obj_terms.append(zz0 * 15)
+
+        # 5b. Global Compactness
+        global_x0 = model.NewIntVar(0, plot_w, 'global_x0')
+        global_x1 = model.NewIntVar(0, plot_w, 'global_x1')
+        global_z0 = model.NewIntVar(0, plot_l, 'global_z0')
+        global_z1 = model.NewIntVar(0, plot_l, 'global_z1')
+        for rv in room_vars.values():
+            model.Add(global_x0 <= rv['x'])
+            model.Add(global_x1 >= rv['x'] + rv['w'])
+            model.Add(global_z0 <= rv['z'])
+            model.Add(global_z1 >= rv['z'] + rv['l'])
+        obj_terms.append((global_x1 - global_x0) * 10)
+        obj_terms.append((global_z1 - global_z0) * 10)
+
+        # 5c. Room expansion weights
+        for rv in room_vars.values():
+            t = rv['type']
+            ew = 1
+            if 'living' in t:    ew = 10
+            elif 'master' in t:  ew = 9
+            elif 'dining' in t:  ew = 8
+            elif 'kitchen' in t: ew = 7
+            elif 'bed' in t:     ew = 6
+            elif 'bath' in t or 'toilet' in t: ew = 3
+            elif 'corridor' in t or 'hallway' in t: ew = -3
+
+            # Slightly perturb weights on retries to find alternate topologies
+            if attempt > 0:
+                # Deterministic perturbation based on room id and attempt
+                ew = max(1, ew + (hash(rv['type']) + attempt) % 3 - 1)
+
+            obj_terms.append(-ew * rv['w'])
+            obj_terms.append(-ew * rv['l'])
+            # Mild packing to origin
+            obj_terms.append(rv['x'])
+            obj_terms.append(rv['z'])
+
+        # 5c. Walking-distance minimisation
+        for r_id, rv in room_vars.items():
+            cx = model.NewIntVar(0, plot_w * 2, f'cx_{r_id}')
+            cz = model.NewIntVar(0, plot_l * 2, f'cz_{r_id}')
+            model.Add(cx == 2 * rv['x'] + rv['w'])
+            model.Add(cz == 2 * rv['z'] + rv['l'])
+
+            for conn in rv['connections']:
+                tt = conn.get('target_room', '')
+                wt = conn.get('weight', 5)
+                if not tt:
+                    continue
+                tid = None
+                for k, v in room_vars.items():
+                    if v['type'] == tt and k != r_id:
+                        tid = k
+                        break
+                if not tid:
+                    continue
+                tv = room_vars[tid]
+                cx2 = model.NewIntVar(0, plot_w * 2, f'cx2_{r_id}_{tid}')
+                cz2 = model.NewIntVar(0, plot_l * 2, f'cz2_{r_id}_{tid}')
+                model.Add(cx2 == 2 * tv['x'] + tv['w'])
+                model.Add(cz2 == 2 * tv['z'] + tv['l'])
+
+                dx = model.NewIntVar(0, plot_w * 2, f'dx_{r_id}_{tid}')
+                dz = model.NewIntVar(0, plot_l * 2, f'dz_{r_id}_{tid}')
+                model.AddAbsEquality(dx, cx - cx2)
+                model.AddAbsEquality(dz, cz - cz2)
+                obj_terms.append(wt * dx)
+                obj_terms.append(wt * dz)
+
+        model.Minimize(sum(obj_terms))
+
+        # ────────────────────────────────────────────
+        # PHASE 6 — Solve
+        # ────────────────────────────────────────────
         solver = cp_model.CpSolver()
-        solver.parameters.max_time_in_seconds = 2.0
-        
+        solver.parameters.max_time_in_seconds = 5.0 + attempt * 3.0
+        # Set random seed to explore different search spaces
+        solver.parameters.random_seed = attempt
+        # Use more workers on retries
+        if attempt > 0:
+            solver.parameters.num_workers = 4
+
         status = solver.Solve(model)
-        
-        if status == cp_model.OPTIMAL or status == cp_model.FEASIBLE:
-            logger.info("CP Solver found a solution!")
-            resolved_rooms = []
+
+        if status in (cp_model.OPTIMAL, cp_model.FEASIBLE):
+            quality = "optimal" if status == cp_model.OPTIMAL else "feasible"
+            logger.info(f"CP Solver found a {quality} solution (attempt {attempt})!")
+
+            resolved = []
             for r_id, rv in room_vars.items():
-                resolved_rooms.append({
+                resolved.append({
                     "id": r_id,
                     "type": rv['type'],
                     "connections": rv['connections'],
@@ -290,16 +335,147 @@ class CPSolver:
                     "width": solver.Value(rv['w']) / scale,
                     "length": solver.Value(rv['l']) / scale,
                 })
-            floor_data['resolved_rooms'] = resolved_rooms
+
+            # ── PHASE 7 — Post-Solve Validation ──
+            validation = self._validate(resolved)
+            floor_data['resolved_rooms'] = resolved
+            floor_data['validation'] = validation
+
+            if not validation['passed']:
+                for e in validation['errors']:
+                    logger.warning(f"[POST-VALIDATE] {e}")
+                if attempt < 2:
+                    logger.info(f"[RETRY] Re-solving (attempt {attempt + 1})…")
+                    # Clear stale results before retry
+                    floor_data.pop('resolved_rooms', None)
+                    return self.solve_phase_2_csp(floor_data, attempt + 1)
+                else:
+                    logger.error("[REJECTED] Layout failed validation after 3 attempts.")
         else:
-            logger.warning("CP Solver failed to find a valid layout within the time limit.")
-            
+            logger.warning(f"CP Solver found no solution (status {status}, attempt {attempt}).")
+            floor_data['validation'] = {'passed': False, 'errors': ['Solver infeasible']}
+            if attempt < 2:
+                logger.info(f"[RETRY] Re-solving with more time (attempt {attempt + 1})…")
+                return self.solve_phase_2_csp(floor_data, attempt + 1)
+
         return floor_data
 
+    # ── helpers ──────────────────────────────────────
+
+    @staticmethod
+    def _add_touch_constraint(model, a, b, a_id, b_id, door_w):
+        """
+        HARD: rooms *a* and *b* must share a wall with ≥ door_w overlap.
+
+        Encodes four directional cases; at least one must be true.
+        """
+        tag = f'{a_id}__{b_id}'
+
+        # Case 1 — A left of B  (A.x_end == B.x, Z overlap ≥ door_w)
+        c1 = model.NewBoolVar(f'L_{tag}')
+        model.Add(a['x'] + a['w'] == b['x']).OnlyEnforceIf(c1)
+        model.Add(a['z'] + door_w <= b['z'] + b['l']).OnlyEnforceIf(c1)
+        model.Add(b['z'] + door_w <= a['z'] + a['l']).OnlyEnforceIf(c1)
+
+        # Case 2 — A right of B  (B.x_end == A.x)
+        c2 = model.NewBoolVar(f'R_{tag}')
+        model.Add(b['x'] + b['w'] == a['x']).OnlyEnforceIf(c2)
+        model.Add(a['z'] + door_w <= b['z'] + b['l']).OnlyEnforceIf(c2)
+        model.Add(b['z'] + door_w <= a['z'] + a['l']).OnlyEnforceIf(c2)
+
+        # Case 3 — A above B  (A.z_end == B.z, X overlap ≥ door_w)
+        c3 = model.NewBoolVar(f'A_{tag}')
+        model.Add(a['z'] + a['l'] == b['z']).OnlyEnforceIf(c3)
+        model.Add(a['x'] + door_w <= b['x'] + b['w']).OnlyEnforceIf(c3)
+        model.Add(b['x'] + door_w <= a['x'] + a['w']).OnlyEnforceIf(c3)
+
+        # Case 4 — A below B  (B.z_end == A.z)
+        c4 = model.NewBoolVar(f'B_{tag}')
+        model.Add(b['z'] + b['l'] == a['z']).OnlyEnforceIf(c4)
+        model.Add(a['x'] + door_w <= b['x'] + b['w']).OnlyEnforceIf(c4)
+        model.Add(b['x'] + door_w <= a['x'] + a['w']).OnlyEnforceIf(c4)
+
+        model.AddBoolOr([c1, c2, c3, c4])
+
+    def _validate(self, rooms):
+        """BFS reachability + forbidden-adjacency + door-feasibility post-check."""
+        errors = []
+
+        # Build geometric adjacency graph (shared wall ≥ MIN_DOOR_WALL_FT)
+        adj = {r['id']: set() for r in rooms}
+        for i, a in enumerate(rooms):
+            for b in rooms[i + 1:]:
+                sw = self._shared_wall(a, b)
+                if sw > 0.01:
+                    # Check forbidden
+                    if frozenset({a['type'], b['type']}) in FORBIDDEN_PAIRS:
+                        errors.append(f"FORBIDDEN: {a['id']} ({a['type']}) touches {b['id']} ({b['type']})")
+                    if sw >= MIN_DOOR_WALL_FT:
+                        adj[a['id']].add(b['id'])
+                        adj[b['id']].add(a['id'])
+
+        # Verify every topology edge has enough shared wall
+        for r in rooms:
+            for conn in r.get('connections', []):
+                tt = conn.get('target_room', '')
+                if not tt:
+                    continue
+                target = next((t for t in rooms if t['type'] == tt and t['id'] != r['id']), None)
+                if not target:
+                    continue
+                sw = self._shared_wall(r, target)
+                if sw < MIN_DOOR_WALL_FT:
+                    errors.append(
+                        f"DOOR INFEASIBLE: {r['id']}↔{target['id']} "
+                        f"shared wall {sw:.1f}ft < {MIN_DOOR_WALL_FT}ft"
+                    )
+
+        # BFS from living_room — every room must be reachable
+        starts = [r['id'] for r in rooms if r['type'] == 'living_room']
+        if starts:
+            visited = set(starts)
+            q = deque(starts)
+            while q:
+                cur = q.popleft()
+                for nb in adj.get(cur, []):
+                    if nb not in visited:
+                        visited.add(nb)
+                        q.append(nb)
+            unreachable = [r['id'] for r in rooms if r['id'] not in visited]
+            if unreachable:
+                errors.append(f"UNREACHABLE from living room: {unreachable}")
+
+        return {'passed': len(errors) == 0, 'errors': errors}
+
+    @staticmethod
+    def _shared_wall(a, b):
+        """Length of shared wall between two AABBs (0 if they don't touch)."""
+        TOL = 0.05
+        ax1, az1 = a['x'], a['z']
+        ax2, az2 = ax1 + a['width'], az1 + a['length']
+        bx1, bz1 = b['x'], b['z']
+        bx2, bz2 = bx1 + b['width'], bz1 + b['length']
+
+        # Vertical wall (left/right touch)
+        if abs(ax2 - bx1) < TOL or abs(bx2 - ax1) < TOL:
+            s, e = max(az1, bz1), min(az2, bz2)
+            return max(0.0, e - s)
+
+        # Horizontal wall (top/bottom touch)
+        if abs(az2 - bz1) < TOL or abs(bz2 - az1) < TOL:
+            s, e = max(ax1, bx1), min(ax2, bx2)
+            return max(0.0, e - s)
+
+        return 0.0
+
+
+# ───────────────────────────────────────────────
+# Public API consumed by layout_engine.py
+# ───────────────────────────────────────────────
 class LayoutGeometryEngine:
     def __init__(self):
         self.solver = CPSolver()
-        
+
     def solve_phase_1_local(self, prompt: str, floor_data: dict) -> dict:
         return floor_data
 

@@ -1,0 +1,3 @@
+@echo off
+echo Starting Celery with auto-reload (watchfiles)...
+watchfiles "python -m celery -A celery_worker worker --loglevel=info --pool=solo" .

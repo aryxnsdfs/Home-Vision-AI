@@ -586,6 +586,8 @@ function PromptBar() {
   const [prompt, setPrompt] = useState("");
   const [submitting, setSubmitting] = useState(false);
   const [status, setStatus] = useState("");
+  const [genLogs, setGenLogs] = useState([]);
+  const [showLogs, setShowLogs] = useState(false);
   const applyStylePrompt = useProjectStore((state) => state.applyStylePrompt);
   const applyGeneratedProject = useProjectStore(
     (state) => state.applyGeneratedProject
@@ -593,26 +595,58 @@ function PromptBar() {
   const project = useProjectStore((state) => state.project);
 
   const submit = async () => {
-    const clean = prompt.trim();
+    let clean = prompt.trim();
     if (!clean) return;
+
+    // Clear previous logs and open log panel
+    setGenLogs([]);
+    setShowLogs(true);
+
+    const selectedObj = useProjectStore.getState().selectedObject;
+    if (selectedObj?.kind === "room" && selectedObj.data) {
+      const rName = selectedObj.data.name || "";
+      const rType = selectedObj.data.type || "";
+      const cleanLower = clean.toLowerCase();
+      if (!cleanLower.includes(rName.toLowerCase()) && !cleanLower.includes(rType.toLowerCase())) {
+        clean = `For ${rName}: ${clean}`;
+      }
+    }
+
+    setGenLogs([{ type: "pending", message: `Sending to backend: "${clean}"`, time: new Date().toLocaleTimeString() }]);
+
     setSubmitting(true);
     setStatus("");
+    const t0 = performance.now();
     try {
+      const currentState = useProjectStore.getState();
       const response = await fetch(`${API_BASE_URL}/generate`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           prompt: clean,
-          currentProject: useProjectStore.getState().project,
-          layoutRules: useProjectStore.getState().layoutRules || [],
-          indianOptions: useProjectStore.getState().project.indianOptions || {},
+          currentProject: currentState.project,
+          layoutRules: currentState.layoutRules || [],
+          indianOptions: currentState.project.indianOptions || {},
         })
       });
+      const elapsed = ((performance.now() - t0) / 1000).toFixed(2);
       if (!response.ok) throw new Error(`Backend returned ${response.status}`);
       const json = await response.json();
+
+      // Use backend logs if available, otherwise show basic info
+      const backendLogs = json.logs || [];
+      const clientLog = { type: "success", message: `Round-trip: ${elapsed}s`, time: new Date().toLocaleTimeString() };
+      setGenLogs([...backendLogs, clientLog]);
+
       applyGeneratedProject(json);
       setStatus("✓ Applied");
-    } catch {
+    } catch (err) {
+      const elapsed = ((performance.now() - t0) / 1000).toFixed(2);
+      setGenLogs(prev => [
+        ...prev,
+        { type: "error", message: `Failed after ${elapsed}s: ${err.message}`, time: new Date().toLocaleTimeString() },
+        { type: "info", message: "Falling back to local style parsing", time: new Date().toLocaleTimeString() },
+      ]);
       // Graceful fallback to local style parsing
       applyStylePrompt(clean);
       setStatus("✓ Style applied locally");
@@ -628,9 +662,70 @@ function PromptBar() {
   const lastWarnings = useProjectStore(s => s.lastWarnings);
   const hasRooms = rooms && rooms.length > 0;
 
+  const logColors = {
+    info: "text-sky-400",
+    success: "text-emerald-400",
+    warn: "text-amber-400",
+    error: "text-red-400",
+    pending: "text-purple-400",
+  };
+  const logIcons = {
+    info: "ℹ",
+    success: "✓",
+    warn: "⚠",
+    error: "✗",
+    pending: "⟳",
+  };
+
   return (
     <div className="pointer-events-none fixed bottom-[110px] left-3 right-3 z-50 mx-auto flex max-w-2xl flex-col items-center gap-2 sm:left-24 sm:right-24 sm:bottom-[100px]">
-      {/* REMOVED MODIFYING LAYOUT BADGE */}
+      {/* Generation Log Panel */}
+      {showLogs && genLogs.length > 0 && (
+        <motion.div
+          initial={{ opacity: 0, y: 10, scaleY: 0.95 }}
+          animate={{ opacity: 1, y: 0, scaleY: 1 }}
+          exit={{ opacity: 0 }}
+          className="pointer-events-auto w-full rounded-2xl border border-white/10 bg-neutral-950/95 shadow-2xl shadow-black/50 backdrop-blur-2xl overflow-hidden"
+        >
+          <div className="flex items-center justify-between px-3 py-2 border-b border-white/5">
+            <span className="text-[11px] font-bold text-neutral-300 tracking-wider uppercase flex items-center gap-1.5">
+              <Zap size={12} className="text-amber-400" />
+              Generation Log
+              <span className="text-[10px] text-neutral-500 font-normal ml-1">({genLogs.length} entries)</span>
+            </span>
+            <button onClick={() => setShowLogs(false)} className="text-neutral-500 hover:text-neutral-300 transition">
+              <X size={14} />
+            </button>
+          </div>
+          <div className="max-h-[240px] overflow-y-auto px-3 py-2 space-y-1 scrollbar-thin" style={{ scrollbarWidth: 'thin', scrollbarColor: '#444 transparent' }}>
+            {genLogs.map((log, i) => (
+              <div key={i} className="flex gap-2 text-[11px] leading-relaxed font-mono">
+                <span className="text-neutral-600 shrink-0 select-none">{log.time}</span>
+                <span className={`shrink-0 w-3 text-center ${logColors[log.type]}`}>{logIcons[log.type]}</span>
+                <div className="flex-1 min-w-0">
+                  <span className={logColors[log.type]}>{log.message}</span>
+                  {log.data && Array.isArray(log.data) && (
+                    <div className="mt-0.5 pl-2 border-l border-white/5">
+                      {log.data.map((item, j) => (
+                        <div key={j} className="text-neutral-400 text-[10px]">
+                          • {typeof item === 'string' ? item : JSON.stringify(item)}
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              </div>
+            ))}
+            {submitting && (
+              <div className="flex gap-2 text-[11px] leading-relaxed font-mono items-center">
+                <span className="text-neutral-600 shrink-0 select-none">{new Date().toLocaleTimeString()}</span>
+                <Loader2 size={10} className="animate-spin text-purple-400 shrink-0" />
+                <span className="text-purple-400 animate-pulse">Processing...</span>
+              </div>
+            )}
+          </div>
+        </motion.div>
+      )}
       
       <motion.div
         initial={{ y: 16, opacity: 0 }}
@@ -655,6 +750,15 @@ function PromptBar() {
           <span className="text-[10px] font-bold text-emerald-400 whitespace-nowrap">
             {status}
           </span>
+        )}
+        {genLogs.length > 0 && !showLogs && (
+          <button
+            onClick={() => setShowLogs(true)}
+            className="text-[10px] font-bold text-amber-400/70 hover:text-amber-400 transition whitespace-nowrap"
+            title="Show generation logs"
+          >
+            Logs ({genLogs.length})
+          </button>
         )}
         <button
           type="button"
@@ -1411,8 +1515,6 @@ function ColorPickerSection() {
   const setRoomColor = useProjectStore(s => s.setRoomColor);
   const setWallColors = useProjectStore(s => s.setWallColors);
   const room = (project.floors ? project.floors[project.current_floor_index || 0].rooms : []).find(r => r.id === selectedRoomId);
-  const [aiPrompt, setAiPrompt] = React.useState('');
-  const [aiLoading, setAiLoading] = React.useState(false);
 
   if (!room) {
     return null;
@@ -1440,107 +1542,63 @@ function ColorPickerSection() {
     '#fef9c3','#e0f2fe'
   ];
 
-  const handleAiColor = async () => {
-    if (!aiPrompt.trim()) return;
-    setAiLoading(true);
-    try {
-      const res = await fetch('http://localhost:8994/api/generate', {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ prompt: `Apply colors for ${aiPrompt}`, styleOnly: true })
-      });
-      const data = await res.json();
-      if (data.style?.accentColor) {
-        if (selectedObject?.kind?.includes('solid')) {
-          setWallColors(room.id, selectedObject.kind, data.style.accentColor);
-        } else {
-          setRoomColor(room.id, data.style.accentColor, data.style.accentColor, data.style.accentColor);
-        }
-      }
-    } catch(e) { /* ignore */ }
-    setAiLoading(false);
-  };
-
   return (
     <div className="mt-4 border-t border-white/10 pt-4">
       <div className="mb-2 flex items-center gap-2 text-xs font-semibold uppercase tracking-wider text-neutral-400">
         <Palette size={14} /> Colors
       </div>
       
-      <div className="space-y-3">
+      <div className="flex flex-wrap items-center gap-1.5">
         {/* Quick palette */}
-        <div className="flex flex-wrap gap-1.5">
-          {palette.map(c => (
-            <button
-              key={c}
-              onClick={() => {
-                if (selectedObject?.kind?.includes('solid')) setWallColors(room.id, selectedObject.kind, c);
-                else setRoomColor(room.id, c, room.furnitureColor || '#d4bfa0', c);
-              }}
-              style={{ backgroundColor: c }}
-              title={c}
-              className={`h-6 rounded-md border-2 transition-all hover:scale-110 ${
-                room.floorColor === c ? 'w-10 border-white' : 'w-6 border-white/10 hover:border-white/50'
-              }`}
-            />
-          ))}
-        </div>
-
-        {/* Manual hex picker */}
-        <div className="flex flex-wrap items-center gap-2">
-          {(!selectedObject || selectedObject.kind === 'floor' || selectedObject.kind === 'room') && (
-            <div className="flex items-center gap-1.5 rounded-lg bg-white/5 px-2 py-1">
-              <label className="text-[10px] text-neutral-400">Floor</label>
-              <input
-                type="color"
-                value={room.floorColor || '#e2e8f0'}
-                onChange={e => setRoomColor(room.id, e.target.value, room.furnitureColor || '#d4bfa0', room.wallColor || '#ffffff')}
-                className="h-5 w-5 cursor-pointer rounded border-0 bg-transparent"
-              />
-            </div>
-          )}
-          {(!selectedObject || selectedObject.kind?.includes('solid') || selectedObject.kind === 'room') && (
-            <div className="flex items-center gap-1.5 rounded-lg bg-white/5 px-2 py-1">
-              <label className="text-[10px] text-neutral-400">Wall</label>
-              <input
-                type="color"
-                value={currentWallColor()}
-                onChange={handleWallColorChange}
-                className="h-5 w-5 cursor-pointer rounded border-0 bg-transparent"
-              />
-            </div>
-          )}
-          {(!selectedObject || selectedObject.kind === 'furniture' || selectedObject.kind === 'room') && (
-            <div className="flex items-center gap-1.5 rounded-lg bg-white/5 px-2 py-1">
-              <label className="text-[10px] text-neutral-400">Furniture</label>
-              <input
-                type="color"
-                value={room.furnitureColor || '#d4bfa0'}
-                onChange={e => setRoomColor(room.id, room.floorColor || '#e2e8f0', e.target.value, room.wallColor || '#ffffff')}
-                className="h-5 w-5 cursor-pointer rounded border-0 bg-transparent"
-              />
-            </div>
-          )}
-        </div>
-
-        {/* AI Theme */}
-        <div className="flex gap-2">
-          <input
-            type="text"
-            placeholder="e.g. ocean blue, warm wood..."
-            value={aiPrompt}
-            onChange={(e) => setAiPrompt(e.target.value)}
-            onKeyDown={(e) => e.key === 'Enter' && handleAiColor()}
-            className="w-full rounded-md bg-white/5 px-2.5 py-1.5 text-[11px] text-white placeholder-neutral-500 outline-none focus:bg-white/10"
-          />
+        {palette.map(c => (
           <button
-            onClick={handleAiColor}
-            disabled={aiLoading}
-            className="flex items-center justify-center rounded-md bg-indigo-500/20 px-2.5 py-1.5 text-indigo-300 transition hover:bg-indigo-500/30 disabled:opacity-50"
-          >
-            {aiLoading ? <span className="animate-spin text-[10px]">⟳</span> : <Sparkles size={14} />}
-          </button>
-        </div>
+            key={c}
+            onClick={() => {
+              const kind = selectedObject?.kind || 'room';
+              if (kind.includes('solid')) {
+                setWallColors(room.id, kind, c);
+              } else if (kind === 'floor') {
+                setRoomColor(room.id, c, room.furnitureColor || '#d4bfa0', room.wallColor || '#ffffff');
+              } else if (kind === 'furniture') {
+                // Do nothing for furniture color
+              } else if (kind === 'wall') {
+                setRoomColor(room.id, room.floorColor || '#e2e8f0', room.furnitureColor || '#d4bfa0', c);
+              } else {
+                // Room mode: set both floor and wall color for quick styling
+                setRoomColor(room.id, c, room.furnitureColor || '#d4bfa0', c);
+              }
+            }}
+            style={{ backgroundColor: c }}
+            title={c}
+            className={`h-6 rounded-md border-2 transition-all hover:scale-110 ${
+              room.floorColor === c ? 'w-10 border-white' : 'w-6 border-white/10 hover:border-white/50'
+            }`}
+          />
+        ))}
+
+        {(!selectedObject || selectedObject.kind === 'floor' || selectedObject.kind === 'room') && (
+          <div className="flex items-center gap-1.5 rounded-lg bg-white/5 px-2 py-1 ml-2">
+            <label className="text-[10px] text-neutral-400">Floor</label>
+            <input
+              type="color"
+              value={room.floorColor || '#e2e8f0'}
+              onChange={e => setRoomColor(room.id, e.target.value, room.furnitureColor || '#d4bfa0', room.wallColor || '#ffffff')}
+              className="h-5 w-5 cursor-pointer rounded border-0 bg-transparent"
+            />
+          </div>
+        )}
+        
+        {(!selectedObject || selectedObject.kind === 'wall' || selectedObject.kind?.includes('solid') || selectedObject.kind === 'room') && (
+          <div className="flex items-center gap-1.5 rounded-lg bg-white/5 px-2 py-1 ml-2">
+            <label className="text-[10px] text-neutral-400">Wall</label>
+            <input
+              type="color"
+              value={currentWallColor()}
+              onChange={handleWallColorChange}
+              className="h-5 w-5 cursor-pointer rounded border-0 bg-transparent"
+            />
+          </div>
+        )}
       </div>
     </div>
   );
