@@ -246,6 +246,7 @@ function BuilderLegends() {
   const showWiring = useProjectStore((state) => state.showWiring);
   const showPlumbing = useProjectStore((state) => state.showPlumbing);
   const showLegend = useProjectStore((state) => state.showLegend);
+  const builderMode = useProjectStore((state) => state.builderMode);
   // Show whenever a MEP layer is visible AND the legend toggle is on — works in
   // both Home-Owner and Builder modes. Both wiring + plumbing keys can show.
   if (!showLegend || (!showWiring && !showPlumbing)) return null;
@@ -265,12 +266,19 @@ function BuilderLegends() {
     </li>
   );
 
+  const containerClass = builderMode
+    ? "pointer-events-auto w-44 sm:w-52 bg-slate-900/90 backdrop-blur-md rounded-2xl px-3 py-2.5 border border-white/10 text-white shadow-2xl shrink-0"
+    : "pointer-events-auto fixed right-3 sm:right-6 w-44 sm:w-52 bg-slate-900/90 backdrop-blur-md rounded-2xl px-3 py-2.5 border border-white/10 z-[55] text-white shadow-2xl";
+
+  const containerStyle = builderMode
+    ? {}
+    : { top: "calc(136px + 14rem + 180px)" };
+
   // Rendered inside FloatingOverlay after MiniMap. Sits directly under minimap
   // via a high top value that clears the minimap container + its controls.
   // z-[55] sits above minimap (z-50). Matches minimap width (w-44 sm:w-52).
   return (
-    <div className="pointer-events-auto fixed right-3 sm:right-6 w-44 sm:w-52 bg-slate-900/90 backdrop-blur-md rounded-2xl px-3 py-2.5 border border-white/10 z-[55] text-white shadow-2xl"
-         style={{ top: "calc(136px + 14rem + 180px)" }}>
+    <div className={containerClass} style={containerStyle}>
       {showWiring && (
         <div className={showPlumbing ? "mb-3" : ""}>
           <h3 className="text-[10px] font-bold uppercase tracking-wider mb-1.5 text-neutral-300">Electrical Legend</h3>
@@ -309,7 +317,7 @@ function ProfessionalSchedules() {
   });
 
   return (
-    <div className="fixed right-6 bottom-32 w-80 bg-slate-900/90 backdrop-blur-md rounded-2xl p-4 border border-white/10 z-40 text-white shadow-2xl pointer-events-auto max-h-[50vh] overflow-y-auto custom-scrollbar">
+    <div className="w-80 bg-slate-900/90 backdrop-blur-md rounded-2xl p-4 border border-white/10 text-white shadow-2xl pointer-events-auto max-h-[50vh] overflow-y-auto custom-scrollbar">
       <h3 className="text-xs font-bold uppercase tracking-wider mb-2 text-emerald-400">Electrical Schedule</h3>
       <table className="w-full text-[9px] text-left">
         <thead>
@@ -2349,6 +2357,7 @@ export default function FloatingOverlay() {
   const [wiringModalOpen, setWiringModalOpen] = React.useState(false);
   const [plumbingModalOpen, setPlumbingModalOpen] = React.useState(false);
   const minimapExpanded = useProjectStore((state) => state.minimapExpanded);
+  const builderMode = useProjectStore((state) => state.builderMode);
 
   React.useEffect(() => {
     const handleKeyDown = (e) => {
@@ -2387,8 +2396,14 @@ export default function FloatingOverlay() {
         <PromptBar />
         <CenteredPropertiesPanel />
         <BottomDock />
-        <BuilderLegends />
-        <ProfessionalSchedules />
+        {builderMode ? (
+          <div className="fixed right-6 bottom-32 z-40 flex flex-col items-end gap-3 pointer-events-none">
+            <ProfessionalSchedules />
+            <BuilderLegends />
+          </div>
+        ) : (
+          <BuilderLegends />
+        )}
       </div>
       <MiniMap />
       <WarningToast />
