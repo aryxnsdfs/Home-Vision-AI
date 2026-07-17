@@ -949,9 +949,7 @@ export default function Room({
           if (isSouthEdge) segmentMats[4] = matArrays.extMat;
           if (isNorthEdge) segmentMats[5] = matArrays.extMat;
 
-          if (isEastEdge || isWestEdge || isSouthEdge || isNorthEdge) {
-            console.log(`[EDGE WALL] Room: ${room.name} | Kind: ${kind} | Ext:${isExt} | E:${isEastEdge} W:${isWestEdge} S:${isSouthEdge} N:${isNorthEdge}`);
-          }
+
 
           return (
             <React.Fragment key={`${id || kind}-${idx}`}>

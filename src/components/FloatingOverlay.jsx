@@ -598,9 +598,8 @@ function PromptBar() {
     let clean = prompt.trim();
     if (!clean) return;
 
-    // Clear previous logs and open log panel
+    // Clear previous logs
     setGenLogs([]);
-    setShowLogs(true);
 
     const selectedObj = useProjectStore.getState().selectedObject;
     if (selectedObj?.kind === "room" && selectedObj.data) {
@@ -679,53 +678,7 @@ function PromptBar() {
 
   return (
     <div className="pointer-events-none fixed bottom-[110px] left-3 right-3 z-50 mx-auto flex max-w-2xl flex-col items-center gap-2 sm:left-24 sm:right-24 sm:bottom-[100px]">
-      {/* Generation Log Panel */}
-      {showLogs && genLogs.length > 0 && (
-        <motion.div
-          initial={{ opacity: 0, y: 10, scaleY: 0.95 }}
-          animate={{ opacity: 1, y: 0, scaleY: 1 }}
-          exit={{ opacity: 0 }}
-          className="pointer-events-auto w-full rounded-2xl border border-white/10 bg-neutral-950/95 shadow-2xl shadow-black/50 backdrop-blur-2xl overflow-hidden"
-        >
-          <div className="flex items-center justify-between px-3 py-2 border-b border-white/5">
-            <span className="text-[11px] font-bold text-neutral-300 tracking-wider uppercase flex items-center gap-1.5">
-              <Zap size={12} className="text-amber-400" />
-              Generation Log
-              <span className="text-[10px] text-neutral-500 font-normal ml-1">({genLogs.length} entries)</span>
-            </span>
-            <button onClick={() => setShowLogs(false)} className="text-neutral-500 hover:text-neutral-300 transition">
-              <X size={14} />
-            </button>
-          </div>
-          <div className="max-h-[240px] overflow-y-auto px-3 py-2 space-y-1 scrollbar-thin" style={{ scrollbarWidth: 'thin', scrollbarColor: '#444 transparent' }}>
-            {genLogs.map((log, i) => (
-              <div key={i} className="flex gap-2 text-[11px] leading-relaxed font-mono">
-                <span className="text-neutral-600 shrink-0 select-none">{log.time}</span>
-                <span className={`shrink-0 w-3 text-center ${logColors[log.type]}`}>{logIcons[log.type]}</span>
-                <div className="flex-1 min-w-0">
-                  <span className={logColors[log.type]}>{log.message}</span>
-                  {log.data && Array.isArray(log.data) && (
-                    <div className="mt-0.5 pl-2 border-l border-white/5">
-                      {log.data.map((item, j) => (
-                        <div key={j} className="text-neutral-400 text-[10px]">
-                          • {typeof item === 'string' ? item : JSON.stringify(item)}
-                        </div>
-                      ))}
-                    </div>
-                  )}
-                </div>
-              </div>
-            ))}
-            {submitting && (
-              <div className="flex gap-2 text-[11px] leading-relaxed font-mono items-center">
-                <span className="text-neutral-600 shrink-0 select-none">{new Date().toLocaleTimeString()}</span>
-                <Loader2 size={10} className="animate-spin text-purple-400 shrink-0" />
-                <span className="text-purple-400 animate-pulse">Processing...</span>
-              </div>
-            )}
-          </div>
-        </motion.div>
-      )}
+
       
       <motion.div
         initial={{ y: 16, opacity: 0 }}
@@ -751,15 +704,7 @@ function PromptBar() {
             {status}
           </span>
         )}
-        {genLogs.length > 0 && !showLogs && (
-          <button
-            onClick={() => setShowLogs(true)}
-            className="text-[10px] font-bold text-amber-400/70 hover:text-amber-400 transition whitespace-nowrap"
-            title="Show generation logs"
-          >
-            Logs ({genLogs.length})
-          </button>
-        )}
+
         <button
           type="button"
           onClick={submit}
