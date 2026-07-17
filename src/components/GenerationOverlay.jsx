@@ -181,9 +181,6 @@ export default function GenerationOverlay() {
                 <p className="text-white text-xl font-semibold tracking-tight mb-1.5">
                   Generating your home
                 </p>
-                <p className="text-white/30 text-sm leading-snug line-clamp-2">
-                  {subtitle}
-                </p>
               </motion.div>
 
               {/* Stage list */}
