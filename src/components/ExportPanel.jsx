@@ -20,13 +20,6 @@ export default function ExportPanel() {
   const [busy, setBusy] = useState(false);
 
   const handleExport = async () => {
-    // Informational (non-blocking) warning when MEP layers are missing.
-    const hasWiring = !!project?.rooms?.some(r => r.mep_nodes?.some(n => n.is_wiring));
-    const hasPlumbing = !!project?.rooms?.some(r => r.mep_nodes?.some(n => n.is_plumbing));
-    if (!hasWiring || !hasPlumbing) {
-      useProjectStore.setState({ uiWarning: "Warning: This blueprint does not include Wiring and/or Water Supply layouts. For a complete engineering blueprint, please enable Add Wiring and Add Water Supply." });
-      await new Promise((r) => setTimeout(r, 60)); // let the toast paint first
-    }
     setBusy(true);
     try {
       validateProject();

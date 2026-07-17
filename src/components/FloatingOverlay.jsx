@@ -109,17 +109,7 @@ const downloadBlob = (blob, filename) => {
   const project = useProjectStore((state) => state.project);
   const [busy, setBusy] = useState(false);
 
-  const hasWiring = !!project?.rooms?.some(r => r.mep_nodes?.some(n => n.is_wiring));
-  const hasPlumbing = !!project?.rooms?.some(r => r.mep_nodes?.some(n => n.is_plumbing));
-  const engineeringReady = hasWiring && hasPlumbing;
-
   const handleExport = async () => {
-    // Download always allowed. Warn (non-blocking) if MEP layers missing —
-    // blueprint just won't contain that info.
-    if (!hasWiring || !hasPlumbing) {
-      useProjectStore.setState({ uiWarning: "Warning: This blueprint does not include Wiring and/or Water Supply layouts. For a complete engineering blueprint, please enable Add Wiring and Add Water Supply." });
-      await new Promise((r) => setTimeout(r, 60)); // let the toast paint before heavy PDF work
-    }
     setBusy(true);
     try {
       validateProject();
@@ -145,7 +135,7 @@ const downloadBlob = (blob, filename) => {
       type="button"
       onClick={handleExport}
       disabled={busy}
-      title={engineeringReady ? "Download Engineering Blueprints" : "Download (some MEP layers not generated — blueprint will be partial)"}
+      title="Download Engineering Blueprints"
       className="flex items-center gap-2 h-10 px-4 rounded-xl border transition hover:-translate-y-0.5 disabled:cursor-not-allowed disabled:opacity-70 border-emerald-500/30 bg-emerald-500/10 hover:bg-emerald-400/20 hover:border-emerald-400/50 hover:shadow-[0_0_15px_rgba(52,211,153,0.3)]"
       aria-label="Export architect PDF"
     >
