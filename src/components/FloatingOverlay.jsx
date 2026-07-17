@@ -2387,7 +2387,7 @@ export default function FloatingOverlay() {
         <CenteredPropertiesPanel />
         <BottomDock />
         {builderMode ? (
-          <div className="fixed right-6 bottom-32 z-40 flex flex-col items-end gap-3 pointer-events-none">
+          <div className="fixed right-6 bottom-32 z-40 flex flex-row items-end gap-3 pointer-events-none">
             <ProfessionalSchedules />
             <BuilderLegends />
           </div>
