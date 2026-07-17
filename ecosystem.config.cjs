@@ -11,6 +11,7 @@ module.exports = {
     {
       name: "home-celery",
       script: "/var/www/sanky/venv/bin/celery",
+      interpreter: "/var/www/sanky/venv/bin/python",
       args: "-A celery_worker worker --loglevel=info --pool=solo",
       cwd: "/var/www/sanky",
       restart_delay: 5000,
