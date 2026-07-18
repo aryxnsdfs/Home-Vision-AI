@@ -527,7 +527,15 @@ def auto_wire_topology(room_types: list, ai_categories: dict = None) -> list:
     if not room_types:
         return []
         
-    ai_categories = ai_categories or {}
+    if not ai_categories:
+        # Intelligent fallback categorization
+        ai_categories = {
+            "outdoor_rooms": [r for r in room_types if any(kw in r.lower() for kw in ("courtyard", "parking", "garden", "pool", "deck", "patio", "balcony", "porch", "veranda"))],
+            "wet_rooms": [r for r in room_types if any(kw in r.lower() for kw in ("bath", "toilet", "powder", "laundry", "wash"))],
+            "circulation_rooms": [r for r in room_types if any(kw in r.lower() for kw in ("corridor", "hallway", "staircase", "foyer"))],
+            "private_rooms": [r for r in room_types if any(kw in r.lower() for kw in ("bed", "master", "closet", "study", "office"))],
+            "public_rooms": [r for r in room_types if any(kw in r.lower() for kw in ("living", "kitchen", "dining", "lounge", "family", "drawing"))],
+        }
     
     # Normalize AI sets for fast lookup
     outdoor_set = {r.replace(" ", "_").lower() for r in ai_categories.get("outdoor_rooms", [])}
