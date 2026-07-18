@@ -90,19 +90,27 @@ class CPSolver:
             l = model.NewIntVar(min_dim, plot_l, f'l_{r_id}')
 
             # Aspect ratio (no super-elongated rooms)
-            if "corridor" not in r_type and "hallway" not in r_type:
-                model.Add(100 * w >= 50 * l)   # w/l ≥ 0.5
-                model.Add(100 * w <= 200 * l)   # w/l ≤ 2.0
-            else:
-                # Corridor: at least one dimension must be narrow (≤ 5 ft)
-                b1 = model.NewBoolVar(f'corr_narrow_w_{r_id}')
-                b2 = model.NewBoolVar(f'corr_narrow_l_{r_id}')
-                model.Add(w <= int(5.0 * scale)).OnlyEnforceIf(b1)
-                model.Add(l <= int(5.0 * scale)).OnlyEnforceIf(b2)
-                model.AddBoolOr([b1, b2])
+            if "fixed_rect" not in room:
+                if "corridor" not in r_type and "hallway" not in r_type:
+                    model.Add(100 * w >= 50 * l)   # w/l ≥ 0.5
+                    model.Add(100 * w <= 200 * l)   # w/l ≤ 2.0
+                else:
+                    # Corridor: at least one dimension must be narrow (≤ 5 ft)
+                    b1 = model.NewBoolVar(f'corr_narrow_w_{r_id}')
+                    b2 = model.NewBoolVar(f'corr_narrow_l_{r_id}')
+                    model.Add(w <= int(5.0 * scale)).OnlyEnforceIf(b1)
+                    model.Add(l <= int(5.0 * scale)).OnlyEnforceIf(b2)
+                    model.AddBoolOr([b1, b2])
 
-            x_end = model.NewIntVar(min_dim, plot_w, f'xe_{r_id}')
-            z_end = model.NewIntVar(min_dim, plot_l, f'ze_{r_id}')
+            if "fixed_rect" in room:
+                fx, fz, fw, fl = room["fixed_rect"]
+                model.Add(x == int(fx * scale))
+                model.Add(z == int(fz * scale))
+                model.Add(w == int(fw * scale))
+                model.Add(l == int(fl * scale))
+
+            x_end = model.NewIntVar(0, max(plot_w, 2000), f'xe_{r_id}')
+            z_end = model.NewIntVar(0, max(plot_l, 2000), f'ze_{r_id}')
             model.Add(x_end == x + w)
             model.Add(z_end == z + l)
 
@@ -110,9 +118,10 @@ class CPSolver:
             z_iv = model.NewIntervalVar(z, l, z_end, f'zi_{r_id}')
 
             # Minimum area (HARD)
-            area = model.NewIntVar(0, plot_w * plot_l, f'area_{r_id}')
+            area = model.NewIntVar(0, max(plot_w * plot_l, 1000000), f'area_{r_id}')
             model.AddMultiplicationEquality(area, [w, l])
-            model.Add(area >= int(min_area_ft * scale * scale))
+            if "fixed_rect" not in room:
+                model.Add(area >= int(min_area_ft * scale * scale))
 
             room_vars[r_id] = {
                 'type': r_type,

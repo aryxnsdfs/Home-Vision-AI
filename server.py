@@ -2956,8 +2956,6 @@ def _stream_generate_work(req: "GenerateRequest", emit_fn: Callable) -> None:
                     logger.info("[PIPELINE] Generating Floor 1 (Duplex)...")
                     blocked_zones = []
                     staircase = next((n for n in generated_nodes_0 if n.type == "staircase"), None)
-                    if staircase:
-                        blocked_zones.append(staircase.rect)
                     living_dh = next((n for n in generated_nodes_0 if getattr(n, "is_double_height", False)), None)
                     if living_dh:
                         blocked_zones.append(living_dh.rect)
@@ -2972,6 +2970,16 @@ def _stream_generate_work(req: "GenerateRequest", emit_fn: Callable) -> None:
                                     r["type"] = "bedroom"
 
                     floor_1_rooms = sort_spec_by_generation_order(safe_first_spec)
+                    
+                    if staircase:
+                        # Pin the staircase on Floor 1 to the exact same coordinates as Floor 0
+                        # so the CP solver builds the corridor and rooms seamlessly around it.
+                        f1_stair = next((r for r in floor_1_rooms if "staircase" in r.get("type", "").lower()), None)
+                        if f1_stair is None:
+                            f1_stair = {"type": "staircase", "id": "staircase-f1"}
+                            floor_1_rooms.append(f1_stair)
+                        f1_stair["fixed_rect"] = (staircase.rect.x, staircase.rect.z, staircase.rect.width, staircase.rect.length)
+
                     floor1_bp = None
                     if master_bp:
                         floor1_bp = [b for b in master_bp if b.get("floor_number", 0) == 1]
