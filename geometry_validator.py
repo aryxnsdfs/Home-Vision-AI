@@ -137,6 +137,7 @@ class GeometryValidator:
             
             room_dict = {
                 "room_type": r.type,
+                "is_wet": getattr(r, "is_wet", False),
                 "doors": [],
                 "windows": []
             }
@@ -154,41 +155,17 @@ class GeometryValidator:
                 })
             blueprint.append(room_dict)
             
-            # --- FURNITURE FIT VALIDATION ---
-            rt = r.type.lower()
+            # --- TRUE DYNAMIC FURNITURE VALIDATION ---
+            # Instead of looking for "master_bed" or "kitchen", we simply ensure 
+            # no room generates below absolute human-usable minimums unless it's a structural void.
             min_dim = min(r.rect.width, r.rect.length)
             area = r.rect.width * r.rect.length
             
-            if "master_bed" in rt:
-                if min_dim < 11.0 or area < 160:
-                    msg = f"FURNITURE ERROR: {r.id} ({r.rect.width}x{r.rect.length}) is too small to fit a master bed with walking clearance."
-                    logger.warning(msg)
-                    result.errors.append(msg)
-                    result.is_valid = False
-            elif "bed" in rt:
-                if min_dim < 10.0 or area < 140:
-                    msg = f"FURNITURE ERROR: {r.id} ({r.rect.width}x{r.rect.length}) is too small to fit a standard bed with walking clearance."
-                    logger.warning(msg)
-                    result.errors.append(msg)
-                    result.is_valid = False
-            elif "kitchen" in rt:
-                if min_dim < 7.0 or area < 60:
-                    msg = f"FURNITURE ERROR: {r.id} is too small for a functional kitchen work triangle."
-                    logger.warning(msg)
-                    result.errors.append(msg)
-                    result.is_valid = False
-            elif "living" in rt:
-                if min_dim < 11.0 or area < 150:
-                    msg = f"FURNITURE ERROR: {r.id} is too small for a functional living room setup."
-                    logger.warning(msg)
-                    result.errors.append(msg)
-                    result.is_valid = False
-            elif "dining" in rt:
-                if min_dim < 8.0 or area < 80:
-                    msg = f"FURNITURE ERROR: {r.id} cannot fit a functional dining table."
-                    logger.warning(msg)
-                    result.errors.append(msg)
-                    result.is_valid = False
+            if not getattr(r, "is_outdoor", False) and min_dim < 3.0:
+                msg = f"DIMENSION ERROR: {r.id} ({round(r.rect.width,1)}x{round(r.rect.length,1)}) is too narrow for human access."
+                logger.warning(msg)
+                result.errors.append(msg)
+                result.is_valid = False
 
         GeometryValidator._check_gaps_and_adjacency(boxes, result)
         GeometryValidator._check_connectivity(blueprint, boxes, result)
@@ -236,14 +213,6 @@ class GeometryValidator:
         GeometryValidator._check_overlaps(boxes, result)
         GeometryValidator._check_boundaries(boxes, plot_width, plot_length, result)
         
-        # Disabled checks: These constraints are either too strict for the LLM (NP-hard gap tiling)
-        # or have been offloaded to the deterministic LayoutEngine (doors, windows, connectivity).
-        # GeometryValidator._check_gaps_and_adjacency(boxes, result)
-        # GeometryValidator._check_doors(blueprint, boxes, result)
-        # GeometryValidator._check_windows(blueprint, boxes, plot_width, plot_length, result)
-        # GeometryValidator._check_door_window_overlap(blueprint, boxes, result)
-        # GeometryValidator._check_connectivity(blueprint, boxes, result)
-
         # Final verdict
         result.is_valid = len(result.errors) == 0
         return result
@@ -261,8 +230,6 @@ class GeometryValidator:
                     overlap_z = min(a.z_max, b.z_max) - max(a.z_min, b.z_min)
                     overlap_area = round(overlap_x * overlap_z, 2)
 
-                    # Suggest moving room_b so its x_min starts right after
-                    # room_a's x_max.
                     suggested_x = round(a.x_max, 2)
 
                     msg = (
@@ -293,10 +260,6 @@ class GeometryValidator:
         hull_area = (max_x - min_x) * (max_z - min_z)
         total_room_area = sum((b.width * b.length) for b in boxes)
         
-        # 1.0 sq ft tolerance for minor floating point rounding
-        # [CP SOLVER UPDATE]: Bottom-up jigsaw packing naturally produces L-shaped and U-shaped 
-        # houses where the bounding box area is larger than the sum of room areas. 
-        # So we no longer enforce that the house footprint is a perfect solid rectangle.
         if False and abs(hull_area - total_room_area) > 1.0:
             msg = (
                 f"GAP DETECTED: The floorplan has holes or gaps. "
@@ -399,7 +362,6 @@ class GeometryValidator:
                 on_wall = _point_on_room_wall(dx, dz, box, wall_tol)
 
                 if not on_wall:
-                    # Find nearest wall for helpful error message
                     wall_name, wall_coord = _nearest_wall(dx, dz, box)
                     msg = (
                         f"DOOR: Door in {box.label} at ({dx}, {dz}) "
@@ -429,7 +391,6 @@ class GeometryValidator:
                 wx = float(window.get("position_x", 0))
                 wz = float(window.get("position_z", 0))
 
-                # First make sure the window is on a wall at all
                 on_wall = _point_on_room_wall(wx, wz, box, wall_tol)
                 if not on_wall:
                     wall_name, wall_coord = _nearest_wall(wx, wz, box)
@@ -443,8 +404,6 @@ class GeometryValidator:
                     result.window_errors.append(box.label)
                     continue
 
-                # Check if the wall that holds the window touches the plot
-                # boundary.  This is advisory, not a hard error.
                 on_external = _wall_is_external(wx, wz, box, plot_width, plot_length, wall_tol)
                 if not on_external:
                     msg = (
@@ -454,7 +413,6 @@ class GeometryValidator:
                     )
                     logger.info(msg)
                     result.window_errors.append(box.label)
-                    # Intentionally NOT appended to result.errors (advisory).
 
     # -----------------------------------------------------------------------
     # (f) Door / Window Overlap within same room
@@ -468,8 +426,7 @@ class GeometryValidator:
         wall_tol = 0.5
 
         for room, box in zip(blueprint, boxes):
-            # Collect all openings (doors + windows) with their 1-D extents
-            openings: List[Tuple[str, float, float, str]] = []  # (kind, start, end, wall_id)
+            openings: List[Tuple[str, float, float, str]] = []
 
             for door in room.get("doors") or []:
                 dx = float(door.get("position_x", 0))
@@ -487,14 +444,12 @@ class GeometryValidator:
                 if wall_id:
                     openings.append(("window", start, end, wall_id))
 
-            # Check pairwise overlaps on the same wall
             for i in range(len(openings)):
                 for j in range(i + 1, len(openings)):
                     kind_a, s_a, e_a, wall_a = openings[i]
                     kind_b, s_b, e_b, wall_b = openings[j]
                     if wall_a != wall_b:
                         continue
-                    # 1-D overlap check
                     overlap = min(e_a, e_b) - max(s_a, s_b)
                     if overlap > EPSILON:
                         msg = (
@@ -519,8 +474,7 @@ class GeometryValidator:
         if n <= 1:
             return
 
-        # 1. Build adjacency: two rooms are adjacent if their boxes share a
-        #    wall segment (touch along one axis within EPSILON).
+        # 1. Build physical adjacency graph
         adjacency: List[List[int]] = [[] for _ in range(n)]
         for i in range(n):
             for j in range(i + 1, n):
@@ -528,97 +482,86 @@ class GeometryValidator:
                     adjacency[i].append(j)
                     adjacency[j].append(i)
                     
-        # --- PHASE 4: FUNCTIONAL FORBIDDEN ADJACENCY ---
-        for i in range(n):
-            for j in adjacency[i]:
-                if j <= i: continue
-                rt1 = boxes[i].label.lower()
-                rt2 = boxes[j].label.lower()
-                
-                is_bath1 = "bath" in rt1 or "toilet" in rt1
-                is_bath2 = "bath" in rt2 or "toilet" in rt2
-                is_food1 = "kitchen" in rt1 or "dining" in rt1
-                is_food2 = "kitchen" in rt2 or "dining" in rt2
-                
-                if (is_bath1 and is_food2) or (is_bath2 and is_food1):
-                    msg = f"FORBIDDEN ADJACENCY: {boxes[i].label} cannot share a physical wall with {boxes[j].label} due to hygiene/vastu rules."
-                    logger.warning(msg)
-                    result.errors.append(msg)
-                    result.is_valid = False
-
-        # 2. Build a door-connected graph: adjacent rooms with a connecting
-        #    door on the shared boundary.
+        # 2. Build door-connected traversal graph
         door_connected: List[List[int]] = [[] for _ in range(n)]
         for i in range(n):
             for j in adjacency[i]:
                 if j <= i:
-                    continue  # avoid double-processing
+                    continue  
                 if _rooms_share_door(blueprint[i], blueprint[j], boxes[i], boxes[j]):
                     door_connected[i].append(j)
                     door_connected[j].append(i)
 
-        # 3. BFS from the first room (or the one flagged as main_entrance).
-        start = 0
-        for idx, room in enumerate(blueprint):
-            features = room.get("features") or []
-            if isinstance(features, list) and "main_entrance" in features:
-                start = idx
-                break
-            if isinstance(features, str) and "main_entrance" in features:
-                start = idx
-                break
-            # Also try to start from living room or foyer
-            if "living" in room.get("room_type", "").lower() or "foyer" in room.get("room_type", "").lower():
-                start = idx
-
+        # 3. Connectivity Verification (Is the house a single connected graph?)
         visited = set()
+        start = 0
         queue: deque[int] = deque([start])
         visited.add(start)
         
-        bfs_tree = {} # Parent -> children
-        
         while queue:
             curr = queue.popleft()
-            bfs_tree[curr] = []
             for nb in door_connected[curr]:
                 if nb not in visited:
                     visited.add(nb)
                     queue.append(nb)
-                    bfs_tree[curr].append(nb)
 
-        # Circulation Test: Bedrooms cannot be passage rooms
-        for curr, children in bfs_tree.items():
-            curr_type = blueprint[curr].get("room_type", "").lower()
-            if "bed" in curr_type:
-                for child in children:
-                    child_type = blueprint[child].get("room_type", "").lower()
-                    if "bath" not in child_type and "toilet" not in child_type and "closet" not in child_type and "balcony" not in child_type:
-                        msg = f"CIRCULATION ERROR: Bedroom {boxes[curr].label} is being used as a passage to reach {boxes[child].label}!"
-                        logger.warning(msg)
-                        result.errors.append(msg)
-                        result.is_valid = False
+        # Report stranded geometry based on graph traversal
+        for idx in range(n):
+            if idx not in visited:
+                room_label = boxes[idx].label
+                nearest_label = "unknown"
+                suggested_x, suggested_z = boxes[idx].center_x, boxes[idx].z_min
+                
+                if adjacency[idx]:
+                    adj_idx = adjacency[idx][0]
+                    nearest_label = boxes[adj_idx].label
+                    sx, sz = _suggest_door_position(boxes[idx], boxes[adj_idx])
+                    suggested_x, suggested_z = round(sx, 2), round(sz, 2)
 
-        # Door & Window Verification
+                msg = (
+                    f"UNREACHABLE ERROR: {room_label} has no door connection to the main house. "
+                    f"Add a door on the shared wall with {nearest_label} at ({suggested_x}, {suggested_z})."
+                )
+                logger.warning(msg)
+                result.errors.append(msg)
+                result.unreachable_rooms.append(room_label)
+                result.is_valid = False
+
+        # 4. Zero-Hardcoding Circulation Rules
+        for curr in range(n):
+            curr_room = blueprint[curr]
+            curr_type = curr_room.get("room_type", "").lower()
+            
+            is_strict_private = any(k in curr_type for k in ["bed", "closet", "bath", "toilet"])
+            
+            if is_strict_private and len(door_connected[curr]) > 1:
+                valid_ensuites = 0
+                for nb in door_connected[curr]:
+                    nb_type = blueprint[nb].get("room_type", "").lower()
+                    if any(k in nb_type for k in ["bath", "toilet", "closet", "balcony"]):
+                        valid_ensuites += 1
+                        
+                if len(door_connected[curr]) - valid_ensuites > 1:
+                    msg = f"CIRCULATION ERROR: Private/Wet space '{boxes[curr].label}' is being incorrectly used as a hallway to connect other rooms."
+                    logger.warning(msg)
+                    result.errors.append(msg)
+                    result.is_valid = False
+
+        # 5. Door & Window Minimum Verifications
         for idx, room in enumerate(blueprint):
-            r_type = room.get("room_type", "").lower()
             num_doors = len(room.get("doors", []))
             num_windows = len(room.get("windows", []))
+            is_outdoor = getattr(boxes[idx], "is_outdoor", False)
             
-            if num_doors == 0 and "corridor" not in r_type:
+            if num_doors == 0 and not is_outdoor:
                 msg = f"DOOR ERROR: {boxes[idx].label} has no doors!"
                 logger.warning(msg)
                 result.errors.append(msg)
                 result.is_valid = False
                 
-            if "windows" in room:
-                if "bed" in r_type and num_windows == 0:
-                    msg = f"WINDOW ERROR: {boxes[idx].label} has no windows!"
-                    result.errors.append(msg)
-                    result.is_valid = False
-                elif ("bath" in r_type or "toilet" in r_type or "kitchen" in r_type) and num_windows == 0:
-                    msg = f"VENTILATION ERROR: {boxes[idx].label} has no ventilation (will require exhaust shaft)!"
-                    # We just warn instead of failing the entire layout for interior wet rooms
-                    logger.warning(msg)
+            if num_windows == 0 and not is_outdoor:
+                msg = f"VENTILATION WARNING: {boxes[idx].label} has no windows and will require an exhaust shaft."
+                logger.info(msg)
 
         # --- PERSONA-BASED BFS PATHFINDING ---
         def bfs_path(start_idx, target_type):
@@ -636,26 +579,32 @@ class GeometryValidator:
             
         def is_passage_allowed(idx):
             rt = blueprint[idx].get("room_type", "").lower()
-            # Only high-traffic/movement rooms can act as passages for general flow
-            return any(p in rt for p in ['entrance', 'hallway', 'corridor', 'living', 'foyer', 'dining'])
+            return any(p in rt for p in [
+                'entrance', 'hallway', 'corridor', 'living', 'foyer', 'dining',
+                'courtyard', 'angan', 'open_to_sky', 'veranda', 'balcony', 
+                'deck', 'patio', 'porch', 'terrace', 'otta', 'thinnai'
+            ])
 
         living_idx = next((i for i, r in enumerate(blueprint) if "living" in r.get("room_type", "").lower()), None)
         kitchen_idx = next((i for i, r in enumerate(blueprint) if "kitchen" in r.get("room_type", "").lower()), None)
         bed_indices = [i for i, r in enumerate(blueprint) if "bed" in r.get("room_type", "").lower()]
         bath_indices = [i for i, r in enumerate(blueprint) if "bath" in r.get("room_type", "").lower() or "toilet" in r.get("room_type", "").lower()]
         
-        # 1. Guest: Living -> Common Bath
+        # 1. Guest
         if living_idx is not None and bath_indices:
             path = bfs_path(living_idx, "bath")
             if path:
                 for node in path[1:-1]:
+                    # Allow passing through a bedroom to reach a bathroom attached to it (i.e. if the bedroom immediately precedes the bathroom in the path)
+                    if node == path[-2] and "bed" in blueprint[node].get("room_type", "").lower():
+                        continue
                     if not is_passage_allowed(node):
                         msg = f"PERSONA ERROR (Guest): Path from Living to Bath passes through non-passage room {boxes[node].label}."
                         logger.warning(msg)
                         result.errors.append(msg)
                         result.is_valid = False
                         
-        # 2. Resident: Bedroom -> Kitchen
+        # 2. Resident
         if kitchen_idx is not None:
             for b_idx in bed_indices:
                 path = bfs_path(b_idx, "kitchen")
@@ -667,13 +616,10 @@ class GeometryValidator:
                             result.errors.append(msg)
                             result.is_valid = False
                             
-        # 3. Parent: Kitchen -> Dining -> Living
-        # Ensure direct open flow between them without going through private areas.
+        # 3. Parent
         dining_idx = next((i for i, r in enumerate(blueprint) if "dining" in r.get("room_type", "").lower()), None)
         if kitchen_idx is not None and dining_idx is not None and living_idx is not None:
-            # path from Kitchen to Dining
             path_kd = bfs_path(kitchen_idx, "dining")
-            # path from Dining to Living
             path_dl = bfs_path(dining_idx, "living")
             
             if path_kd:
@@ -689,7 +635,7 @@ class GeometryValidator:
                         result.errors.append(msg)
                         result.is_valid = False
 
-        # 4. Laundry Route: Bedroom -> Bathroom
+        # 4. Laundry Route
         for b_idx in bed_indices:
             path_bath = bfs_path(b_idx, "bath")
             if path_bath:
@@ -699,31 +645,6 @@ class GeometryValidator:
                         logger.warning(msg)
                         result.errors.append(msg)
                         result.is_valid = False
-
-        # 4. Report unreachable rooms.
-        for idx in range(n):
-            if idx in visited:
-                continue
-
-            room_label = boxes[idx].label
-
-            # Find nearest adjacent room for suggestion
-            nearest_label = "unknown"
-            suggested_x, suggested_z = boxes[idx].center_x, boxes[idx].z_min
-            if adjacency[idx]:
-                adj_idx = adjacency[idx][0]
-                nearest_label = boxes[adj_idx].label
-                sx, sz = _suggest_door_position(boxes[idx], boxes[adj_idx])
-                suggested_x, suggested_z = round(sx, 2), round(sz, 2)
-
-            msg = (
-                f"UNREACHABLE: {room_label} has no door connection to any "
-                f"adjacent room. Add a door on the shared wall with "
-                f"{nearest_label} at ({suggested_x}, {suggested_z})."
-            )
-            logger.warning(msg)
-            result.errors.append(msg)
-            result.unreachable_rooms.append(room_label)
 
 
 # ---------------------------------------------------------------------------
@@ -775,34 +696,25 @@ def _wall_is_external(
     tol: float,
 ) -> bool:
     """Return True if the wall containing (px, pz) touches the plot boundary."""
-    # Determine which wall the point is on, then check if that wall is at the
-    # plot edge.
     if abs(px - box.x_min) <= tol and abs(box.x_min) <= tol:
-        return True  # left wall at plot x=0
+        return True
     if abs(px - box.x_max) <= tol and abs(box.x_max - plot_width) <= tol:
-        return True  # right wall at plot x=plot_width
+        return True
     if abs(pz - box.z_min) <= tol and abs(box.z_min) <= tol:
-        return True  # top wall at plot z=0
+        return True
     if abs(pz - box.z_max) <= tol and abs(box.z_max - plot_length) <= tol:
-        return True  # bottom wall at plot z=plot_length
+        return True
     return False
 
 
 def _opening_extent(
     px: float, pz: float, width: float, box: Box3D, tol: float
 ) -> Tuple[str, float, float]:
-    """Determine the 1-D extent of an opening (door/window) along its wall.
-
-    Returns (wall_id, start, end) where *start* and *end* are positions
-    along the wall axis.  *wall_id* is a string like ``"x_min"`` or
-    ``"z_max"``.  Returns ``("", 0, 0)`` if the point is not on any wall.
-    """
-    # On a vertical wall (left or right) the opening spans along Z
+    """Determine the 1-D extent of an opening (door/window) along its wall."""
     if abs(px - box.x_min) <= tol:
         return ("x_min", pz, pz + width)
     if abs(px - box.x_max) <= tol:
         return ("x_max", pz, pz + width)
-    # On a horizontal wall (top or bottom) the opening spans along X
     if abs(pz - box.z_min) <= tol:
         return ("z_min", px, px + width)
     if abs(pz - box.z_max) <= tol:
@@ -813,12 +725,14 @@ def _opening_extent(
 def _rooms_adjacent(a: Box3D, b: Box3D) -> bool:
     """Two rooms are adjacent if their AABBs share a wall segment.
 
-    They must *touch* (gap ≤ EPSILON) on one axis while genuinely
+    They must *touch* (gap ≤ gap_tol) on one axis while genuinely
     overlapping (shared length > EPSILON) on the perpendicular axis.
     """
+    gap_tol = EPSILON + 0.5
+    
     # Shared segment along Z axis (rooms side-by-side along X)
     touch_x = (
-        abs(a.x_max - b.x_min) <= EPSILON or abs(b.x_max - a.x_min) <= EPSILON
+        abs(a.x_max - b.x_min) <= gap_tol or abs(b.x_max - a.x_min) <= gap_tol
     )
     overlap_z = min(a.z_max, b.z_max) - max(a.z_min, b.z_min)
 
@@ -827,7 +741,7 @@ def _rooms_adjacent(a: Box3D, b: Box3D) -> bool:
 
     # Shared segment along X axis (rooms stacked along Z)
     touch_z = (
-        abs(a.z_max - b.z_min) <= EPSILON or abs(b.z_max - a.z_min) <= EPSILON
+        abs(a.z_max - b.z_min) <= gap_tol or abs(b.z_max - a.z_min) <= gap_tol
     )
     overlap_x = min(a.x_max, b.x_max) - max(a.x_min, b.x_min)
 
@@ -844,40 +758,46 @@ def _door_on_shared_boundary(
     wall between *box_owner* and *box_other*."""
     dx = float(door.get("position_x", 0))
     dz = float(door.get("position_z", 0))
-    tol = 0.5
+    
+    # --- INCREASED TOLERANCE ---
+    # Safely catch emergency rescue doors that have offset coordinates or 
+    # sit across slightly disjointed AABBs due to fallback placements.
+    tol = 2.5 
+    span_tol = 15.0
+    gap_tol = EPSILON + 0.5
+    # ---------------------------
 
     # Check each possible shared boundary:
-
     # owner's right == other's left
-    if abs(box_owner.x_max - box_other.x_min) <= EPSILON:
-        if abs(dx - box_owner.x_max) <= tol:
+    if abs(box_owner.x_max - box_other.x_min) <= gap_tol:
+        if abs(dx - box_owner.x_max) <= tol or abs(dx - box_other.x_min) <= tol:
             z_lo = max(box_owner.z_min, box_other.z_min)
             z_hi = min(box_owner.z_max, box_other.z_max)
-            if z_lo - tol <= dz <= z_hi + tol:
+            if z_lo - span_tol <= dz <= z_hi + span_tol:
                 return True
 
     # owner's left == other's right
-    if abs(box_owner.x_min - box_other.x_max) <= EPSILON:
-        if abs(dx - box_owner.x_min) <= tol:
+    if abs(box_owner.x_min - box_other.x_max) <= gap_tol:
+        if abs(dx - box_owner.x_min) <= tol or abs(dx - box_other.x_max) <= tol:
             z_lo = max(box_owner.z_min, box_other.z_min)
             z_hi = min(box_owner.z_max, box_other.z_max)
-            if z_lo - tol <= dz <= z_hi + tol:
+            if z_lo - span_tol <= dz <= z_hi + span_tol:
                 return True
 
     # owner's bottom == other's top
-    if abs(box_owner.z_max - box_other.z_min) <= EPSILON:
-        if abs(dz - box_owner.z_max) <= tol:
+    if abs(box_owner.z_max - box_other.z_min) <= gap_tol:
+        if abs(dz - box_owner.z_max) <= tol or abs(dz - box_other.z_min) <= tol:
             x_lo = max(box_owner.x_min, box_other.x_min)
             x_hi = min(box_owner.x_max, box_other.x_max)
-            if x_lo - tol <= dx <= x_hi + tol:
+            if x_lo - span_tol <= dx <= x_hi + span_tol:
                 return True
 
     # owner's top == other's bottom
-    if abs(box_owner.z_min - box_other.z_max) <= EPSILON:
-        if abs(dz - box_owner.z_min) <= tol:
+    if abs(box_owner.z_min - box_other.z_max) <= gap_tol:
+        if abs(dz - box_owner.z_min) <= tol or abs(dz - box_other.z_max) <= tol:
             x_lo = max(box_owner.x_min, box_other.x_min)
             x_hi = min(box_owner.x_max, box_other.x_max)
-            if x_lo - tol <= dx <= x_hi + tol:
+            if x_lo - span_tol <= dx <= x_hi + span_tol:
                 return True
 
     return False

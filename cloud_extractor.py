@@ -98,12 +98,21 @@ class BlueprintRoom(BaseModel):
     features: List[str] = Field(default_factory=list)
 
 class HouseDesignRequest(BaseModel):
-    intent: str = Field(description="One of: CREATE, ADD, REMOVE, RESIZE, COLOR, MODIFY_MEP, MOVE")
+    intent: str = Field(description="The core action or intent inferred from the user prompt...")
     bhk: int = 0
     floors: int = 1
     style: str = ""
     materials: List[str] = Field(default_factory=list)
     target_rooms: List[str] = Field(default_factory=list)
+    
+    # --- ZERO HARDCODING: FULL AI ROOM CLASSIFICATION ---
+    outdoor_rooms: List[str] = Field(default_factory=list, description="Rooms open to the sky (e.g., courtyard, angan).")
+    wet_rooms: List[str] = Field(default_factory=list, description="Rooms requiring plumbing (e.g., bath, toilet, kitchen).")
+    circulation_rooms: List[str] = Field(default_factory=list, description="Rooms used for movement (e.g., corridor, hallway, foyer).")
+    private_rooms: List[str] = Field(default_factory=list, description="Private personal spaces (e.g., bedrooms).")
+    public_rooms: List[str] = Field(default_factory=list, description="Shared communal spaces (e.g., living room, dining room, pooja room).")
+    # ----------------------------------------------------
+    
     global_color: str = ""
     room_colors: List[RoomColor] = Field(default_factory=list)
     color_hex: str = ""
@@ -113,34 +122,9 @@ class HouseDesignRequest(BaseModel):
     vastu_specifics: List[VastuSpecific] = Field(default_factory=list)
     negative_constraints: List[str] = Field(default_factory=list)
     mep_additions: List[MepAddition] = Field(default_factory=list)
-    needs_pooja_room: bool = False
-    utility_area: bool = False
-    powder_room: bool = False
-    elderly_suite: bool = False
-    foyer: bool = False
-    open_kitchen: bool = False
-    master_blueprint: List[BlueprintRoom] = Field(default_factory=list, description="Array of rooms generated via calculation")
     primary_entry_room_id: str = Field(default="", description="The room_type of the main entrance room")
     front_orientation: str = Field(default="north", description="The plot's street-facing direction")
-    brahmasthan: bool = False
-    angan: bool = False
-    bhandar_ghar: bool = False
-    maliya: bool = False
-    sump_tank: bool = False
-    overhead_tank: bool = False
-    diwan: bool = False
-    otta: bool = False
-    portico: bool = False
-    flat_terrace: bool = False
-    parapet: bool = False
-    mumty: bool = False
-    double_height: bool = False
-    jali: bool = False
-    chhajja: bool = False
-    jharokha: bool = False
-    stack_vent: bool = False
     facing: str = Field(default="", description="North, South, East, West or empty")
-
 
 class ProgramRoom(BaseModel):
     room_type: str = Field(description="e.g. master_bedroom, living_room, kitchen, corridor, bathroom")
@@ -538,97 +522,123 @@ def extract_keywords_groq(user_prompt: str, vocabulary: dict) -> Dict[str, Any]:
 def reason_modifications_deepseek(user_prompt: str, current_floorplan: dict) -> dict:
     return QueryRouter.route(user_prompt, {}, current_floorplan)
 
-def auto_wire_topology(room_types: list) -> list:
-    """Takes a flat list of room strings and returns a list of dictionaries with proper architectural connections."""
+def auto_wire_topology(room_types: list, ai_categories: dict = None) -> list:
+    """Takes a list of room strings and wires connections using AI-provided categories."""
+    if not room_types:
+        return []
+        
+    ai_categories = ai_categories or {}
+    
+    # Normalize AI sets for fast lookup
+    outdoor_set = {r.replace(" ", "_").lower() for r in ai_categories.get("outdoor_rooms", [])}
+    wet_set = {r.replace(" ", "_").lower() for r in ai_categories.get("wet_rooms", [])}
+    circ_set = {r.replace(" ", "_").lower() for r in ai_categories.get("circulation_rooms", [])}
+    private_set = {r.replace(" ", "_").lower() for r in ai_categories.get("private_rooms", [])}
+    public_set = {r.replace(" ", "_").lower() for r in ai_categories.get("public_rooms", [])}
+
     room_specs = [{"type": r, "connections": []} for r in room_types]
     
-    def get_indices(rtype): return [i for i, rs in enumerate(room_specs) if rs['type'] == rtype]
+    circulation_idx, outdoor_idx, wet_idx, private_idx, public_idx = [], [], [], [], []
     
-    living_idx = get_indices("living_room")
-    dining_idx = get_indices("dining_room")
-    kitchen_idx = get_indices("kitchen")
-    master_idx = get_indices("master_bedroom")
-    bed_idx = get_indices("bedroom")
-    bath_idx = get_indices("bathroom")
-    toilet_idx = get_indices("toilet")
-    utility_idx = get_indices("utility")
-    corridor_idx = get_indices("corridor")
-    hall_idx = get_indices("hallway")
-    
-    all_baths = bath_idx + toilet_idx
-    
-    num_beds = len(bed_idx) + len(master_idx)
-    
-    # Adaptive Circulation Generation
-    # Medium/Large house (2+ beds) gets a private Corridor
-    if not corridor_idx and num_beds >= 2:
-        room_specs.append({"type": "corridor", "connections": []})
-        corridor_idx = [len(room_specs) - 1]
+    # Phase 1: Pure AI Classification & Role Assignment
+    for i, r in enumerate(room_specs):
+        rt = r['type'].lower()
         
-    # Very large house (4+ beds) gets a public Hallway
-    if not hall_idx and num_beds >= 4:
-        room_specs.append({"type": "hallway", "connections": []})
-        hall_idx = [len(room_specs) - 1]
+        if rt in outdoor_set:
+            outdoor_idx.append(i)
+            r['role'] = {'traffic': 'high', 'can_be_passage': True}
+        elif rt in circ_set:
+            circulation_idx.append(i)
+            r['role'] = {'traffic': 'high', 'can_be_passage': True}
+        elif rt in private_set:
+            private_idx.append(i)
+            r['role'] = {'traffic': 'low', 'can_be_passage': False}
+        elif rt in wet_set:
+            wet_idx.append(i)
+            r['role'] = {'traffic': 'low', 'can_be_passage': False}
+        else:
+            # Default to public zone if it isn't private, wet, or outdoor
+            public_idx.append(i)
+            r['role'] = {'traffic': 'medium', 'can_be_passage': True}
 
-    def add_conn(src_idx, target_type, intent, weight):
+    def add_conn(src_idx, target_idx, intent, weight):
         room_specs[src_idx]['connections'].append({
-            "target_room": target_type,
+            "target_room": room_specs[target_idx]['type'],
             "intent": intent,
             "weight": weight
         })
 
-    # Core Public Zone Flow
-    if living_idx and dining_idx: add_conn(living_idx[0], "dining_room", "open_flow", 10)
-    if dining_idx and kitchen_idx: add_conn(dining_idx[0], "kitchen", "open_flow", 10)
-    elif living_idx and kitchen_idx: add_conn(living_idx[0], "kitchen", "open_flow", 10)
-        
-    if kitchen_idx and utility_idx: add_conn(kitchen_idx[0], "utility", "standard", 7)
-        
-    # Wet Zone Attachments (Master gets first bath)
-    if master_idx and all_baths:
-        add_conn(master_idx[0], room_specs[all_baths[0]]['type'], "standard", 10)
-        all_baths.pop(0)
-        
-    # Private Zone Flow
-    if corridor_idx:
-        corr_i = corridor_idx[0]
-        corr_type = room_specs[corr_i]['type']
-        
-        if master_idx: add_conn(master_idx[0], corr_type, "standard", 10)
-        for bi in bed_idx: add_conn(bi, corr_type, "standard", 10)
-        for bi in all_baths: add_conn(bi, corr_type, "standard", 8)
-            
-        if hall_idx: add_conn(corr_i, room_specs[hall_idx[0]]['type'], "open_flow", 10)
-        elif living_idx: add_conn(corr_i, "living_room", "open_flow", 10)
-        elif dining_idx: add_conn(corr_i, "dining_room", "open_flow", 10)
-            
-    # Hall logic
-    if hall_idx:
-        hall_i = hall_idx[0]
-        if living_idx: add_conn(hall_i, "living_room", "open_flow", 10)
-        if dining_idx: add_conn(hall_i, "dining_room", "open_flow", 8)
-        
-    # Small house logic (no corridor)
-    if not corridor_idx:
-        target_idx = hall_idx[0] if hall_idx else (living_idx[0] if living_idx else (dining_idx[0] if dining_idx else None))
-        if target_idx is not None:
-            target_type = room_specs[target_idx]['type']
-            if master_idx: add_conn(master_idx[0], target_type, "standard", 10)
-            for bi in bed_idx: add_conn(bi, target_type, "standard", 10)
-            for bi in all_baths: add_conn(bi, target_type, "standard", 8)
+    # Phase 2: Dynamic Topology Wiring based on AI Bins
+    # 1. Chain Public Zones together (Open Concept Flow)
+    for i in range(len(public_idx) - 1):
+        add_conn(public_idx[i], public_idx[i+1], "open_flow", 10)
 
-    # Common bath living connection (Medium Priority)
-    if all_baths and living_idx:
-        add_conn(living_idx[0], room_specs[all_baths[-1]]['type'], "standard", 4)
-        
-    # Phase 2: Assign Room Roles
-    for r in room_specs:
-        rt = r['type'].lower()
-        if rt in ['entrance', 'hallway', 'corridor', 'living_room', 'foyer']:
-            r['role'] = {'traffic': 'high', 'can_be_passage': True}
-        elif rt in ['dining_room', 'kitchen', 'utility']:
-            r['role'] = {'traffic': 'medium', 'can_be_passage': False}
-        else:
-            r['role'] = {'traffic': 'low', 'can_be_passage': False}
-                
+    # 2. Determine Primary Hub for Circulation
+    hub_idx = circulation_idx[0] if circulation_idx else (public_idx[0] if public_idx else 0)
+
+    # 3. Connect Outdoor Spaces to the Hub
+    for oi in outdoor_idx:
+        if hub_idx != oi:
+            add_conn(hub_idx, oi, "open_flow", 10)
+
+    # 4. Connect Private Zones to the Hub
+    for pi in private_idx:
+        if hub_idx != pi:
+            add_conn(pi, hub_idx, "standard", 10)
+
+    # 5. Distribute Wet Zones (Bathrooms)
+    available_baths = list(wet_idx)
+    
+    # En-suite priority: Give a bath to each private room first
+    for pi in private_idx:
+        if available_baths:
+            bath_i = available_baths.pop(0)
+            add_conn(pi, bath_i, "standard", 10)
+
+    # Remaining wet zones act as common baths connected to the hub
+    for bath_i in available_baths:
+        if hub_idx != bath_i:
+            add_conn(hub_idx, bath_i, "standard", 6)
+
+    return room_specs
+    def add_conn(src_idx, target_idx, intent, weight):
+        room_specs[src_idx]['connections'].append({
+            "target_room": room_specs[target_idx]['type'],
+            "intent": intent,
+            "weight": weight
+        })
+
+    # Phase 2: Dynamic Topology Wiring
+
+    # 1. Chain Public Zones together (Open Concept Flow)
+    for i in range(len(public_idx) - 1):
+        add_conn(public_idx[i], public_idx[i+1], "open_flow", 10)
+
+    # 2. Determine Primary Hub for Circulation
+    hub_idx = circulation_idx[0] if circulation_idx else (public_idx[0] if public_idx else 0)
+
+    # 3. Connect Outdoor Spaces to the Hub
+    for oi in outdoor_idx:
+        if hub_idx != oi:
+            add_conn(hub_idx, oi, "open_flow", 10)
+
+    # 4. Connect Private Zones to the Hub
+    for pi in private_idx:
+        if hub_idx != pi:
+            add_conn(pi, hub_idx, "standard", 10)
+
+    # 5. Distribute Wet Zones (Bathrooms)
+    available_baths = list(wet_idx)
+    
+    # En-suite priority: Give a bath to each private room first
+    for pi in private_idx:
+        if available_baths:
+            bath_i = available_baths.pop(0)
+            add_conn(pi, bath_i, "standard", 10)
+
+    # Remaining wet zones act as common baths connected to the hub
+    for bath_i in available_baths:
+        if hub_idx != bath_i:
+            add_conn(hub_idx, bath_i, "standard", 6)
+
     return room_specs

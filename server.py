@@ -123,31 +123,65 @@ def _apply_selected_palette(nodes: List[RoomNode], colors: Optional[Dict[str, An
         }.items() if v},
     }
 
-
 def smart_layout_validation(
     rooms_spec: list,
     plot_width: float,
     plot_length: float,
 ) -> tuple:
     """
-    Validate whether the requested rooms fit livably in the given plot.
-    If the plot is too small, automatically expand the plot mathematically 
-    to maintain a spacious layout instead of deleting rooms.
-    Returns (adjusted_rooms_spec, warnings_list, new_plot_width, new_plot_length).
+    Validate and scale room specs dynamically based on available plot sizes.
     """
     warnings: list = []
-    buildable_area = plot_width * plot_length * 0.85
+    
+    # 1. Procedural Area Memory Registration (FIXED SCHEMA)
+    for r in rooms_spec:
+        rtype = r.get("type", "room")
+        if rtype not in ROOM_MINIMUMS:
+            ai_w = float(r.get("width", 10.0))  # Baseline structural defaults
+            ai_l = float(r.get("length", 10.0))
+            # FIX: Include min_dim so the final layout validator doesn't crash!
+            ROOM_MINIMUMS[rtype] = {
+                "area": ai_w * ai_l,
+                "min_dim": min(ai_w, ai_l)
+            }
 
+    buildable_area = plot_width * plot_length * 0.85
     room_types = [r["type"] for r in rooms_spec]
     min_needed = compute_minimum_plot_area(room_types)
 
     if buildable_area <= 0:
-        buildable_area = 1.0  # Prevent division by zero
+        buildable_area = 1.0
+        
+    # 2. Dynamic Proportional Plot Scaling
+    if buildable_area > min_needed * 1.5:
+        scale_factor = min(2.5, (buildable_area / min_needed) ** 0.45)
+        for room in rooms_spec:
+            if "width" in room:
+                room["width"] = round(room["width"] * scale_factor, 1)
+            if "length" in room:
+                room["length"] = round(room["length"] * scale_factor, 1)
+            
+            rtype = room["type"]
+            # Guard checking to prevent unexpected data structures from crashing calculations
+            if isinstance(ROOM_MINIMUMS[rtype], dict):
+                current_area = ROOM_MINIMUMS[rtype]["area"]
+                current_min = ROOM_MINIMUMS[rtype].get("min_dim", min(float(room.get("width", 5.0)), float(room.get("length", 5.0))))
+            else:
+                current_area = float(ROOM_MINIMUMS[rtype])
+                current_min = min(float(room.get("width", 5.0)), float(room.get("length", 5.0)))
+                
+            ROOM_MINIMUMS[rtype] = {
+                "area": current_area * (scale_factor ** 2),
+                "min_dim": current_min * scale_factor
+            }
+        
+        warnings.append(f"Scaled room dimensions dynamically by {scale_factor:.2f}x to optimally utilize the {plot_width}'x{plot_length}' plot boundary.")
+        return rooms_spec, warnings, float(plot_width), float(plot_length)
         
     if buildable_area >= min_needed:
         return rooms_spec, warnings, float(plot_width), float(plot_length)
 
-    # Plot is too small. Expand the plot size instead of shrinking the rooms!
+    # Plot scale fallback loop if boundaries are too compact
     multiplier = (min_needed / buildable_area) ** 0.5
     new_plot_width = round(plot_width * multiplier + 1)
     new_plot_length = round(plot_length * multiplier + 1)
@@ -158,8 +192,6 @@ def smart_layout_validation(
     )
     
     return rooms_spec, warnings, float(new_plot_width), float(new_plot_length)
-
-
 def get_base_rooms_for_bhk(bhk: int) -> list:
     """Return the standard set of rooms for a given BHK count.
 
@@ -2515,8 +2547,28 @@ def _stream_generate_work(req: "GenerateRequest", emit_fn: Callable) -> None:
                         seen_types.add(r_clean)
                     valid_rooms.append(r)
             if valid_rooms:
+                for key, value in slm_result.items():
+                    if isinstance(value, bool) and value is True:
+                        clean_room_type = key.replace("needs_", "").replace("_area", "")
+                        if clean_room_type not in valid_rooms:
+                            valid_rooms.append(clean_room_type)
+                
                 from cloud_extractor import auto_wire_topology
-                layout_params["rooms"] = auto_wire_topology([r.replace(" ", "_") for r in valid_rooms])
+                layout_params["rooms"] = auto_wire_topology(
+    [r.replace(" ", "_") for r in valid_rooms], 
+    ai_categories=slm_result
+)
+
+                # --- UNIFIED AI FLAG INJECTIONS ---
+                ai_outdoor_rooms = [str(r).lower().replace(" ", "_") for r in slm_result.get("outdoor_rooms", [])]
+                ai_wet_rooms = [str(r).lower().replace(" ", "_") for r in slm_result.get("wet_rooms", [])]
+                
+                for room_dict in layout_params["rooms"]:
+                    if room_dict["type"] in ai_outdoor_rooms:
+                        room_dict["is_outdoor"] = True
+                    if room_dict["type"] in ai_wet_rooms:
+                        room_dict["is_wet"] = True
+                # ----------------------------------------------------------------
 
             for k in ("bhk",):
                 pass  # already handled above
@@ -2672,6 +2724,30 @@ def _stream_generate_work(req: "GenerateRequest", emit_fn: Callable) -> None:
                         response["understood"].append(f"Painted {painted_count} room(s) {target_color}")
                 
                 response["layout_data"], _ = _preserve_modified_project_rooms(current_rooms)
+                
+                # --- PREVENT SERIALIZER WIPE IN STREAM EDIT PATH ---
+                layout_data = response["layout_data"]
+                rooms_to_update = []
+                if isinstance(layout_data, list):
+                    rooms_to_update = layout_data
+                elif isinstance(layout_data, dict):
+                    rooms_to_update.extend(layout_data.get("rooms", []))
+                    for f in layout_data.get("floors", []):
+                        rooms_to_update.extend(f.get("rooms", []))
+                for serialized_room in rooms_to_update:
+                    if not isinstance(serialized_room, dict): continue
+                    for active_room in current_rooms:
+                        if serialized_room.get("id") == active_room.get("id") or serialized_room.get("type") == active_room.get("type"):
+                            if "wallColor" in active_room:
+                                serialized_room["wallColor"] = active_room["wallColor"]
+                                serialized_room["wallColors"] = active_room.get("wallColors")
+                            if "floorColor" in active_room:
+                                serialized_room["floorColor"] = active_room["floorColor"]
+                            if "furnitureColor" in active_room:
+                                serialized_room["furnitureColor"] = active_room["furnitureColor"]
+                            break
+                # ----------------------------------------------------
+                
                 if not any("Painted" in u for u in response["understood"]):
                     response["understood"].append("Applied style changes without modifying layout structure")
                 emit_fn({"done": True, "result": response})
@@ -3023,7 +3099,6 @@ def _stream_generate_work(req: "GenerateRequest", emit_fn: Callable) -> None:
     except Exception as exc:
         logger.error("Streaming generate error: %s\n%s", exc, traceback.format_exc())
         emit_fn({"error": str(exc)})
-
 def _stream_template_work(req: "TemplateRequest", emit_fn: Callable) -> None:
     """Run template generation in a background thread, pushing SSE dicts to pq."""
     def emit(stage: int, label: str, substage: str = ""):

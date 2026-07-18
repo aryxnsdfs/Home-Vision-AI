@@ -885,6 +885,11 @@ class LayoutEngine:
         if layout_rules is None:
             layout_rules = []
             
+        # --- ZERO HARDCODING: COLLECT AI OUTDOOR DESIGNATIONS ---
+        # Collect AI-designated outdoor room types directly from the processed specification
+        ai_outdoor_types = {r["type"].replace(" ", "_").lower() for r in rooms_spec if isinstance(r, dict) and r.get("is_outdoor")}
+        ai_wet_types = {r["type"].replace(" ", "_").lower() for r in rooms_spec if isinstance(r, dict) and r.get("is_wet")}
+            
         logger.info(f"[PERF] LayoutEngine.generate started for {len(rooms_spec)} rooms. Plot: {self.plot_width}x{self.plot_length}")
         start_time = time.time()
         nodes: List[RoomNode] = []
@@ -1135,11 +1140,20 @@ class LayoutEngine:
             if self.theme.get("furniture"):
                 furniture_color = self.theme["furniture"]
 
+            # --- TRUE AI-DRIVEN SEMANTIC CLASSIFIER (CORE) ---
+            is_open_sky = matched_rt in ai_outdoor_types
+            roof_val = "open" if is_open_sky else "flat"
+            
+            if is_open_sky and floor_color == "#ffffff":
+                floor_color = "#d6d3d1"  # Outdoor pavement fallback tint
+
             nodes.append(RoomNode(
                 id=matched_id, type=matched_rt, name=matched_rt.replace("_", " ").title(),
                 rect=Rect(x, z, w, l), wallThicknessIn=wall_thick, is_wet=is_wet,
-                floorColor=floor_color, wallColor=wall_color, furnitureColor=furniture_color
+                floorColor=floor_color, wallColor=wall_color, furnitureColor=furniture_color,
+                roof_type=roof_val  # Dynamic roof property assignment via AI
             ))
+            # -------------------------------------------------
 
         # 2. Process Parasites (Mutators)
         parasites = [(rid, rt) for rid, rt in ai_requested_rooms if rid not in used_ai_rooms]
@@ -1155,18 +1169,14 @@ class LayoutEngine:
         for rid, rt in parasites:
             anchor_candidates = []
             if "bath" in rt: anchor_candidates = ["bedroom", "master_bedroom", "living"]
-            elif "utility" in rt: anchor_candidates = ["kitchen"]            # utility attaches to kitchen
-            elif "store" in rt: anchor_candidates = ["kitchen", "utility"]   # store near kitchen/utility
-            elif "powder" in rt: anchor_candidates = ["living", "foyer"]     # powder near living/foyer
-            elif "pooja" in rt: anchor_candidates = ["living", "dining", "foyer"]  # pooja near living/dining
+            elif "utility" in rt: anchor_candidates = ["kitchen"]
+            elif "store" in rt: anchor_candidates = ["kitchen", "utility"]
+            elif "powder" in rt: anchor_candidates = ["living", "foyer"]
+            elif "pooja" in rt: anchor_candidates = ["living", "dining", "foyer"]
             elif "courtyard" in rt or "angan" in rt: anchor_candidates = ["living", "dining"]
             
             anchor_node = None
             if "bath" in rt:
-                # Attached bath belongs to the Master Bedroom. Prefer an existing
-                # master; else pick the LARGEST bedroom (most suitable) and PROMOTE
-                # it to master. Bath space is then carved from that bedroom only —
-                # never from corridor / kitchen / utility / other bedrooms.
                 master = next((n for n in nodes if "master_bedroom" in n.type), None)
                 if master:
                     anchor_node = master
@@ -1176,6 +1186,7 @@ class LayoutEngine:
                         anchor_node = max(beds, key=lambda n: n.rect.area)
                         anchor_node.type = "master_bedroom"
                         anchor_node.name = "Master Bedroom"
+                        
             if anchor_node is None:
                 for cand in anchor_candidates:
                     for n in nodes:
@@ -1185,32 +1196,19 @@ class LayoutEngine:
                     if anchor_node: break
 
             if not anchor_node and nodes:
-                # default to biggest room
                 anchor_node = max(nodes, key=lambda n: n.rect.area)
                 
             if anchor_node:
                 p_area = ROOM_MINIMUMS.get(rt, {}).get("area", 30.0)
                 min_dim = ROOM_MINIMUMS.get(rt, {}).get("min_dim", 4.0)
                 
-                # We carve out from the parent node
-                carve_w = max(min_dim, p_area / (anchor_node.rect.length * 0.5))
+                carve_w = max(min_dim, p_area / max(1.0, anchor_node.rect.length * 0.5))
                 carve_l = max(min_dim, p_area / carve_w)
                 
-                # Cap carve size so it doesn't destroy parent
-                carve_w = min(carve_w, anchor_node.rect.width * 0.30)
-                carve_l = min(carve_l, anchor_node.rect.length * 0.30)
+                # Cap carve safely to 55% to support 1BHKs without starving room footprints
+                carve_w = min(carve_w, anchor_node.rect.width * 0.55)
+                carve_l = min(carve_l, anchor_node.rect.length * 0.55)
 
-                # Compact rooms must stay compact — never bedroom/hall sized.
-                # REDUCE these max dimensions so they act as corner nooks, not full rooms.
-                COMPACT_MAX = {"pooja_room": 5.5, "powder_room": 4.5, "store_room": 5.0}
-                cmax = COMPACT_MAX.get(rt)
-                if cmax:
-                    carve_w = min(carve_w, cmax)
-                    carve_l = min(carve_l, cmax)
-                
-                # Which sides of the anchor face a circulation space? We must NOT
-                # carve a bathroom out of that side, or the bath would end up
-                # between the corridor and the bedroom (a bath-as-gateway).
                 a = anchor_node.rect
                 ax0, ax1, az0, az1 = a.x, a.x + a.width, a.z, a.z + a.length
                 circ_sides = set()
@@ -1227,15 +1225,12 @@ class LayoutEngine:
 
                 slice_w = carve_w
                 slice_l = carve_l
-                # Preferred carve sides, skipping any that face circulation. For a
-                # bathroom this keeps the bedroom touching the corridor.
+                
+                # Safely determine the side to carve
                 avoid = circ_sides if "bath" in rt else set()
                 order = ["right", "bottom", "left", "top"] if a.width > a.length else ["bottom", "right", "top", "left"]
                 side = next((s for s in order if s not in avoid), order[0])
 
-                # Bedroom-cluster protection: never shrink the parent below its
-                # minimum livable dimension. Clamp the slice; if even the smallest
-                # bath won't fit without breaking the parent, skip the carve.
                 a_min = ROOM_MINIMUMS.get(anchor_node.type, {}).get("min_dim", 8.0)
                 if side in ("left", "right"):
                     slice_w = min(slice_w, a.width - a_min)
@@ -1246,6 +1241,7 @@ class LayoutEngine:
                     if slice_l < min_dim:
                         continue
 
+                # Execute the carve 
                 if side == "right":
                     p_rect = Rect(a.x + a.width - slice_w, a.z, slice_w, a.length)
                     a.width -= slice_w
@@ -1256,50 +1252,58 @@ class LayoutEngine:
                 elif side == "bottom":
                     p_rect = Rect(a.x, a.z + a.length - slice_l, a.width, slice_l)
                     a.length -= slice_l
-                else:  # top
+                else:
                     p_rect = Rect(a.x, a.z, a.width, slice_l)
                     a.z += slice_l
                     a.length -= slice_l
 
-                # Compact rooms (pooja/powder/store) are CORNER nooks — cap BOTH
-                # axes and seat them in the corner. The rest of the carved edge is
-                # handed back to the parent (living) as OPEN floor so there is a
-                # walking passage beside the nook instead of a full dividing wall.
-                if cmax:
-                    if side in ("left", "right"):
-                        if p_rect.length > cmax:
-                            # Give the un-used length back to the parent: shift the
-                            # parent's far edge to re-cover the strip beside the nook.
-                            if side == "right":
-                                a.width += slice_w  # parent reclaims full strip…
-                            elif side == "left":
-                                a.x -= slice_w
-                                a.width += slice_w
-                            p_rect.length = cmax
-                            # Parent now keeps its full footprint (open floor); the
-                            # nook overlaps only its corner.
-                        if p_rect.width > cmax:
-                            p_rect.width = cmax
-                    else:
-                        if p_rect.width > cmax:
-                            if side == "bottom":
-                                a.length += slice_l
-                            elif side == "top":
-                                a.z -= slice_l
-                                a.length += slice_l
-                            p_rect.width = cmax
-                        if p_rect.length > cmax:
-                            p_rect.length = cmax
+                # --- ZERO HARDCODING: AI-DRIVEN MAX DIMENSIONS ---
+                ai_spec = next((r for r in rooms_spec if r.get("type", "") == rt), {})
+                cmax_w = float(ai_spec.get("width", min_dim * 1.5))
+                cmax_l = float(ai_spec.get("length", min_dim * 1.5))
 
-                is_wet = "bath" in rt or "utility" in rt
-                p_floor = self.theme["floor"] if self.theme.get("floor") else "#f8fafc"
+                if side in ("left", "right"):
+                    if p_rect.length > cmax_l:
+                        if side == "right":
+                            a.width += slice_w
+                        elif side == "left":
+                            a.x -= slice_w
+                            a.width += slice_w
+                        p_rect.length = cmax_l
+                    if p_rect.width > cmax_w:
+                        p_rect.width = cmax_w
+                else:
+                    if p_rect.width > cmax_w:
+                        if side == "bottom":
+                            a.length += slice_l
+                        elif side == "top":
+                            a.z -= slice_l
+                            a.length += slice_l
+                        p_rect.width = cmax_w
+                    if p_rect.length > cmax_l:
+                        p_rect.length = cmax_l
+
+                # --- TRUE AI-DRIVEN SEMANTIC CLASSIFIER (PARASITES) ---
+                is_wet = rt in ai_wet_types
+                is_open_sky = rt in ai_outdoor_types
+                
+                roof_val = "open" if is_open_sky else "flat"
+                
                 p_wall = self.theme["wall"] if self.theme.get("wall") else ""
                 p_furn = self.theme["furniture"] if self.theme.get("furniture") else ""
+                p_floor = self.theme["floor"] if self.theme.get("floor") else ("#d6d3d1" if is_open_sky else "#f8fafc")
+
                 nodes.append(RoomNode(
                     id=rid, type=rt, name=rt.replace("_", " ").title(),
-                    rect=p_rect, wallThicknessIn=8.0 if is_wet else 6.0, is_wet=is_wet,
-                    floorColor=p_floor, wallColor=p_wall, furnitureColor=p_furn
+                    rect=p_rect, 
+                    wallThicknessIn=8.0 if is_wet else 6.0, 
+                    is_wet=is_wet,
+                    floorColor=p_floor, 
+                    wallColor=p_wall, 
+                    furnitureColor=p_furn,
+                    roof_type=roof_val
                 ))
+                # ------------------------------------------------------
 
         # 3. Post-Processing & Special Vastu Rules
         living = next((n for n in nodes if n.type == "living_room"), None)
@@ -1407,6 +1411,14 @@ class AdjacencyResolver:
         room_by_id = {r.id: r for r in self.rooms}
         placed_doors_between = set()
         
+        def has_connection(src, dst):
+            return any(c.get("target_room") == dst.type for c in src.connections)
+            
+        def get_face(rel_x, rel_z, room, is_v):
+            if is_v: return "west" if rel_x < room.rect.width / 2.0 else "east"
+            return "north" if rel_z < room.rect.length / 2.0 else "south"
+
+        # --- PASS 1: Strict Topological Placement ---
         for w in walls:
             if w.get("is_shared"):
                 r1_id, r2_id = w["room_ids"][:2]
@@ -1414,47 +1426,28 @@ class AdjacencyResolver:
                 if pair in placed_doors_between:
                     continue
                 
-                # Check if door should be placed
                 r1, r2 = room_by_id[r1_id], room_by_id[r2_id]
-                
-                # --- TOPOLOGICAL EDGE ENFORCEMENT ---
-                def has_connection(src, dst):
-                    return any(c.get("target_room") == dst.type for c in src.connections)
                 
                 is_r1_private = "bed" in r1.type or "bath" in r1.type or "toilet" in r1.type or "closet" in r1.type
                 is_r2_private = "bed" in r2.type or "bath" in r2.type or "toilet" in r2.type or "closet" in r2.type
                 
+                # If the AI topology forbids this connection, strictly skip it
                 if is_r1_private or is_r2_private:
                     if not (has_connection(r1, r2) or has_connection(r2, r1)):
-                        # Skip placing a door if the strict architectural graph doesn't permit it.
-                        # This prevents bedrooms from becoming passages, and stops bathrooms from connecting to each other.
                         continue
                 
-                # Ensure bathrooms only get one door max (prefer bedrooms)
+                # Ensure bathrooms only get one primary door
                 is_r1_bath = "bath" in r1.type or "toilet" in r1.type
                 is_r2_bath = "bath" in r2.type or "toilet" in r2.type
                 if is_r1_bath and any(d for d in r1.doors): continue
                 if is_r2_bath and any(d for d in r2.doors): continue
 
-                # --- ATTACHED BATHROOM ENFORCEMENT ---
-                # Bathrooms can be connected to bedrooms, corridors, or living rooms.
-                # We need to verify that a connection exists between these specific two rooms.
                 if is_r1_bath or is_r2_bath:
                     bath_room = r1 if is_r1_bath else r2
                     other_room = r2 if is_r1_bath else r1
-                    
-                    # Ensure there's a topological connection explicitly between these two rooms.
-                    # It could be `other_room -> bath_room` OR `bath_room -> other_room`
-                    has_bath_conn = (
-                        has_connection(other_room, bath_room) or 
-                        has_connection(bath_room, other_room)
-                    )
-                    
-                    if not has_bath_conn:
-                        # No architectural link between this specific bath and this room
+                    if not (has_connection(other_room, bath_room) or has_connection(bath_room, other_room)):
                         continue
 
-                # --- PHASE 5: DETERMINISTIC DOOR PLANNER ---
                 is_vert = w["orientation"] == "vertical"
                 wall_len = (w["z2"] - w["z1"]) if is_vert else (w["x2"] - w["x1"])
                 
@@ -1469,37 +1462,74 @@ class AdjacencyResolver:
                         break
 
                 if is_open_flow:
-                    door_w = max(4.0, wall_len - 0.5) # Huge opening for open flow
+                    door_w = max(4.0, wall_len - 0.5) 
                 else:
                     door_w = 2.5 if (is_r1_bath or is_r2_bath) else 3.0
                 
-                # Rule: 3x3 Landing + Corner Clearance (needs at least door_w + 1ft buffer)
+                # Dynamic door downscaling for narrow walls
                 if not is_open_flow and wall_len < door_w + 1.0:
-                    logger.warning(f"[DOOR PLANNER] Shared wall {r1_id}-{r2_id} is too short ({wall_len:.1f}ft) for a {door_w}ft door.")
-                    continue # Skip placement; validator will fail layout if required
+                    if wall_len >= 2.0:
+                        door_w = max(2.0, round(wall_len - 0.2, 1))
+                    else:
+                        continue 
                 
-                # Calculate center of wall
                 cx = (w["x1"] + w["x2"]) / 2.0
                 cz = (w["z1"] + w["z2"]) / 2.0
                 
-                # Convert global center to room-relative center
                 d1_x, d1_z = cx - r1.rect.x, cz - r1.rect.z
                 d2_x, d2_z = cx - r2.rect.x, cz - r2.rect.z
                 
-                def get_face(rel_x, rel_z, room, is_vert):
-                    if is_vert: return "west" if rel_x < room.rect.width / 2.0 else "east"
-                    return "north" if rel_z < room.rect.length / 2.0 else "south"
-                    
                 face1 = get_face(d1_x, d1_z, r1, is_vert)
                 face2 = get_face(d2_x, d2_z, r2, is_vert)
                 
                 r1.doors.append(Door(x=d1_x, z=d1_z, width=door_w, wall_orientation=face1))
                 r2.doors.append(Door(x=d2_x, z=d2_z, width=door_w, wall_orientation=face2))
                 
-                logger.info(f"    Placed door between '{r1_id}' and '{r2_id}'")
                 placed_doors_between.add(pair)
                 logger.info(f"    Placed door between '{r1.name}' and '{r2.name}'")
 
+        # --- PASS 2: RESCUE STRANDED ROOMS ---
+        # If strict topological checks blocked a room from getting ANY doors, 
+        # force a door on its longest shared wall to prevent a pipeline crash.
+        for r in self.rooms:
+            if len(r.doors) == 0:
+                available_walls = [w for w in walls if w.get("is_shared") and r.id in w["room_ids"]]
+                if not available_walls:
+                    continue # Truly isolated geometry 
+                
+                def wall_len(w):
+                    return abs(w["z2"]-w["z1"]) if w["orientation"]=="vertical" else abs(w["x2"]-w["x1"])
+                
+                best_wall = max(available_walls, key=wall_len)
+                r1_id, r2_id = best_wall["room_ids"][:2]
+                pair = tuple(sorted([r1_id, r2_id]))
+                
+                r1, r2 = room_by_id[r1_id], room_by_id[r2_id]
+                w_len = wall_len(best_wall)
+                
+                door_w = 3.0
+                if w_len < door_w + 1.0:
+                    if w_len >= 2.0:
+                        door_w = max(2.0, round(w_len - 0.2, 1))
+                    else:
+                        continue 
+                
+                cx = (best_wall["x1"] + best_wall["x2"]) / 2.0
+                cz = (best_wall["z1"] + best_wall["z2"]) / 2.0
+                
+                is_vert = best_wall["orientation"] == "vertical"
+                
+                d1_x, d1_z = cx - r1.rect.x, cz - r1.rect.z
+                d2_x, d2_z = cx - r2.rect.x, cz - r2.rect.z
+                
+                face1 = get_face(d1_x, d1_z, r1, is_vert)
+                face2 = get_face(d2_x, d2_z, r2, is_vert)
+                
+                r1.doors.append(Door(x=d1_x, z=d1_z, width=door_w, wall_orientation=face1))
+                r2.doors.append(Door(x=d2_x, z=d2_z, width=door_w, wall_orientation=face2))
+                
+                placed_doors_between.add(pair)
+                logger.warning(f"[DOOR PLANNER] RESCUE PASS: Forced emergency door for stranded room {r.name} to {r1.name if r.id == r2.id else r2.name} ({door_w}ft)")
 # ---------------------------------------------------------------------------
 # Window Generation
 # ---------------------------------------------------------------------------
