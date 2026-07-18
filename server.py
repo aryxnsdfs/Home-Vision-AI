@@ -1971,7 +1971,7 @@ async def generate_plan(req: GenerateRequest):
                 room_pool = [r for r in layout_params["rooms"] if r["type"] not in indian_types]
                 room_pool, structural_features = strip_structural(room_pool)
 
-                first_spec = []
+                basement_spec, first_spec, terrace_spec = [], [], []
                 if floors > 1:
                     basement_spec, ground_spec, first_spec, terrace_spec = split_multistory_specs(room_pool, bhk_val)
                     floor_0_rooms = sort_spec_by_generation_order(ground_spec)
@@ -2299,7 +2299,7 @@ async def generate_from_template(req: TemplateRequest):
         # Floor 0
         bhk_count = template.get("bhk", 0)
         room_pool, structural_features = strip_structural(list(template["rooms"]))
-        first_spec = []
+        basement_spec, first_spec, terrace_spec = [], [], []
         if req.floors > 1:
             basement_spec, ground_spec, first_spec, terrace_spec = split_multistory_specs(room_pool, bhk_count)
             floor_0_rooms = sort_spec_by_generation_order(ground_spec)
@@ -2878,7 +2878,7 @@ def _stream_generate_work(req: "GenerateRequest", emit_fn: Callable) -> None:
         room_pool = [r for r in layout_params["rooms"] if r["type"] not in indian_types]
         room_pool, structural_features = strip_structural(room_pool)
 
-        first_spec: List[Dict] = []
+        basement_spec, first_spec, terrace_spec = [], [], []
         if floors > 1:
             basement_spec, ground_spec, first_spec, terrace_spec = split_multistory_specs(room_pool, bhk_val)
             floor_0_rooms = sort_spec_by_generation_order(ground_spec)
@@ -3211,7 +3211,7 @@ def _stream_template_work(req: "TemplateRequest", emit_fn: Callable) -> None:
         # unless the Pooja feature is explicitly selected.
         if not (req.indianOptions or {}).get("pooja_room"):
             room_pool = [r for r in room_pool if "pooja" not in str(r.get("type", "")).lower()]
-        first_spec: List[Dict] = []
+        basement_spec, first_spec, terrace_spec = [], [], []
         if req.floors > 1:
             basement_spec, ground_spec, first_spec, terrace_spec = split_multistory_specs(room_pool, bhk_count)
             floor_0_rooms = sort_spec_by_generation_order(ground_spec)
