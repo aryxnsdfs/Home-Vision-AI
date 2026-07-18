@@ -584,7 +584,7 @@ class GeometryValidator:
             return any(p in rt for p in [
                 'entrance', 'hallway', 'corridor', 'living', 'foyer', 'dining',
                 'courtyard', 'angan', 'open_to_sky', 'veranda', 'balcony', 
-                'deck', 'patio', 'porch', 'terrace', 'otta', 'thinnai'
+                'deck', 'patio', 'porch', 'terrace', 'otta', 'thinnai', 'stair'
             ])
 
         living_idx = next((i for i, r in enumerate(blueprint) if "living" in r.get("room_type", "").lower()), None)

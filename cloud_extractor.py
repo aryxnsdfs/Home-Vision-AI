@@ -527,15 +527,7 @@ def auto_wire_topology(room_types: list, ai_categories: dict = None) -> list:
     if not room_types:
         return []
         
-    if not ai_categories:
-        # Intelligent fallback categorization
-        ai_categories = {
-            "outdoor_rooms": [r for r in room_types if any(kw in r.lower() for kw in ("courtyard", "parking", "garden", "pool", "deck", "patio", "balcony", "porch", "veranda"))],
-            "wet_rooms": [r for r in room_types if any(kw in r.lower() for kw in ("bath", "toilet", "powder", "laundry", "wash"))],
-            "circulation_rooms": [r for r in room_types if any(kw in r.lower() for kw in ("corridor", "hallway", "staircase", "foyer"))],
-            "private_rooms": [r for r in room_types if any(kw in r.lower() for kw in ("bed", "master", "closet", "study", "office"))],
-            "public_rooms": [r for r in room_types if any(kw in r.lower() for kw in ("living", "kitchen", "dining", "lounge", "family", "drawing"))],
-        }
+    ai_categories = ai_categories or {}
     
     # Normalize AI sets for fast lookup
     outdoor_set = {r.replace(" ", "_").lower() for r in ai_categories.get("outdoor_rooms", [])}
@@ -544,7 +536,7 @@ def auto_wire_topology(room_types: list, ai_categories: dict = None) -> list:
     private_set = {r.replace(" ", "_").lower() for r in ai_categories.get("private_rooms", [])}
     public_set = {r.replace(" ", "_").lower() for r in ai_categories.get("public_rooms", [])}
 
-    room_specs = [{"id": f"{r}_{i}", "type": r, "connections": []} for i, r in enumerate(room_types)]
+    room_specs = [{"type": r, "connections": []} for r in room_types]
     
     circulation_idx, outdoor_idx, wet_idx, private_idx, public_idx = [], [], [], [], []
     
@@ -572,7 +564,6 @@ def auto_wire_topology(room_types: list, ai_categories: dict = None) -> list:
     def add_conn(src_idx, target_idx, intent, weight):
         room_specs[src_idx]['connections'].append({
             "target_room": room_specs[target_idx]['type'],
-            "target_id": room_specs[target_idx]['id'],
             "intent": intent,
             "weight": weight
         })
@@ -584,10 +575,6 @@ def auto_wire_topology(room_types: list, ai_categories: dict = None) -> list:
 
     # 2. Determine Primary Hub for Circulation
     hub_idx = circulation_idx[0] if circulation_idx else (public_idx[0] if public_idx else 0)
-
-    # Connect the primary public room to the hub if they are distinct
-    if public_idx and hub_idx not in public_idx:
-        add_conn(public_idx[0], hub_idx, "open_flow", 10)
 
     # 3. Connect Outdoor Spaces to the Hub
     for oi in outdoor_idx:

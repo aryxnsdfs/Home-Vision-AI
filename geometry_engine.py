@@ -36,22 +36,17 @@ class CPSolver:
         """
         Places rooms on a grid such that:
         1. Connected rooms share ≥ 4ft wall (HARD) — doors are always feasible
+        2. Forbidden pairs never touch (HARD) — kitchen ≠ bathroom
+        3. Minimum room dimensions and areas (HARD)
+        4. Zonal clustering and walking distance (SOFT objectives)
         5. Post-solve BFS connectivity check
         """
+        plot_w_ft = floor_data.get('plot_width', 30.0)
+        plot_l_ft = floor_data.get('plot_length', 40.0)
         rooms_spec = floor_data.get('rooms', [])
+
         if not rooms_spec:
             return floor_data
-
-        total_min_area = 0.0
-        for r in rooms_spec:
-            rtype = r.get("type", "room")
-            total_min_area += ROOM_MINIMUMS.get(rtype, _DEFAULT_MIN).get("area", 64)
-        
-        # Scale plot if required area exceeds standard 30x40 (1200 sqft)
-        target_plot_area = max(1200.0, total_min_area * 1.3) # 30% margin for corridors/walls
-        scale_factor = (target_plot_area / 1200.0) ** 0.5
-        plot_w_ft = max(30.0, floor_data.get('plot_width', 30.0) * scale_factor)
-        plot_l_ft = max(40.0, floor_data.get('plot_length', 40.0) * scale_factor)
 
         # Grid: 1 unit = 0.5 feet
         scale = 2
@@ -96,14 +91,10 @@ class CPSolver:
 
             # Aspect ratio (no super-elongated rooms)
             if "corridor" not in r_type and "hallway" not in r_type:
-                model.Add(100 * w >= 50 * l)   # w/l >= 0.5
-                model.Add(100 * w <= 200 * l)   # w/l <= 2.0
-                # Relaxed limit for residential rooms so they can still reach plot edges or connect.
-                if "wedding" not in r_type and "theater" not in r_type and min_dim < int(12.0 * scale):
-                    model.Add(w <= int(min_dim * 3.5))
-                    model.Add(l <= int(min_dim * 3.5))
+                model.Add(100 * w >= 50 * l)   # w/l ≥ 0.5
+                model.Add(100 * w <= 200 * l)   # w/l ≤ 2.0
             else:
-                # Corridor: at least one dimension must be narrow (<= 5 ft)
+                # Corridor: at least one dimension must be narrow (≤ 5 ft)
                 b1 = model.NewBoolVar(f'corr_narrow_w_{r_id}')
                 b2 = model.NewBoolVar(f'corr_narrow_l_{r_id}')
                 model.Add(w <= int(5.0 * scale)).OnlyEnforceIf(b1)
@@ -114,19 +105,6 @@ class CPSolver:
             z_end = model.NewIntVar(min_dim, plot_l, f'ze_{r_id}')
             model.Add(x_end == x + w)
             model.Add(z_end == z + l)
-
-            # Outdoor rooms must touch the plot perimeter
-            if room.get("is_outdoor", False):
-                # Room must be on left edge (x=0), right edge (x_end=plot_w), top edge (z=0), or bottom edge (z_end=plot_l)
-                b_left = model.NewBoolVar(f'out_left_{r_id}')
-                b_right = model.NewBoolVar(f'out_right_{r_id}')
-                b_top = model.NewBoolVar(f'out_top_{r_id}')
-                b_bottom = model.NewBoolVar(f'out_bot_{r_id}')
-                model.Add(x == 0).OnlyEnforceIf(b_left)
-                model.Add(x_end == plot_w).OnlyEnforceIf(b_right)
-                model.Add(z == 0).OnlyEnforceIf(b_top)
-                model.Add(z_end == plot_l).OnlyEnforceIf(b_bottom)
-                model.AddBoolOr([b_left, b_right, b_top, b_bottom])
 
             x_iv = model.NewIntervalVar(x, w, x_end, f'xi_{r_id}')
             z_iv = model.NewIntervalVar(z, l, z_end, f'zi_{r_id}')
@@ -175,17 +153,12 @@ class CPSolver:
                 if not target_type:
                     continue
 
-                # Find the target room by id if available, else by type
+                # Find the first room of target_type that isn't r_id
                 target_id = None
-                expected_id = conn.get('target_id')
-                
-                if expected_id and expected_id in room_vars:
-                    target_id = expected_id
-                else:
-                    for tid, trv in room_vars.items():
-                        if trv['type'] == target_type and tid != r_id:
-                            target_id = tid
-                            break
+                for tid, trv in room_vars.items():
+                    if trv['type'] == target_type and tid != r_id:
+                        target_id = tid
+                        break
                 if not target_id:
                     continue
 

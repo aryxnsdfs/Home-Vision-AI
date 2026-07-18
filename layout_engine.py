@@ -594,15 +594,6 @@ ROOM_MINIMUMS: Dict[str, Dict[str, float]] = {
     "laundry":         {"area":  25.0, "min_dim":  4.0},
     "veranda":         {"area":  40.0, "min_dim":  4.0},
     "parking":         {"area": 100.0, "min_dim": 8.0},
-    "wedding_hall":    {"area": 800.0, "min_dim": 20.0},
-    "home_theater":    {"area": 250.0, "min_dim": 14.0},
-    "gym":             {"area": 120.0, "min_dim": 10.0},
-    "courtyard":       {"area": 100.0, "min_dim": 8.0},
-    "garden":          {"area": 100.0, "min_dim": 8.0},
-    "pool":            {"area": 150.0, "min_dim": 10.0},
-    "basement":        {"area": 200.0, "min_dim": 12.0},
-    "terrace":         {"area": 200.0, "min_dim": 12.0},
-    "office":          {"area": 100.0, "min_dim": 8.0},
 }
 # Default for unknown types
 _DEFAULT_MIN = {"area": 40.0, "min_dim": 5.0}
