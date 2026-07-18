@@ -51,7 +51,7 @@ from layout_engine import (
     align_duplex_floors, compute_shared_walls, validate_layout
 )
 from room_planner import (
-    sort_spec_by_generation_order, strip_structural, split_duplex_specs,
+    sort_spec_by_generation_order, strip_structural, split_multistory_specs,
     final_layout_validation, INSUFFICIENT_SPACE_MSG,
     requested_type_set, enforce_requested_only,
 )
@@ -1973,7 +1973,7 @@ async def generate_plan(req: GenerateRequest):
 
                 first_spec = []
                 if floors > 1:
-                    ground_spec, first_spec = split_duplex_specs(room_pool, bhk_val)
+                    basement_spec, ground_spec, first_spec, terrace_spec = split_multistory_specs(room_pool, bhk_val)
                     floor_0_rooms = sort_spec_by_generation_order(ground_spec)
                 else:
                     floor_0_rooms = sort_spec_by_generation_order(room_pool)
@@ -2301,7 +2301,7 @@ async def generate_from_template(req: TemplateRequest):
         room_pool, structural_features = strip_structural(list(template["rooms"]))
         first_spec = []
         if req.floors > 1:
-            ground_spec, first_spec = split_duplex_specs(room_pool, bhk_count)
+            basement_spec, ground_spec, first_spec, terrace_spec = split_multistory_specs(room_pool, bhk_count)
             floor_0_rooms = sort_spec_by_generation_order(ground_spec)
         else:
             floor_0_rooms = sort_spec_by_generation_order(room_pool)
@@ -2880,7 +2880,7 @@ def _stream_generate_work(req: "GenerateRequest", emit_fn: Callable) -> None:
 
         first_spec: List[Dict] = []
         if floors > 1:
-            ground_spec, first_spec = split_duplex_specs(room_pool, bhk_val)
+            basement_spec, ground_spec, first_spec, terrace_spec = split_multistory_specs(room_pool, bhk_val)
             floor_0_rooms = sort_spec_by_generation_order(ground_spec)
         else:
             floor_0_rooms = sort_spec_by_generation_order(room_pool)
@@ -2951,18 +2951,40 @@ def _stream_generate_work(req: "GenerateRequest", emit_fn: Callable) -> None:
                     "indianOptions": indian_opts,
                 }
 
-                # Generate Floor 1 if Duplex
-                if floors > 1:
-                    logger.info("[PIPELINE] Generating Floor 1 (Duplex)...")
-                    blocked_zones = []
-                    staircase = next((n for n in generated_nodes_0 if n.type == "staircase"), None)
-                    if staircase:
-                        blocked_zones.append(staircase.rect)
-                    living_dh = next((n for n in generated_nodes_0 if getattr(n, "is_double_height", False)), None)
-                    if living_dh:
-                        blocked_zones.append(living_dh.rect)
+                # Extract Ground Staircase for alignment
+                blocked_zones = []
+                staircase = next((n for n in generated_nodes_0 if n.type == "staircase"), None)
+                if staircase:
+                    blocked_zones.append(staircase.rect)
+                living_dh = next((n for n in generated_nodes_0 if getattr(n, "is_double_height", False)), None)
+                if living_dh:
+                    blocked_zones.append(living_dh.rect)
 
-                    import copy
+                import copy
+
+                # Generate Basement if exists
+                if basement_spec:
+                    logger.info("[PIPELINE] Generating Basement (Floor -1)...")
+                    floor_m1_rooms = sort_spec_by_generation_order(basement_spec)
+                    generated_nodes_m1 = engine.generate(
+                        floor_m1_rooms,
+                        blocked_zones=blocked_zones,
+                        restrict_slots=True
+                    )
+                    enforce_requested_only(generated_nodes_m1, _req_types)
+                    ArchitecturalRules.optimize_wet_walls(generated_nodes_m1)
+                    AdjacencyResolver(generated_nodes_m1, open_rooms=layout_params.get("open_rooms", [])).resolve()
+                    val_m1 = GeometryValidator.validate_post_placement(generated_nodes_m1)
+                    if not val_m1.is_valid:
+                        if attempt < max_attempts - 1: continue
+                        else: raise ValueError(f"Layout failed Basement validation: {val_m1.errors}")
+                    layout_data["floor_-1"] = [n.to_dict() for n in generated_nodes_m1]
+                    layout_data["walls_floor_-1"] = compute_shared_walls(generated_nodes_m1)
+
+                # Generate Floor 1 if Duplex
+                generated_nodes_1 = []
+                if floors > 1 or first_spec:
+                    logger.info("[PIPELINE] Generating Floor 1 (Duplex)...")
                     safe_first_spec = copy.deepcopy(first_spec) if first_spec else []
                     if not safe_first_spec:
                         safe_first_spec = [copy.deepcopy(r) for r in layout_params["rooms"] if r["type"] in ("bedroom", "bathroom", "master_bedroom")]
@@ -2972,9 +2994,7 @@ def _stream_generate_work(req: "GenerateRequest", emit_fn: Callable) -> None:
                                     r["type"] = "bedroom"
 
                     floor_1_rooms = sort_spec_by_generation_order(safe_first_spec)
-                    floor1_bp = None
-                    if master_bp:
-                        floor1_bp = [b for b in master_bp if b.get("floor_number", 0) == 1]
+                    floor1_bp = [b for b in master_bp if b.get("floor_number", 0) == 1] if master_bp else None
                     
                     generated_nodes_1 = engine.generate(
                         floor_1_rooms,
@@ -2999,10 +3019,34 @@ def _stream_generate_work(req: "GenerateRequest", emit_fn: Callable) -> None:
                         else:
                             raise ValueError(f"Layout failed Floor 1 validation: {val_1.errors}")
 
-                    shared_walls_1 = compute_shared_walls(generated_nodes_1)
                     layout_data["floor_1"] = [n.to_dict() for n in generated_nodes_1]
-                    layout_data["walls_floor_1"] = shared_walls_1
+                    layout_data["walls_floor_1"] = compute_shared_walls(generated_nodes_1)
                     layout_data["mep_data_f1"] = compute_mep_heuristics(generated_nodes_1)
+
+                # Generate Terrace if exists
+                if terrace_spec:
+                    logger.info("[PIPELINE] Generating Terrace (Floor 2)...")
+                    # Anchor to first floor stairs if they exist, otherwise ground stairs
+                    t_blocked_zones = []
+                    t_staircase = next((n for n in (generated_nodes_1 or generated_nodes_0) if n.type == "staircase"), None)
+                    if t_staircase:
+                        t_blocked_zones.append(t_staircase.rect)
+                    
+                    floor_2_rooms = sort_spec_by_generation_order(terrace_spec)
+                    generated_nodes_2 = engine.generate(
+                        floor_2_rooms,
+                        blocked_zones=t_blocked_zones,
+                        restrict_slots=True
+                    )
+                    enforce_requested_only(generated_nodes_2, _req_types)
+                    ArchitecturalRules.optimize_wet_walls(generated_nodes_2)
+                    AdjacencyResolver(generated_nodes_2, open_rooms=layout_params.get("open_rooms", [])).resolve()
+                    val_2 = GeometryValidator.validate_post_placement(generated_nodes_2)
+                    if not val_2.is_valid:
+                        if attempt < max_attempts - 1: continue
+                        else: raise ValueError(f"Layout failed Terrace validation: {val_2.errors}")
+                    layout_data["floor_2"] = [n.to_dict() for n in generated_nodes_2]
+                    layout_data["walls_floor_2"] = compute_shared_walls(generated_nodes_2)
 
                 # If we made it here, both floors succeeded (or we hit max retries)
                 logger.info(f"[PIPELINE] Layout generation succeeded on attempt {attempt + 1}!")
@@ -3018,7 +3062,11 @@ def _stream_generate_work(req: "GenerateRequest", emit_fn: Callable) -> None:
 
         emit(8, "Generating Materials & Structures...", "Structural analysis · cost estimation")
 
-        all_nodes = list(generated_nodes_0) + list(generated_nodes_1)
+        all_nodes = list(generated_nodes_0)
+        if 'generated_nodes_m1' in locals(): all_nodes += list(generated_nodes_m1)
+        if 'generated_nodes_1' in locals() and generated_nodes_1: all_nodes += list(generated_nodes_1)
+        if 'generated_nodes_2' in locals(): all_nodes += list(generated_nodes_2)
+        
         selected_palette = _apply_selected_palette(all_nodes, req.colors)
         layout_data["floor_0"] = [n.to_dict() for n in generated_nodes_0]
         if generated_nodes_1:
@@ -3165,7 +3213,7 @@ def _stream_template_work(req: "TemplateRequest", emit_fn: Callable) -> None:
             room_pool = [r for r in room_pool if "pooja" not in str(r.get("type", "")).lower()]
         first_spec: List[Dict] = []
         if req.floors > 1:
-            ground_spec, first_spec = split_duplex_specs(room_pool, bhk_count)
+            basement_spec, ground_spec, first_spec, terrace_spec = split_multistory_specs(room_pool, bhk_count)
             floor_0_rooms = sort_spec_by_generation_order(ground_spec)
         else:
             floor_0_rooms = sort_spec_by_generation_order(room_pool)

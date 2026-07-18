@@ -277,7 +277,7 @@ export const useProjectStore = create((set, get) => ({
   },
   lastUnderstood: [],
   lastWarnings: [],
-  visibleFloor: "floor_0", // 'floor_0', 'floor_1', or 'all'
+  visibleFloor: "floor_0", // 'floor_-1', 'floor_0', 'floor_1', 'floor_2', or 'all'
   showWiring: false,
   showPlumbing: false,
   showStructural: false,
@@ -871,19 +871,25 @@ export const useProjectStore = create((set, get) => ({
     set((state) => {
       // Handle both new layout_data format and fallback to legacy flat rooms array
       let rawRooms = [];
-      if (payload?.layout_data?.floor_0) {
-        rawRooms = [...payload.layout_data.floor_0];
-        if (payload.layout_data.floor_1) {
-            const f1Rooms = payload.layout_data.floor_1.map(r => ({...r, isFloor1: true}));
-            rawRooms = [...rawRooms, ...f1Rooms];
-        }
+      if (payload?.layout_data?.floor_0 || payload?.layout_data?.floor_1 || payload?.layout_data?.["floor_-1"] || payload?.layout_data?.floor_2) {
+        const addFloorRooms = (floorKey, index, isF1 = false) => {
+          if (payload.layout_data[floorKey]) {
+            rawRooms.push(...payload.layout_data[floorKey].map(r => ({ ...r, floorIndex: index, isFloor1: isF1 })));
+          }
+        };
+        addFloorRooms("floor_-1", -1);
+        addFloorRooms("floor_0", 0);
+        addFloorRooms("floor_1", 1, true);
+        addFloorRooms("floor_2", 2);
       } else if (Array.isArray(payload?.rooms)) {
         rawRooms = payload.rooms;
       }
 
       const candidateWalls = [
-        ...(payload?.layout_data?.walls_floor_0 || []),
-        ...(payload?.layout_data?.walls_floor_1?.map(w => ({...w, isFloor1: true})) || [])
+        ...(payload?.layout_data?.["walls_floor_-1"]?.map(w => ({...w, floorIndex: -1})) || []),
+        ...(payload?.layout_data?.walls_floor_0?.map(w => ({...w, floorIndex: 0})) || []),
+        ...(payload?.layout_data?.walls_floor_1?.map(w => ({...w, floorIndex: 1, isFloor1: true})) || []),
+        ...(payload?.layout_data?.walls_floor_2?.map(w => ({...w, floorIndex: 2})) || [])
       ];
 
       const candidateRooms = rawRooms.length > 0

@@ -727,12 +727,19 @@ function PromptBar() {
 function MiniMapFloorSwitch() {
   const visibleFloor = useProjectStore((s) => s.visibleFloor);
   const setVisibleFloor = useProjectStore((s) => s.setVisibleFloor);
-  const isDuplex = useProjectStore((s) => (s.project.floors ? s.project.floors[s.project.current_floor_index || 0].rooms : []).some((r) => r.isFloor1));
-  if (!isDuplex) return null;
-  const opts = [
-    { v: "floor_0", label: "Ground" },
-    { v: "floor_1", label: "First Floor" },
-  ];
+  const rooms = useProjectStore((s) => (s.project.floors ? s.project.floors[s.project.current_floor_index || 0].rooms : []));
+  
+  const hasBasement = rooms.some(r => r.floorIndex === -1);
+  const hasFirst = rooms.some(r => r.floorIndex === 1 || r.isFloor1);
+  const hasSecond = rooms.some(r => r.floorIndex === 2);
+  
+  if (!hasBasement && !hasFirst && !hasSecond) return null;
+  
+  const opts = [];
+  if (hasBasement) opts.push({ v: "floor_-1", label: "Basement" });
+  opts.push({ v: "floor_0", label: "Ground" });
+  if (hasFirst) opts.push({ v: "floor_1", label: "First Floor" });
+  if (hasSecond) opts.push({ v: "floor_2", label: "Terrace" });
   return (
     <div className="flex gap-1 w-full mb-1.5">
       {opts.map((o) => (
@@ -764,8 +771,10 @@ function MiniMap() {
   // the default; only an explicit "First" selection switches it. "Both" and
   // "Compare" still show the ground plan (no overlapping/combined map).
   const rooms = useMemo(() => {
-    if (visibleFloor === "floor_1") return allRooms.filter((r) => r.isFloor1);
-    return allRooms.filter((r) => !r.isFloor1); // floor_0 / all / compare → ground
+    if (visibleFloor === "floor_-1") return allRooms.filter((r) => r.floorIndex === -1);
+    if (visibleFloor === "floor_1") return allRooms.filter((r) => r.floorIndex === 1 || r.isFloor1);
+    if (visibleFloor === "floor_2") return allRooms.filter((r) => r.floorIndex === 2);
+    return allRooms.filter((r) => (r.floorIndex === 0 || r.floorIndex === undefined) && !r.isFloor1); // floor_0 / all / compare → ground
   }, [allRooms, visibleFloor]);
 
   const bounds = useMemo(() => {

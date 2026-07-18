@@ -175,70 +175,67 @@ _GROUND_ALWAYS = {
 _FIRST_PREFERRED = {"balcony", "built_in_seating"}
 
 
-def split_duplex_specs(
+def split_multistory_specs(
     specs: List[Dict[str, Any]],
     bedroom_count: int,
-) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
-    """Distribute room specs across ground and first floors of a duplex.
-
-    Allocation (bedroom_count = master + plain bedrooms):
-      2 BR  → all bedrooms on Ground (no duplex split of bedrooms).
-      3 BR  → Ground: 1 guest/elderly bedroom; First: Master + 1 bedroom.
-      4 BR+ → Ground: 1 guest/elderly bedroom; First: Master + remaining.
-
-    Private rooms go upstairs whenever possible. Bathrooms follow bedrooms.
-    Returns (ground_specs, first_specs). Both floors keep a staircase + corridor
-    so the flight is continuous and every floor has circulation.
-    """
+    floors: int = 1
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], List[Dict[str, Any]], List[Dict[str, Any]]]:
+    """Distribute room specs across basement, ground, first, and terrace floors."""
+    basement: List[Dict[str, Any]] = []
     ground: List[Dict[str, Any]] = []
     first: List[Dict[str, Any]] = []
+    terrace: List[Dict[str, Any]] = []
 
     beds = [r for r in specs if _canon(r.get("type", "")) in ("bedroom", "master_bedroom", "elderly_suite")]
     baths = [r for r in specs if _canon(r.get("type", "")) == "bathroom"]
-    others = [
-        r for r in specs
-        if r not in beds and r not in baths
-    ]
+    others = [r for r in specs if r not in beds and r not in baths]
 
     # How many bedrooms go downstairs (guest/elderly).
-    if bedroom_count <= 2:
-        ground_bed_n = len(beds)   # everything stays on ground
+    if bedroom_count <= 2 or floors == 1:
+        ground_bed_n = len(beds)
     else:
-        ground_bed_n = 1           # one guest/elderly suite downstairs
+        ground_bed_n = 1
 
-    # Bedrooms: fill ground quota first, rest go upstairs.
     for i, b in enumerate(beds):
         (ground if i < ground_bed_n else first).append(b)
 
-    # Bathrooms: one stays downstairs (for the guest/powder side), rest upstairs
-    # with the private cluster.
     if baths:
         ground.append(baths[0])
         first.extend(baths[1:])
 
-    # Non-bedroom rooms by zone preference.
     for r in others:
         rt = _canon(r.get("type", ""))
-        if rt in _FIRST_PREFERRED and first_has_private(first):
+        
+        # Explicit floor targeting based on name or type
+        if "basement" in rt or "home_theater" in rt:
+            basement.append(r)
+        elif "terrace" in rt or "water_pump" in rt or "pergola" in rt:
+            terrace.append(r)
+        elif rt in _FIRST_PREFERRED and floors > 1:
             first.append(r)
-        elif rt in _GROUND_ALWAYS:
+        elif rt in _GROUND_ALWAYS or floors == 1:
             ground.append(r)
         else:
-            # Family/private support follows the public core downstairs unless
-            # it is clearly a private upstairs amenity.
             zone = classify_zone(rt)
-            (first if zone == ZONE_PRIVATE and first_has_private(first) else ground).append(r)
+            (first if zone == ZONE_PRIVATE and floors > 1 else ground).append(r)
 
-    # Guarantee circulation + a continuous staircase on both floors.
+    # Guarantee circulation + a continuous staircase on floors that exist.
     _ensure_type(ground, "staircase")
-    _ensure_type(first, "staircase")
-    _ensure_type(first, "corridor")
-    if not first:
-        # Degenerate (e.g. <=2 BR): keep the upper floor as a family space.
-        first.append({"type": "living_room", "confidence": 100})
+    
+    if basement:
+        _ensure_type(basement, "staircase")
+    
+    if first or floors > 1:
         _ensure_type(first, "staircase")
+        _ensure_type(first, "corridor")
+        if not first:
+            first.append({"type": "living_room", "confidence": 100})
+            _ensure_type(first, "staircase")
+            
+    if terrace:
+        _ensure_type(terrace, "staircase")
 
-    return ground, first
+    return basement, ground, first, terrace
 
 
 # Features that must NEVER appear unless the user explicitly requested them

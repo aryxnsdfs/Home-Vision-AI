@@ -15,6 +15,38 @@ import HouseRoom, { WALL_HEIGHT as ROOM_WALL_HEIGHT, roomBounds } from "./Room.j
 import StructuralLayer from "./StructuralLayer.jsx";
 import { useProjectStore } from "../store/useProjectStore.js";
 
+function ProceduralFurniture({ room, isSelected, accent, onClick, color }) {
+  const seed = Array.from(room.type || "").reduce((s, c) => s + c.charCodeAt(0), 0);
+  const random = (idx) => {
+    const x = Math.sin(seed + idx) * 10000;
+    return x - Math.floor(x);
+  };
+  const f = Math.min(1, (room.width * 0.18) / 2.0);
+  const blocks = [];
+  const numBlocks = Math.floor(random(1) * 4) + 2;
+  for (let i = 0; i < numBlocks; i++) {
+    const w = (random(i * 4 + 1) * 0.8 + 0.4) * f;
+    const h = (random(i * 4 + 2) * 0.6 + 0.2) * f;
+    const d = (random(i * 4 + 3) * 0.8 + 0.4) * f;
+    const x = (random(i * 4 + 4) * 0.6 - 0.3) * (room.width * 0.18);
+    const z = (random(i * 4 + 5) * 0.6 - 0.3) * (room.length * 0.18);
+    blocks.push(
+      <mesh key={i} castShadow receiveShadow position={[x, h / 2, z]}>
+        <boxGeometry args={[w, h, d]} />
+        {color ? <meshStandardMaterial color={color} roughness={0.5} /> : <GlassPhysicalMaterial type="sofa" opacity={0.58} />}
+        {isSelected && <BoxEdges args={[w, h, d]} color={accent} scale={1.05} />}
+      </mesh>
+    );
+  }
+  const roomW = room.width * 0.18;
+  const roomL = room.length * 0.18;
+  return (
+    <group position={[roomW * 0.5, 0, roomL * 0.5]} onClick={onClick}>
+      {blocks}
+    </group>
+  );
+}
+
 const SCALE = 0.18;
 const EYE_LEVEL = 1.6;
 const WALL_HEIGHT = ROOM_WALL_HEIGHT;
@@ -552,52 +584,9 @@ function InteriorObjects({ rooms, accent }) {
               onClick={handleFurnitureClick}
             />
           );
-        } else if (room.type === "kitchen") {
-          const kf = Math.min(1, (room.width * SCALE) / 1.5);
-          const counterW = 1.28 * kf;
-          const counterD = 0.32 * kf;
-          const kitchenX = clamp(roomW * 0.5, counterW / 2 + clearance, roomW - counterW / 2 - clearance);
-          const kitchenDepth = clamp(roomL - 0.4 * kf, counterD / 2 + clearance, roomL - counterD / 2 - clearance);
-          furnitureElement = (
-            <group position={[kitchenX, 0.32 * kf, kitchenDepth]} scale={kf} onClick={handleFurnitureClick}>
-              <mesh castShadow receiveShadow>
-                <boxGeometry args={[1.28, 0.48, 0.32]} />
-                {color ? <meshStandardMaterial color={color} roughness={0.5} /> : <GlassPhysicalMaterial type="kitchen" opacity={0.58} />}
-                <BoxEdges args={[1.28, 0.48, 0.32]} color={isSelected ? accent : "#e2e8f0"} scale={isSelected ? 1.05 : 1} />
-              </mesh>
-              <mesh castShadow receiveShadow position={[0.38, 0.31, 0]}>
-                <boxGeometry args={[0.28, 0.18, 0.24]} />
-                <GlassPhysicalMaterial type="chair" opacity={0.5} />
-              </mesh>
-            </group>
-          );
         } else {
-          const f = Math.min(1, roomW / 2, roomL / 2);
-          const sofaW = 1.1 * f;
-          const sofaD = 0.42 * f;
-          const sofaX = clamp(roomW * 0.4, sofaW / 2 + clearance, roomW - sofaW / 2 - clearance);
-          const sofaZ = clamp(roomL - 0.6 * f, sofaD / 2 + clearance, roomL - sofaD / 2 - clearance);
-          const tableW = 0.65 * f;
-          const tableD = 0.35 * f;
-          const tableX = clamp(roomW * 0.55, tableW / 2 + clearance, roomW - tableW / 2 - clearance);
-          const tableZ = clamp(roomL * 0.5, tableD / 2 + clearance, roomL - tableD / 2 - clearance);
           furnitureElement = (
-            <group onClick={handleFurnitureClick}>
-              <mesh castShadow receiveShadow position={[sofaX, 0.25 * f, sofaZ]} scale={f}>
-                <boxGeometry args={[1.1, 0.36, 0.42]} />
-                {color ? (
-                  <meshStandardMaterial color={color} roughness={0.55} />
-                ) : (
-                  <GlassPhysicalMaterial type="sofa" opacity={0.55} />
-                )}
-                <BoxEdges args={[1.1, 0.36, 0.42]} color={isSelected ? accent : "#cbd5e1"} scale={isSelected ? 1.05 : 1} />
-              </mesh>
-              <mesh castShadow receiveShadow position={[tableX, 0.18 * f, tableZ]} scale={f}>
-                <boxGeometry args={[0.65, 0.22, 0.35]} />
-                <GlassPhysicalMaterial type="table" opacity={0.4} />
-                {isSelected && <BoxEdges args={[0.65, 0.22, 0.35]} color={accent} scale={1.05} />}
-              </mesh>
-            </group>
+            <ProceduralFurniture room={room} isSelected={isSelected} accent={accent} onClick={handleFurnitureClick} color={color} />
           );
         }
 
@@ -1114,13 +1103,13 @@ function SceneContent() {
     Number.isFinite(r?.width) && r.width > 0 &&
     Number.isFinite(r?.length) && r.length > 0;
   const _safeRooms = ((project.floors ? project.floors[project.current_floor_index || 0].rooms : []) || []).filter(_finiteRoom);
-  const groundFloorRooms = _safeRooms.filter(room => !room.isFloor1);
-  const firstFloorRooms = _safeRooms.filter(room => room.isFloor1);
+  const groundFloorRooms = _safeRooms.filter(room => room.floorIndex === 0 || (room.floorIndex === undefined && !room.isFloor1));
+  const firstFloorRooms = _safeRooms.filter(room => room.floorIndex === 1 || room.isFloor1);
   const floorWalls = project.walls?.length
     ? project.walls
     : (project.floors?.[project.current_floor_index || 0]?.walls || []);
-  const groundFloorWalls = floorWalls.filter(wall => !wall.isFloor1);
-  const firstFloorWalls = floorWalls.filter(wall => wall.isFloor1);
+  const groundFloorWalls = floorWalls.filter(wall => wall.floorIndex === 0 || (wall.floorIndex === undefined && !wall.isFloor1));
+  const firstFloorWalls = floorWalls.filter(wall => wall.floorIndex === 1 || wall.isFloor1);
 
   // Building perimeter bounds (raw room coords) per floor — used to identify
   // exterior-facing walls so the exterior facade palette colors them.
@@ -1176,82 +1165,58 @@ function SceneContent() {
       <group position={sceneOffset}>
         <Plinth rooms={groundFloorRooms} />
 
-        {/* Ground Floor — mounted once; floor switching only toggles
-            `visible`, so geometry is never regenerated (no switch lag). */}
-        {(
-          <group position={[0, 0, 0]} visible={groundVisible}>
-            {groundFloorRooms.map(room => (
-              <HouseRoom
-                key={room.id}
-                room={room}
-                selected={room.id === selectedRoomId}
-                style={project.style}
-                accent={accentColor}
-                showLabel={viewMode !== "walk"}
-                onSelect={selectRoom}
-                transparent={showStructural}
-                buildingBounds={groundBounds}
-                exteriorColor={exteriorColor}
-                globalProperties={project.globalProperties}
-                rooms={groundFloorRooms}
-                exteriorWalls={groundFloorWalls}
-              />
-            ))}
-            <InteriorObjects rooms={groundFloorRooms} accent={accentColor} />
-            {/* Roof over the ground floor ONLY for a single-storey house. In a
-                duplex the first floor sits here, so the roof belongs on top of
-                the first floor (rendered below) — never on the ground floor. */}
-            {firstFloorRooms.length === 0 && (
-              <RoofSlab
-                rooms={groundFloorRooms}
-                visible={roofVisible}
-                accent={accentColor}
-                baseY={0}
-                isTopFloor={true}
-                indianOptions={project.indianOptions}
-              />
-            )}
-            <StructuralLayer houseCenter={houseCenter} />
-          </group>
-        )}
-
-        {/* First Floor — also mounted once; visibility toggled, not remounted. */}
-        {firstFloorRooms.length > 0 && (
-          <group position={firstFloorPos} visible={firstVisible}>
-            <InterflorSlab rooms={firstFloorRooms} />
-            {/* Plot boundary for the first floor too. offset [0,0,0] because this
-                group is already positioned; label only in compare to distinguish. */}
-            <PlotBoundary plot={project.plot} accent={accentColor} offset={[0, 0, 0]} label={isCompare ? "DUPLEX" : null} />
-            {firstFloorRooms.map(room => (
-              <HouseRoom
-                key={room.id}
-                room={room}
-                selected={room.id === selectedRoomId}
-                style={project.style}
-                accent={accentColor}
-                showLabel={viewMode !== "walk"}
-                onSelect={selectRoom}
-                transparent={showStructural}
-                buildingBounds={firstBounds}
-                exteriorColor={exteriorColor}
-                globalProperties={project.globalProperties}
-                rooms={firstFloorRooms}
-                exteriorWalls={firstFloorWalls}
-              />
-            ))}
-            <InteriorObjects rooms={firstFloorRooms} accent={accentColor} />
-            <RoofSlab
-              rooms={firstFloorRooms} // (or groundFloorRooms depending on which block you are in)
-              visible={roofVisible && !isCompare}
-              accent={accentColor}
-              baseY={0}
-              isTopFloor={true}
-              indianOptions={project.indianOptions}
-              // ADD THIS EXACT LINE TO ALL ROOF SLABS:
-              roofColor={project?.style?.roofColor || project?.style?.roofStyle} 
-          />
-          </group>
-        )}
+        {[-1, 0, 1, 2].map(floor => {
+           const getFloor = (r) => r.floorIndex !== undefined ? r.floorIndex : (r.isFloor1 ? 1 : 0);
+           const floorRooms = _safeRooms.filter(r => getFloor(r) === floor);
+           if (floorRooms.length === 0) return null;
+           
+           const isVisible = isCompare || visibleFloor === "all" || visibleFloor === `floor_${floor}`;
+           const isTopFloor = Math.max(..._safeRooms.map(getFloor)) === floor;
+           const isAllMode = visibleFloor === "all";
+           
+           const pos = isCompare 
+              ? [(compareOffsetX * (floor + 1)), 0, 0] 
+              : [0, floor * 3.5, 0];
+              
+           const fw = floorWalls.filter(w => getFloor(w) === floor);
+           const bnd = boundsOf(floorRooms);
+           
+           return (
+             <group key={`floor-${floor}`} position={pos} visible={isVisible}>
+               {floor > 0 && <InterflorSlab rooms={floorRooms} />}
+               <PlotBoundary plot={project.plot} accent={accentColor} offset={[0,0,0]} label={isCompare ? `FLOOR ${floor}` : null} />
+               
+               {floorRooms.map(room => (
+                 <HouseRoom
+                   key={room.id}
+                   room={room}
+                   selected={room.id === selectedRoomId}
+                   style={project.style}
+                   accent={accentColor}
+                   showLabel={viewMode !== "walk"}
+                   onSelect={selectRoom}
+                   transparent={showStructural || isAllMode}
+                   buildingBounds={bnd}
+                   exteriorColor={exteriorColor}
+                   globalProperties={project.globalProperties}
+                   rooms={floorRooms}
+                   exteriorWalls={fw}
+                 />
+               ))}
+               <InteriorObjects rooms={floorRooms} accent={accentColor} />
+               <RoofSlab
+                 rooms={floorRooms}
+                 visible={roofVisible && !isCompare}
+                 accent={accentColor}
+                 baseY={0}
+                 isTopFloor={isTopFloor}
+                 indianOptions={project.indianOptions}
+                 roofColor={project?.style?.roofColor || project?.style?.roofStyle}
+               />
+               {floor === 0 && <StructuralLayer houseCenter={houseCenter} />}
+             </group>
+           );
+        })}
       </group>
 
       <CameraController focusCenter={focusCenter} focusDist={focusDist} controlsRef={controlsRef} />
