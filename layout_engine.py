@@ -1264,21 +1264,11 @@ class LayoutEngine:
 
                 if side in ("left", "right"):
                     if p_rect.length > cmax_l:
-                        if side == "right":
-                            a.width += slice_w
-                        elif side == "left":
-                            a.x -= slice_w
-                            a.width += slice_w
                         p_rect.length = cmax_l
                     if p_rect.width > cmax_w:
                         p_rect.width = cmax_w
                 else:
                     if p_rect.width > cmax_w:
-                        if side == "bottom":
-                            a.length += slice_l
-                        elif side == "top":
-                            a.z -= slice_l
-                            a.length += slice_l
                         p_rect.width = cmax_w
                     if p_rect.length > cmax_l:
                         p_rect.length = cmax_l

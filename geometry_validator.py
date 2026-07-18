@@ -760,47 +760,52 @@ def _door_on_shared_boundary(
     wall between *box_owner* and *box_other*."""
     dx = float(door.get("position_x", 0))
     dz = float(door.get("position_z", 0))
+    face = door.get("wall_orientation", "").lower()
     
     # --- INCREASED TOLERANCE ---
     # Safely catch emergency rescue doors that have offset coordinates or 
     # sit across slightly disjointed AABBs due to fallback placements.
     tol = 2.5 
-    span_tol = 15.0
+    span_tol = 2.0
     gap_tol = EPSILON + 0.5
     # ---------------------------
 
     # Check each possible shared boundary:
     # owner's right == other's left
     if abs(box_owner.x_max - box_other.x_min) <= gap_tol:
-        if abs(dx - box_owner.x_max) <= tol or abs(dx - box_other.x_min) <= tol:
-            z_lo = max(box_owner.z_min, box_other.z_min)
-            z_hi = min(box_owner.z_max, box_other.z_max)
-            if z_lo - span_tol <= dz <= z_hi + span_tol:
-                return True
+        if face in ("east", "west"):
+            if abs(dx - box_owner.x_max) <= tol or abs(dx - box_other.x_min) <= tol:
+                z_lo = max(box_owner.z_min, box_other.z_min)
+                z_hi = min(box_owner.z_max, box_other.z_max)
+                if z_lo - span_tol <= dz <= z_hi + span_tol:
+                    return True
 
     # owner's left == other's right
     if abs(box_owner.x_min - box_other.x_max) <= gap_tol:
-        if abs(dx - box_owner.x_min) <= tol or abs(dx - box_other.x_max) <= tol:
-            z_lo = max(box_owner.z_min, box_other.z_min)
-            z_hi = min(box_owner.z_max, box_other.z_max)
-            if z_lo - span_tol <= dz <= z_hi + span_tol:
-                return True
+        if face in ("east", "west"):
+            if abs(dx - box_owner.x_min) <= tol or abs(dx - box_other.x_max) <= tol:
+                z_lo = max(box_owner.z_min, box_other.z_min)
+                z_hi = min(box_owner.z_max, box_other.z_max)
+                if z_lo - span_tol <= dz <= z_hi + span_tol:
+                    return True
 
     # owner's bottom == other's top
     if abs(box_owner.z_max - box_other.z_min) <= gap_tol:
-        if abs(dz - box_owner.z_max) <= tol or abs(dz - box_other.z_min) <= tol:
-            x_lo = max(box_owner.x_min, box_other.x_min)
-            x_hi = min(box_owner.x_max, box_other.x_max)
-            if x_lo - span_tol <= dx <= x_hi + span_tol:
-                return True
+        if face in ("north", "south"):
+            if abs(dz - box_owner.z_max) <= tol or abs(dz - box_other.z_min) <= tol:
+                x_lo = max(box_owner.x_min, box_other.x_min)
+                x_hi = min(box_owner.x_max, box_other.x_max)
+                if x_lo - span_tol <= dx <= x_hi + span_tol:
+                    return True
 
     # owner's top == other's bottom
     if abs(box_owner.z_min - box_other.z_max) <= gap_tol:
-        if abs(dz - box_owner.z_min) <= tol or abs(dz - box_other.z_max) <= tol:
-            x_lo = max(box_owner.x_min, box_other.x_min)
-            x_hi = min(box_owner.x_max, box_other.x_max)
-            if x_lo - span_tol <= dx <= x_hi + span_tol:
-                return True
+        if face in ("north", "south"):
+            if abs(dz - box_owner.z_min) <= tol or abs(dz - box_other.z_max) <= tol:
+                x_lo = max(box_owner.x_min, box_other.x_min)
+                x_hi = min(box_owner.x_max, box_other.x_max)
+                if x_lo - span_tol <= dx <= x_hi + span_tol:
+                    return True
 
     return False
 
