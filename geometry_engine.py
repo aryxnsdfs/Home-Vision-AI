@@ -98,10 +98,10 @@ class CPSolver:
             if "corridor" not in r_type and "hallway" not in r_type:
                 model.Add(100 * w >= 50 * l)   # w/l >= 0.5
                 model.Add(100 * w <= 200 * l)   # w/l <= 2.0
-                # Prevent small residential rooms from stretching massively
+                # Relaxed limit for residential rooms so they can still reach plot edges or connect.
                 if "wedding" not in r_type and "theater" not in r_type and min_dim < int(12.0 * scale):
-                    model.Add(w <= int(min_dim * 1.8))
-                    model.Add(l <= int(min_dim * 1.8))
+                    model.Add(w <= int(min_dim * 3.5))
+                    model.Add(l <= int(min_dim * 3.5))
             else:
                 # Corridor: at least one dimension must be narrow (<= 5 ft)
                 b1 = model.NewBoolVar(f'corr_narrow_w_{r_id}')
