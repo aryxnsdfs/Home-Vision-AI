@@ -576,6 +576,10 @@ def auto_wire_topology(room_types: list, ai_categories: dict = None) -> list:
     # 2. Determine Primary Hub for Circulation
     hub_idx = circulation_idx[0] if circulation_idx else (public_idx[0] if public_idx else 0)
 
+    # Connect the primary public room to the hub if they are distinct
+    if public_idx and hub_idx not in public_idx:
+        add_conn(public_idx[0], hub_idx, "open_flow", 10)
+
     # 3. Connect Outdoor Spaces to the Hub
     for oi in outdoor_idx:
         if hub_idx != oi:
