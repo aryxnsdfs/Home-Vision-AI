@@ -544,7 +544,7 @@ def auto_wire_topology(room_types: list, ai_categories: dict = None) -> list:
     private_set = {r.replace(" ", "_").lower() for r in ai_categories.get("private_rooms", [])}
     public_set = {r.replace(" ", "_").lower() for r in ai_categories.get("public_rooms", [])}
 
-    room_specs = [{"type": r, "connections": []} for r in room_types]
+    room_specs = [{"id": f"{r}_{i}", "type": r, "connections": []} for i, r in enumerate(room_types)]
     
     circulation_idx, outdoor_idx, wet_idx, private_idx, public_idx = [], [], [], [], []
     
@@ -572,6 +572,7 @@ def auto_wire_topology(room_types: list, ai_categories: dict = None) -> list:
     def add_conn(src_idx, target_idx, intent, weight):
         room_specs[src_idx]['connections'].append({
             "target_room": room_specs[target_idx]['type'],
+            "target_id": room_specs[target_idx]['id'],
             "intent": intent,
             "weight": weight
         })

@@ -175,12 +175,17 @@ class CPSolver:
                 if not target_type:
                     continue
 
-                # Find the first room of target_type that isn't r_id
+                # Find the target room by id if available, else by type
                 target_id = None
-                for tid, trv in room_vars.items():
-                    if trv['type'] == target_type and tid != r_id:
-                        target_id = tid
-                        break
+                expected_id = conn.get('target_id')
+                
+                if expected_id and expected_id in room_vars:
+                    target_id = expected_id
+                else:
+                    for tid, trv in room_vars.items():
+                        if trv['type'] == target_type and tid != r_id:
+                            target_id = tid
+                            break
                 if not target_id:
                     continue
 
