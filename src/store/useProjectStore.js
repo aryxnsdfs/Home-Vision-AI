@@ -871,30 +871,36 @@ export const useProjectStore = create((set, get) => ({
     set((state) => {
       // Handle both new layout_data format and fallback to legacy flat rooms array
       let rawRooms = [];
-      if (payload?.layout_data?.floor_0 || payload?.layout_data?.floor_1 || payload?.layout_data?.["floor_-1"] || payload?.layout_data?.floor_2) {
-        const addFloorRooms = (floorKey, index, isF1 = false) => {
-          if (payload.layout_data[floorKey]) {
-            rawRooms.push(...payload.layout_data[floorKey].map(r => ({ ...r, floorIndex: index, isFloor1: isF1 })));
-          }
-        };
-        addFloorRooms("floor_-1", -1);
-        addFloorRooms("floor_0", 0);
-        addFloorRooms("floor_1", 1, true);
-        addFloorRooms("floor_2", 2);
+      const layoutData = payload?.layout_data || {};
+      const floorKeys = Object.keys(layoutData)
+        .filter(key => /^floor_-?\d+$/.test(key))
+        .sort((a, b) => Number(a.slice(6)) - Number(b.slice(6)));
+      if (floorKeys.length > 0) {
+        floorKeys.forEach((floorKey) => {
+          const index = Number(floorKey.slice(6));
+          rawRooms.push(...(layoutData[floorKey] || []).map(r => ({
+            ...r,
+            floorIndex: index,
+            isFloor1: index === 1,
+          })));
+        });
       } else if (Array.isArray(payload?.rooms)) {
         rawRooms = payload.rooms;
       }
 
-      const candidateWalls = [
-        ...(payload?.layout_data?.["walls_floor_-1"]?.map(w => ({...w, floorIndex: -1})) || []),
-        ...(payload?.layout_data?.walls_floor_0?.map(w => ({...w, floorIndex: 0})) || []),
-        ...(payload?.layout_data?.walls_floor_1?.map(w => ({...w, floorIndex: 1, isFloor1: true})) || []),
-        ...(payload?.layout_data?.walls_floor_2?.map(w => ({...w, floorIndex: 2})) || [])
-      ];
+      const candidateWalls = Object.keys(layoutData)
+        .filter(key => /^walls_floor_-?\d+$/.test(key))
+        .flatMap(key => {
+          const index = Number(key.replace("walls_floor_", ""));
+          return (layoutData[key] || []).map(w => ({ ...w, floorIndex: index, isFloor1: index === 1 }));
+        });
 
       const candidateRooms = rawRooms.length > 0
         ? rawRooms.map((room, index) => ({
-            id: room.id ? `${room.id}-${index}` : `room-${index}`,
+            // Backend room IDs are stable identities used by targeted edits.
+            // Appending the array index on every response changed the ID after
+            // every modification and made the next command target stale data.
+            id: room.id ? String(room.id) : `room-${index}`,
             name: room.name || room.type.replace('_', ' ').replace(/\b\w/g, l => l.toUpperCase()) || `Room ${index + 1}`,
             type: room.type || "living_room",
             width: roundToGrid(room.width ?? room.widthFt ?? 10),
@@ -915,7 +921,8 @@ export const useProjectStore = create((set, get) => ({
               ...(room.type === 'bathroom' ? [{ type: 'water_sink', x: roundToGrid(room.x ?? 0) + 1, z: roundToGrid(room.z ?? 0) + 0.5 }, { type: 'geyser', x: roundToGrid(room.x ?? 0) + (room.width ?? 10) - 1, z: roundToGrid(room.z ?? 0) + 0.5 }] : [])
             ],
             furniture: room.furniture || [],
-            isFloor1: room.isFloor1 || false
+            floorIndex: Number.isFinite(room.floorIndex) ? room.floorIndex : (room.isFloor1 ? 1 : 0),
+            isFloor1: room.isFloor1 || room.floorIndex === 1 || false
           }))
         : null;
 
@@ -933,6 +940,35 @@ export const useProjectStore = create((set, get) => ({
       const plotWidth = layoutParams.plot_width || state.project.plot.width;
       const plotLength = layoutParams.plot_length || state.project.plot.length;
       const areaSqft = layoutParams.area_sqft || state.project.plot.areaSqft;
+      const floorLevels = floorKeys.map(key => {
+        const level = Number(key.slice(6));
+        return {
+          floor_id: `floor-${level}`,
+          level,
+          rooms: (finalRooms || []).filter(room => room.floorIndex === level),
+          walls: candidateWalls.filter(wall => wall.floorIndex === level),
+        };
+      });
+
+      const activeLevel = state.project.floors?.[state.project.current_floor_index]?.level
+        ?? state.project.current_floor_index
+        ?? 0;
+      const nextFloors = floorLevels.length > 0
+        ? floorLevels.map((returnedFloor) => {
+            const existingFloor = state.project.floors?.find((floor, index) =>
+              (floor.level ?? index) === returnedFloor.level
+            );
+            return {
+              ...(existingFloor || {}),
+              ...returnedFloor,
+              height: existingFloor?.height ?? state.project.building?.ceilingHeightFt ?? 10.5,
+            };
+          })
+        : state.project.floors;
+      const nextCurrentFloorIndex = Math.max(
+        0,
+        nextFloors.findIndex((floor, index) => (floor.level ?? index) === activeLevel)
+      );
 
       const project = {
         ...state.project,
@@ -942,14 +978,15 @@ export const useProjectStore = create((set, get) => ({
           length: plotLength,
           areaSqft: areaSqft
         },
-        layout_data: payload?.layout_data || state.project.layout_data,
+        layout_data: payload?.layout_data
+          ? { ...(state.project.layout_data || {}), ...payload.layout_data }
+          : state.project.layout_data,
+        floor_levels: floorLevels.length ? floorLevels : state.project.floor_levels || [],
+        outdoor_areas: layoutData.outdoor_areas ?? state.project.outdoor_areas ?? [],
         indianOptions: payload?.layout_data?.indianOptions || state.project.indianOptions || {},
-        floors: state.project.floors.map((f, i) => i === state.project.current_floor_index ? { 
-          ...f, 
-          rooms: finalRooms || f.rooms,
-          walls: candidateWalls.length > 0 ? candidateWalls : f.walls
-        } : f),
-        rooms: finalRooms || state.project.floors[state.project.current_floor_index].rooms, // Keep legacy rooms for backwards compatibility just in case
+        current_floor_index: nextCurrentFloorIndex,
+        floors: nextFloors,
+        rooms: nextFloors[nextCurrentFloorIndex]?.rooms || state.project.rooms || [],
         walls: candidateWalls.length > 0 ? candidateWalls : state.project.walls,
         building: {
           ...state.project.building,
@@ -970,7 +1007,8 @@ export const useProjectStore = create((set, get) => ({
       };
 
       return {
-        project: withAreaMetrics(project, project.floors[project.current_floor_index].rooms),
+        project: withAreaMetrics(project, project.floors[project.current_floor_index]?.rooms || []),
+        visibleFloor: floorLevels.length > 1 ? "all" : state.visibleFloor,
         selectedRoomId: null,
         selectedObject: null,
         uiWarning: null,

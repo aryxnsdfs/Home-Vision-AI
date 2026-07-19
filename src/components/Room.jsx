@@ -264,11 +264,11 @@ function ExpansionArrow({ position, rotation, direction, roomId, accent }) {
     );
   }
   
-  function DoorModel({ position, size, rotation, transparent }) {
+  function DoorModel({ position, size, rotation, transparent, isMain = false }) {
     return (
       <mesh position={position} rotation={rotation} raycast={() => null} castShadow={!transparent} receiveShadow>
       <boxGeometry args={size} />
-      <meshStandardMaterial color={transparent ? "#cbd5e1" : "#8b5a2b"} roughness={0.8} transparent={transparent} opacity={transparent ? 0.15 : 1} />
+      <meshStandardMaterial color={transparent ? "#cbd5e1" : (isMain ? "#4f2f24" : "#a97952")} roughness={0.8} transparent={transparent} opacity={transparent ? 0.15 : 1} />
     </mesh>
   );
 }
@@ -383,27 +383,22 @@ function wallSegmentsFor(room, bounds, wallThickness) {
       walls[orientation].openings.push({
         center, width: w, height: h, sill: 0, isWindow: false
       });
-      // Only render main doors for exterior or explicitly marked
-      if (d.is_main) {
-        doorPanes.push({
-          pos: [center, h / 2, orientation === 'north' ? 0 : bounds.length],
-          size: [w, h, wallThickness + 0.02],
-          rot: [0, 0, 0],
-          is_main: d.is_main
-        });
-      }
+      doorPanes.push({
+        pos: [center, h / 2, orientation === 'north' ? 0 : bounds.length],
+        size: [w, h, wallThickness + 0.02],
+        rot: [0, 0, 0],
+        is_main: Boolean(d.is_main)
+      });
     } else if (orientation === 'east' || orientation === 'west') {
       walls[orientation].openings.push({
         center, width: w, height: h, sill: 0, isWindow: false
       });
-      if (d.is_main) {
-        doorPanes.push({
-          pos: [orientation === 'west' ? 0 : bounds.width, h / 2, center],
-          size: [wallThickness + 0.02, h, w],
-          rot: [0, 0, 0],
-          is_main: d.is_main
-        });
-      }
+      doorPanes.push({
+        pos: [orientation === 'west' ? 0 : bounds.width, h / 2, center],
+        size: [wallThickness + 0.02, h, w],
+        rot: [0, 0, 0],
+        is_main: Boolean(d.is_main)
+      });
     }
   });
   
@@ -573,10 +568,10 @@ function splitSegmentByExteriorWalls(segment, room, walls, rooms = []) {
   exteriorIntervals.sort((a, b) => a[0] - b[0]);
   
   const merged = [];
+  const exteriorEpsilon = 0.01;
   for (const interval of exteriorIntervals) {
     const previous = merged[merged.length - 1];
-    // FIX 1: Massive 0.5 tolerance bridges all layout engine math gaps
-    if (previous && interval[0] <= previous[1] + 0.5) {
+    if (previous && interval[0] <= previous[1] + exteriorEpsilon) {
       previous[1] = Math.max(previous[1], interval[1]);
     } else {
       merged.push([...interval]);
@@ -597,8 +592,9 @@ function splitSegmentByExteriorWalls(segment, room, walls, rooms = []) {
     if (end - start <= 0.0001) return []; 
     
     const midpoint = (start + end) / 2;
-    // FIX 3: Massive 0.5 tolerance guarantees tiny slivers are painted as exterior!
-    const isExterior = merged.some(([from, to]) => midpoint >= from - 0.5 && midpoint <= to + 0.5);
+    const isExterior = merged.some(
+      ([from, to]) => midpoint >= from - exteriorEpsilon && midpoint <= to + exteriorEpsilon
+    );
     
     const child = { ...segment, _isExterior: isExterior, id: `${segment.id || segment.kind}-${index}` };
     
@@ -713,7 +709,9 @@ export default function Room({
 
   
   
-  const actualWallColor = room.wallColor || room.color || wallColor || "#f8fafc";
+  // `room.color` is an accent/selection color, never an architectural wall
+  // finish. Using it here caused the exterior paint to bleed through rooms.
+  const actualWallColor = room.wallColor || wallColor || "#f8fafc";
   const actualFloorColor = room.floorColor || floor.color || "#e2e8f0";
 
   useEffect(() => {
@@ -798,10 +796,12 @@ export default function Room({
 
     return {
       interior: [bm, bm, bm, bm, bm, bm],
-      east:  [em, bm, em, em, em, em],
-      west:  [bm, em, em, em, em, em],
-      south: [em, em, em, em, em, bm],
-      north: [em, em, em, em, bm, em],
+      // BoxGeometry groups: +X, -X, +Y, -Y, +Z, -Z. Paint only the outward
+      // face; wall ends and the inward face remain the interior finish.
+      east:  [em, bm, bm, bm, bm, bm],
+      west:  [bm, em, bm, bm, bm, bm],
+      south: [bm, bm, bm, bm, em, bm],
+      north: [bm, bm, bm, bm, bm, em],
       baseMat: bm,  // Added so we can access it below
       extMat: em    // Added so we can access it below
     };
@@ -910,46 +910,16 @@ export default function Room({
           let segmentMats = [...matArrays.interior];
 
           if (isExt) {
-            if (orientation === 'north') segmentMats = [...matArrays.north];
-            else if (orientation === 'south') segmentMats = [...matArrays.south];
-            else if (orientation === 'west') segmentMats = [...matArrays.west];
-            else if (orientation === 'east') segmentMats = [...matArrays.east];
+            // Paint only the outward facade face. The inward face remains the
+            // room's interior finish, preventing exterior paint from leaking
+            // into rooms when viewed from above.
+            segmentMats = [...(matArrays[orientation] || matArrays.interior)];
           }
 
           const customMat = customMaterials[id] || customMaterials[kind];
           if (customMat) {
             segmentMats = segmentMats.map(m => m === matArrays.baseMat ? customMat : m);
           }
-
-          // 2. Calculate global bounds safely from the existing `rooms` prop
-          let bMinX = -9999, bMaxX = 9999, bMinZ = -9999, bMaxZ = 9999;
-          if (rooms && rooms.length > 0) {
-            bMinX = Math.min(...rooms.map(r => (r.x - 12) * SCALE));
-            bMaxX = Math.max(...rooms.map(r => ((r.x - 12) + r.width) * SCALE));
-            bMinZ = Math.min(...rooms.map(r => (r.z - 10) * SCALE));
-            bMaxZ = Math.max(...rooms.map(r => ((r.z - 10) + r.length) * SCALE));
-          }
-
-          // 3. Absolute World Collision: Does this specific face touch the global perimeter?
-          const sMinX = bounds.x + px - overSx / 2;
-          const sMaxX = bounds.x + px + overSx / 2;
-          const sMinZ = bounds.z + pz - overSz / 2;
-          const sMaxZ = bounds.z + pz + overSz / 2;
-
-          const TOL = 0.05;
-          const isEastEdge = Math.abs(sMaxX - bMaxX) < TOL;
-          const isWestEdge = Math.abs(sMinX - bMinX) < TOL;
-          const isSouthEdge = Math.abs(sMaxZ - bMaxZ) < TOL;
-          const isNorthEdge = Math.abs(sMinZ - bMinZ) < TOL;
-
-          // 4. THE FIX: Force paint the specific face Mustard if it pokes out to the global edge
-          // Faces: [0:East, 1:West, 2:Top, 3:Bottom, 4:South, 5:North]
-          if (isEastEdge)  segmentMats[0] = matArrays.extMat;
-          if (isWestEdge)  segmentMats[1] = matArrays.extMat;
-          if (isSouthEdge) segmentMats[4] = matArrays.extMat;
-          if (isNorthEdge) segmentMats[5] = matArrays.extMat;
-
-
 
           return (
             <React.Fragment key={`${id || kind}-${idx}`}>
@@ -989,12 +959,13 @@ export default function Room({
       )}
 
       {/* ── Main Doors ── */}
-      {doorPanes.map((pane, idx) => (
+      {doorPanes.filter((pane) => pane.is_main).map((pane, idx) => (
         <DoorModel
           key={`door-${idx}`}
           position={pane.pos}
           size={pane.size}
           rotation={pane.rot}
+          isMain={pane.is_main}
         />
       ))}
 

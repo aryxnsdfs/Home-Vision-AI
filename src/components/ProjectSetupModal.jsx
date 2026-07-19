@@ -185,51 +185,7 @@ function ColorSelectionPanel({ colors, setColors }) {
           </div>
         </div>
 
-        <div>
-          <label className="text-xs font-semibold text-neutral-400 uppercase tracking-wider mb-2 block">Furniture Palette</label>
-          <div className="grid grid-cols-4 gap-2">
-            {FURNITURE_COLORS.map(c => (
-              <button
-                key={c.id}
-                type="button"
-                onClick={() => setColors(p => ({ ...p, furniture: c.id }))}
-                className={`group relative h-10 rounded-lg border transition-all ${colors.furniture === c.id ? 'border-orange-400 ring-2 ring-orange-400/20' : 'border-white/10 hover:border-white/40'}`}
-                style={{ backgroundColor: c.hex }}
-                title={c.name}
-              >
-                {colors.furniture === c.id && <CheckCircle size={14} className="absolute -top-1.5 -right-1.5 text-orange-400 bg-black rounded-full" />}
-              </button>
-            ))}
-            <label className={`relative h-10 rounded-lg border transition-all cursor-pointer flex items-center justify-center ${colors.furniture && !FURNITURE_COLORS.find(c => c.id === colors.furniture) ? 'border-orange-400 ring-2 ring-orange-400/20' : 'border-white/10 hover:border-white/40'}`} style={colors.furniture && !FURNITURE_COLORS.find(c => c.id === colors.furniture) ? { backgroundColor: colors.furniture } : { backgroundColor: '#333' }} title="Custom Color">
-               <input type="color" className="absolute opacity-0 w-full h-full cursor-pointer" onChange={(e) => setColors(p => ({ ...p, furniture: e.target.value }))} />
-               <span className="text-[10px] font-bold text-neutral-300 pointer-events-none drop-shadow-md">RGBA</span>
-               {colors.furniture && !FURNITURE_COLORS.find(c => c.id === colors.furniture) && <CheckCircle size={14} className="absolute -top-1.5 -right-1.5 text-orange-400 bg-black rounded-full" />}
-            </label>
-          </div>
-        </div>
 
-        <div>
-          <label className="text-xs font-semibold text-neutral-400 uppercase tracking-wider mb-2 block">Floor Material Palette</label>
-          <div className="grid grid-cols-4 gap-2">
-            {FLOOR_COLORS.map(c => (
-              <button
-                key={c.id}
-                type="button"
-                onClick={() => setColors(p => ({ ...p, floor: c.id }))}
-                className={`group relative h-10 rounded-lg border transition-all ${colors.floor === c.id ? 'border-teal-400 ring-2 ring-teal-400/20' : 'border-white/10 hover:border-white/40'}`}
-                style={{ backgroundColor: c.hex }}
-                title={c.name}
-              >
-                {colors.floor === c.id && <CheckCircle size={14} className="absolute -top-1.5 -right-1.5 text-teal-400 bg-black rounded-full" />}
-              </button>
-            ))}
-            <label className={`relative h-10 rounded-lg border transition-all cursor-pointer flex items-center justify-center ${colors.floor && !FLOOR_COLORS.find(c => c.id === colors.floor) ? 'border-teal-400 ring-2 ring-teal-400/20' : 'border-white/10 hover:border-white/40'}`} style={colors.floor && !FLOOR_COLORS.find(c => c.id === colors.floor) ? { backgroundColor: colors.floor } : { backgroundColor: '#333' }} title="Custom Color">
-               <input type="color" className="absolute opacity-0 w-full h-full cursor-pointer" onChange={(e) => setColors(p => ({ ...p, floor: e.target.value }))} />
-               <span className="text-[10px] font-bold text-neutral-300 pointer-events-none drop-shadow-md">RGBA</span>
-               {colors.floor && !FLOOR_COLORS.find(c => c.id === colors.floor) && <CheckCircle size={14} className="absolute -top-1.5 -right-1.5 text-teal-400 bg-black rounded-full" />}
-            </label>
-          </div>
-        </div>
       </div>
     </div>
   );
@@ -404,6 +360,18 @@ function FloorsSelector({ floors, setFloors }) {
           Ground + First Floor
           <span className="block text-[10px] font-normal opacity-60">Duplex</span>
         </button>
+        <button
+          type="button"
+          onClick={() => setFloors(3)}
+          className={`flex-1 py-3 rounded-xl border text-sm font-semibold transition-all ${
+            floors === 3
+              ? 'bg-emerald-500/20 border-emerald-500 text-emerald-300'
+              : 'bg-black/50 border-white/10 text-neutral-400 hover:bg-white/10 hover:text-white'
+          }`}
+        >
+          Ground + First + Second
+          <span className="block text-[10px] font-normal opacity-60">Triplex</span>
+        </button>
       </div>
     </div>
   );
@@ -523,7 +491,7 @@ export default function ProjectSetupModal() {
             {/* ── Home Screen ── */}
             {!mode && (
               <motion.div key="menu" initial={{ opacity: 0, x: -16 }} animate={{ opacity: 1, x: 0 }} exit={{ opacity: 0, x: -16 }}>
-                <div className="grid grid-cols-1 md:grid-cols-3 gap-5">
+                <div className="grid grid-cols-1 md:grid-cols-2 gap-5">
                   <button
                     onClick={() => setMode('ai')}
                     className="relative flex flex-col items-center text-center p-8 rounded-2xl bg-gradient-to-br from-amber-500/10 to-purple-600/10 border border-amber-500/30 hover:border-amber-400/60 hover:from-amber-500/15 hover:to-purple-600/15 transition-all group overflow-hidden"
@@ -536,17 +504,6 @@ export default function ProjectSetupModal() {
                     </div>
                     <h3 className="text-xl font-bold mb-2 text-amber-100">Generate with AI</h3>
                     <p className="text-sm text-neutral-400">Describe your dream home in plain English or Hindi.</p>
-                  </button>
-
-                  <button
-                    onClick={() => setMode('template')}
-                    className="flex flex-col items-center text-center p-8 rounded-2xl bg-white/[0.04] border border-white/[0.08] hover:border-blue-500/40 hover:bg-blue-500/[0.07] transition-all group"
-                  >
-                    <div className="w-16 h-16 rounded-full bg-blue-500/10 flex items-center justify-center mb-4 group-hover:scale-110 transition-transform">
-                      <Layout size={30} className="text-blue-400" />
-                    </div>
-                    <h3 className="text-xl font-bold mb-2 text-blue-100">Select Template</h3>
-                    <p className="text-sm text-neutral-400">Choose from predefined standard architectural layouts.</p>
                   </button>
 
                   <button
@@ -624,38 +581,6 @@ export default function ProjectSetupModal() {
               </motion.div>
             )}
 
-            {/* ── Select Template ── */}
-            {mode === 'template' && (
-              <motion.div key="template" initial={{ opacity: 0, x: 20 }} animate={{ opacity: 1, x: 0 }} exit={{ opacity: 0, x: 20 }} className="space-y-6">
-                <div className="grid grid-cols-2 md:grid-cols-5 gap-3">
-                  {['1BHK', '2BHK', '3BHK', '4BHK', 'OPENKITCHEN'].map(t => (
-                    <button key={t} onClick={() => setTemplate(t)}
-                      className={`p-4 rounded-xl border transition-all text-center font-semibold ${
-                        template === t ? 'bg-blue-500/20 border-blue-500 text-white' : 'bg-white/[0.04] border-white/10 text-neutral-400 hover:bg-white/10 hover:text-white'
-                      }`}>
-                      {t}
-                    </button>
-                  ))}
-                </div>
-
-                <div className="grid grid-cols-1 md:grid-cols-2 gap-5">
-                  <PlotSizeSelector inputUnit={inputUnit} setInputUnit={setInputUnit} width={width} setWidth={setWidth}
-                    length={length} setLength={setLength} inputArea={inputArea} setInputArea={setInputArea} color="blue" />
-                  <FloorsSelector floors={floors} setFloors={setFloors} />
-                </div>
-
-                <ColorSelectionPanel colors={colorPrefs} setColors={setColorPrefs} />
-                <IndianOptionsPanel options={indianOptions} setOptions={setIndianOptions} />
-
-                <div className="flex justify-end pt-4">
-                  <button onClick={handleGenerateTemplate} disabled={loading}
-                    className="flex items-center gap-2 bg-blue-500 hover:bg-blue-600 text-white px-7 py-3.5 rounded-xl font-semibold transition-colors disabled:opacity-50">
-                    {loading ? <Loader2 className="animate-spin" size={18} /> : 'Generate Layout'}
-                    {!loading && <ArrowRight size={18} />}
-                  </button>
-                </div>
-              </motion.div>
-            )}
 
             {/* ── Custom Builder ── */}
             {mode === 'custom' && (

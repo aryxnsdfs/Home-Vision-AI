@@ -126,6 +126,92 @@ class HouseDesignRequest(BaseModel):
     front_orientation: str = Field(default="north", description="The plot's street-facing direction")
     facing: str = Field(default="", description="North, South, East, West or empty")
 
+class GeneratedAsset(BaseModel):
+    type: str = Field(description="Semantic low-poly asset name")
+    width: float = Field(default=1.0, ge=0.1, le=30.0)
+    length: float = Field(default=1.0, ge=0.1, le=30.0)
+    height: float = Field(default=0.8, ge=0.05, le=20.0)
+    x: float = Field(default=0.0, description="Local X position in feet")
+    z: float = Field(default=0.0, description="Local Z position in feet")
+    rotation: float = 0.0
+
+
+class GeneratedRoomAssets(BaseModel):
+    room_type: str
+    assets: List[GeneratedAsset] = Field(default_factory=list)
+
+
+class GeneratedFurnitureResponse(BaseModel):
+    rooms: List[GeneratedRoomAssets] = Field(default_factory=list)
+
+
+_FURNITURE_CACHE: Dict[str, Dict[str, List[Dict[str, Any]]]] = {}
+
+
+def generate_furniture_manifest(room_specs: List[Dict[str, Any]], user_prompt: str = "") -> Dict[str, List[Dict[str, Any]]]:
+    """Ask Gemini for measured, room-aware assets for any room type.
+
+    Room names are deliberately unbounded here.  The renderer only needs a
+    semantic asset name and measured footprint, so a new user-created room
+    does not require a code change or a catalog entry.
+    """
+    if not room_specs or not GEMINI_API_KEY:
+        return {}
+    normalized = []
+    for room in room_specs:
+        normalized.append({
+            "room_type": str(room.get("type", "room")),
+            "width": round(float(room.get("width", 10.0)), 2),
+            "length": round(float(room.get("length", 10.0)), 2),
+        })
+    cache_key = json.dumps({"rooms": normalized, "request": (user_prompt or "").strip().lower()}, sort_keys=True)
+    if cache_key in _FURNITURE_CACHE:
+        return _FURNITURE_CACHE[cache_key]
+    try:
+        from google import genai
+        client = genai.Client(api_key=GEMINI_API_KEY)
+        system_prompt = """You are a professional interior-space planner for a low-poly 3D home generator.
+For EVERY supplied room, create a complete context-aware furniture and object manifest.
+Room types are open-ended; infer the correct contents from the room name and user request.
+Use semantic asset names, measured footprints in feet, and local x/z positions inside each room.
+Keep a clear walking path to doors, keep every asset inside its room, avoid overlaps, and use only
+one or two essential assets per room. For example, a gym should use recognizable equipment such
+as a treadmill and exercise bike, not generic boxes. Do not invent rooms and do not omit any
+supplied room. Return only JSON matching the schema."""
+        contents = json.dumps({"user_request": user_prompt, "rooms": normalized})
+        response = client.models.generate_content(
+            model="gemini-2.5-flash",
+            contents=contents,
+            config=genai.types.GenerateContentConfig(
+                system_instruction=system_prompt,
+                response_mime_type="application/json",
+                response_schema=GeneratedFurnitureResponse,
+                temperature=0.2,
+            ),
+        )
+        parsed = json.loads(response.text)
+        result: Dict[str, List[Dict[str, Any]]] = {}
+        for room in parsed.get("rooms", []):
+            room_type = str(room.get("room_type", "")).strip().lower().replace(" ", "_")
+            if not room_type:
+                continue
+            assets = []
+            # The renderer deliberately displays a small, readable set.  This
+            # also limits Gemini output before collision fitting.
+            for asset in room.get("assets", [])[:2]:
+                item = dict(asset)
+                item["type"] = str(item.get("type", "asset")).strip().lower().replace(" ", "_")
+                assets.append(item)
+            if assets:
+                result[room_type] = assets
+        _FURNITURE_CACHE[cache_key] = result
+        logger.info("[GEMINI] Generated furniture manifests for %d rooms", len(result))
+        return result
+    except Exception as exc:
+        logger.warning("[GEMINI] Furniture manifest unavailable; using deterministic fallback: %s", exc)
+        return {}
+
+
 class ProgramRoom(BaseModel):
     room_type: str = Field(description="e.g. master_bedroom, living_room, kitchen, corridor, bathroom")
     min_width: float = Field(description="Minimum width in feet")
@@ -423,7 +509,12 @@ class QueryRouter:
             from google import genai
             client = genai.Client(api_key=GEMINI_API_KEY)
             
-            sys_prompt = f"You are a strict JSON translation engine for architectural layouts. ROOMS: {list(vocabulary.get('rooms', {}).keys())}"
+            sys_prompt = """You are a strict JSON translation engine for architectural layouts.
+Extract EVERY room, indoor space, outdoor area, floor, and custom facility the user requests.
+Room names are open-ended: do not limit, replace, omit, or reject a space because it is not in a vocabulary.
+Preserve unfamiliar names as concise snake_case labels in target_rooms (for example music_studio, art_gallery,
+recording_room, robotics_lab, library, or any other user-created space). Do not confuse furniture or materials
+with rooms. Return only the requested spaces and all requested spaces."""
             if current_floorplan:
                 user_content = f"Current State: {json.dumps(current_floorplan)}\nRequest: {user_prompt}"
             else:
@@ -453,8 +544,9 @@ class QueryRouter:
         
         system_prompt = f"""You are a strict JSON translation engine for architectural layouts.
 Read the user's architectural request.
-Map styles, materials, and rooms ONLY to these exact words:
-ROOMS: {known_rooms}
+Map known styles and materials to the supplied lists, but treat rooms and facilities as an open-ended vocabulary.
+Preserve every requested unfamiliar room/facility as a concise snake_case string in target_rooms.
+Never drop a room because it is not listed below.
 STYLES: {known_styles}
 MATERIALS: {known_materials}
 "room_colors": [{"room": str, "color": str, "surface": "wall" | "floor" | "furniture" | "exterior" | "roof"}],
@@ -501,6 +593,12 @@ def extract_keywords_groq(user_prompt: str, vocabulary: dict) -> Dict[str, Any]:
     target_rooms = result.get('target_rooms', [])
     if isinstance(target_rooms, list):
         for rtype in target_rooms:
+            # Gemini may number repeated rooms (bedroom_1, bathroom_2).
+            # Preserve multiplicity while canonicalizing the architectural
+            # type so bedroom intelligence and duplex distribution apply.
+            normalized = str(rtype).strip().lower().replace(" ", "_")
+            normalized = re.sub(r"^(bedroom|bathroom|kitchen|living_room|dining_room|study_room|corridor|foyer|pooja_room|staircase)[_-]\d+$", r"\1", normalized)
+            rtype = normalized
             if rtype in singleton_types:
                 # Allow duplicates only if explicitly requested
                 rtype_clean = rtype.replace('_', ' ')
@@ -523,7 +621,13 @@ def reason_modifications_deepseek(user_prompt: str, current_floorplan: dict) -> 
     return QueryRouter.route(user_prompt, {}, current_floorplan)
 
 def auto_wire_topology(room_types: list, ai_categories: dict = None) -> list:
-    """Takes a list of room strings and wires connections using AI-provided categories."""
+    """Wire an open-ended room program using stable instance IDs.
+
+    Repeated room types (three bedrooms, two ensuites) cannot be connected by
+    type alone: every edge would otherwise resolve to the first matching room.
+    Dict inputs retain relationship metadata while string inputs remain
+    backwards compatible.
+    """
     if not room_types:
         return []
         
@@ -536,13 +640,44 @@ def auto_wire_topology(room_types: list, ai_categories: dict = None) -> list:
     private_set = {r.replace(" ", "_").lower() for r in ai_categories.get("private_rooms", [])}
     public_set = {r.replace(" ", "_").lower() for r in ai_categories.get("public_rooms", [])}
 
-    room_specs = [{"type": r, "connections": []} for r in room_types]
+    # The AI category lists are optional.  Never fall back to a sequential
+    # chain when they are absent: a bedroom/bathroom must not become a hallway
+    # between unrelated rooms.  These conservative architectural defaults are
+    # only used for missing AI classifications.
+    outdoor_set.update({"balcony", "courtyard", "garden", "parking", "portico", "veranda", "terrace", "flat_terrace"})
+    wet_set.update({"bathroom", "powder_room", "toilet", "washroom", "laundry"})
+    circ_set.update({"corridor", "hallway", "foyer", "staircase", "passage"})
+    private_set.update({"bedroom", "master_bedroom", "elderly_suite", "study_room", "office", "gym"})
+
+    room_specs = []
+    type_counts: Dict[str, int] = {}
+    for raw in room_types:
+        source = dict(raw) if isinstance(raw, dict) else {"type": raw}
+        room_type = str(source.get("type", "room")).strip().lower().replace(" ", "_")
+        type_counts[room_type] = type_counts.get(room_type, 0) + 1
+        source["type"] = room_type
+        source["id"] = str(source.get("id") or f"{room_type}-{type_counts[room_type]}")
+        source["connections"] = []
+        room_specs.append(source)
+
+    # A larger home requires a public circulation spine.  This is a geometry
+    # requirement, not a room-name vocabulary rule, and prevents bedrooms from
+    # becoming passages between unrelated rooms.
+    if len(room_specs) > 4 and not any(
+        spec["type"] in circ_set for spec in room_specs
+    ):
+        room_specs.append({
+            "type": "corridor", "id": "corridor-1", "connections": [],
+            "role": {"traffic": "high", "can_be_passage": True},
+        })
     
     circulation_idx, outdoor_idx, wet_idx, private_idx, public_idx = [], [], [], [], []
     
     # Phase 1: Pure AI Classification & Role Assignment
     for i, r in enumerate(room_specs):
-        rt = r['type'].lower()
+        rt = r['type'].replace(" ", "_").lower()
+        is_bedroom = "bedroom" in rt or rt in {"bed", "master_bed"}
+        is_bathroom = any(token in rt for token in ("bath", "toilet", "washroom", "powder"))
         
         if rt in outdoor_set:
             outdoor_idx.append(i)
@@ -550,10 +685,10 @@ def auto_wire_topology(room_types: list, ai_categories: dict = None) -> list:
         elif rt in circ_set:
             circulation_idx.append(i)
             r['role'] = {'traffic': 'high', 'can_be_passage': True}
-        elif rt in private_set:
+        elif rt in private_set or is_bedroom:
             private_idx.append(i)
             r['role'] = {'traffic': 'low', 'can_be_passage': False}
-        elif rt in wet_set:
+        elif rt in wet_set or is_bathroom:
             wet_idx.append(i)
             r['role'] = {'traffic': 'low', 'can_be_passage': False}
         else:
@@ -564,6 +699,7 @@ def auto_wire_topology(room_types: list, ai_categories: dict = None) -> list:
     def add_conn(src_idx, target_idx, intent, weight):
         room_specs[src_idx]['connections'].append({
             "target_room": room_specs[target_idx]['type'],
+            "target_room_id": room_specs[target_idx]['id'],
             "intent": intent,
             "weight": weight
         })
@@ -575,6 +711,17 @@ def auto_wire_topology(room_types: list, ai_categories: dict = None) -> list:
 
     # 2. Determine Primary Hub for Circulation
     hub_idx = circulation_idx[0] if circulation_idx else (public_idx[0] if public_idx else 0)
+
+    # The circulation spine itself must open into the public entry zone.
+    if circulation_idx and public_idx and hub_idx != public_idx[0]:
+        add_conn(hub_idx, public_idx[0], "standard", 20)
+
+    # Vertical circulation is never a bedroom passage. A staircase must open
+    # to the circulation hub (corridor/foyer/living), which also guides the
+    # geometric solver to place it beside public access.
+    for ci in circulation_idx:
+        if ci != hub_idx and room_specs[ci]["type"] in {"staircase", "stairwell"}:
+            add_conn(ci, hub_idx, "standard", 20)
 
     # 3. Connect Outdoor Spaces to the Hub
     for oi in outdoor_idx:
@@ -589,11 +736,25 @@ def auto_wire_topology(room_types: list, ai_categories: dict = None) -> list:
     # 5. Distribute Wet Zones (Bathrooms)
     available_baths = list(wet_idx)
     
-    # En-suite priority: Give a bath to each private room first
-    for pi in private_idx:
-        if available_baths:
-            bath_i = available_baths.pop(0)
-            add_conn(pi, bath_i, "standard", 10)
+    bedroom_idx = [
+        index for index in private_idx
+        if "bedroom" in room_specs[index]["type"]
+    ]
+    attached_baths = [
+        index for index in available_baths
+        if room_specs[index].get("bathroom_role") == "attached"
+        or "attached" in room_specs[index]["type"]
+        or "ensuite" in room_specs[index]["type"]
+    ]
+    common_baths = [index for index in available_baths if index not in attached_baths]
+
+    # Pair each requested ensuite with one distinct bedroom using stable IDs.
+    for bedroom_i, bath_i in zip(bedroom_idx, attached_baths):
+        add_conn(bedroom_i, bath_i, "standard", 20)
+
+    # Generic bathrooms become ensuite only when the program explicitly marks
+    # them as attached; otherwise they remain common and open to circulation.
+    available_baths = common_baths
 
     # Remaining wet zones act as common baths connected to the hub
     for bath_i in available_baths:

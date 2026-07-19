@@ -61,6 +61,10 @@ ROOMS: dict[str, list[str]] = {
         "library", "reading room", "workspace", "den", "studio",
         "computer room", "work from home room",
     ],
+    "gym": [
+        "gym", "home gym", "fitness room", "fitness center", "fitness centre",
+        "workout room", "exercise room", "training room", "health club",
+    ],
     "pooja room": [
         "pooja room", "puja room", "prayer room", "mandir", "temple room",
         "pooja", "puja", "worship room", "meditation room", "shrine",

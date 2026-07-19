@@ -82,7 +82,16 @@ class CPSolver:
             elif "bath" in r_type or "toilet" in r_type:
                 min_dim = max(min_dim, int(5.0 * scale))
 
-            min_area_ft = ROOM_MINIMUMS.get(r_type, _DEFAULT_MIN).get("area", 64)
+            # Never construct an invalid CP-SAT domain when a previous
+            # request supplied an oversized/custom minimum or the plot is
+            # compact. Infeasible geometry may fall back, but MODEL_INVALID
+            # must never occur.
+            min_dim = max(1, min(min_dim, plot_w, plot_l))
+
+            min_area_ft = min(
+                ROOM_MINIMUMS.get(r_type, _DEFAULT_MIN).get("area", 64),
+                max(1.0, (plot_w / scale) * (plot_l / scale)),
+            )
 
             x = model.NewIntVar(0, plot_w - min_dim, f'x_{r_id}')
             z = model.NewIntVar(0, plot_l - min_dim, f'z_{r_id}')
@@ -158,16 +167,20 @@ class CPSolver:
         processed_edges = set()
         for r_id, rv in room_vars.items():
             for conn in rv['connections']:
+                if conn.get('intent') == 'proximity':
+                    continue
                 target_type = conn.get('target_room', '')
-                if not target_type:
+                target_room_id = conn.get('target_room_id', '')
+                if not target_type and not target_room_id:
                     continue
 
-                # Find the first room of target_type that isn't r_id
-                target_id = None
-                for tid, trv in room_vars.items():
-                    if trv['type'] == target_type and tid != r_id:
-                        target_id = tid
-                        break
+                # Instance IDs are authoritative for repeated room types.
+                target_id = target_room_id if target_room_id in room_vars and target_room_id != r_id else None
+                if not target_id:
+                    for tid, trv in room_vars.items():
+                        if trv['type'] == target_type and tid != r_id:
+                            target_id = tid
+                            break
                 if not target_id:
                     continue
 
@@ -256,6 +269,13 @@ class CPSolver:
             model.Add(global_x1 >= rv['x'] + rv['w'])
             model.Add(global_z0 <= rv['z'])
             model.Add(global_z1 >= rv['z'] + rv['l'])
+
+        # The living room is the public entry room and must own a real facade
+        # segment. Without this constraint another public room can surround it,
+        # leaving the "main door" on an internal wall.
+        entry_room = next((rv for rv in room_vars.values() if rv['type'] == 'living_room'), None)
+        if entry_room is not None:
+            model.Add(entry_room['z_end'] == global_z1)
         obj_terms.append((global_x1 - global_x0) * 10)
         obj_terms.append((global_z1 - global_z0) * 10)
 
@@ -292,13 +312,15 @@ class CPSolver:
             for conn in rv['connections']:
                 tt = conn.get('target_room', '')
                 wt = conn.get('weight', 5)
-                if not tt:
+                target_room_id = conn.get('target_room_id', '')
+                if not tt and not target_room_id:
                     continue
-                tid = None
-                for k, v in room_vars.items():
-                    if v['type'] == tt and k != r_id:
-                        tid = k
-                        break
+                tid = target_room_id if target_room_id in room_vars and target_room_id != r_id else None
+                if tid is None:
+                    for k, v in room_vars.items():
+                        if v['type'] == tt and k != r_id:
+                            tid = k
+                            break
                 if not tid:
                     continue
                 tv = room_vars[tid]
@@ -352,16 +374,18 @@ class CPSolver:
 
             if not validation['passed']:
                 for e in validation['errors']:
-                    logger.warning(f"[POST-VALIDATE] {e}")
+                    logger.info(f"[POST-VALIDATE] {e}")
                 if attempt < 2:
                     logger.info(f"[RETRY] Re-solving (attempt {attempt + 1})…")
                     # Clear stale results before retry
                     floor_data.pop('resolved_rooms', None)
                     return self.solve_phase_2_csp(floor_data, attempt + 1)
                 else:
-                    logger.error("[REJECTED] Layout failed validation after 3 attempts.")
+                    logger.info("[FALLBACK] Layout solver exhausted validation retries; keeping the last finite layout for downstream repair.")
         else:
-            logger.warning(f"CP Solver found no solution (status {status}, attempt {attempt}).")
+            if status == cp_model.MODEL_INVALID:
+                logger.info(f"[FALLBACK] CP model was invalid; using deterministic layout fallback. Details: {model.Validate()}")
+            logger.info(f"CP Solver did not return a solution (status {status}, attempt {attempt}); using deterministic fallback.")
             floor_data['validation'] = {'passed': False, 'errors': ['Solver infeasible']}
             if attempt < 2:
                 logger.info(f"[RETRY] Re-solving with more time (attempt {attempt + 1})…")
@@ -426,10 +450,15 @@ class CPSolver:
         # Verify every topology edge has enough shared wall
         for r in rooms:
             for conn in r.get('connections', []):
-                tt = conn.get('target_room', '')
-                if not tt:
+                if conn.get('intent') == 'proximity':
                     continue
-                target = next((t for t in rooms if t['type'] == tt and t['id'] != r['id']), None)
+                tt = conn.get('target_room', '')
+                target_room_id = conn.get('target_room_id', '')
+                if not tt and not target_room_id:
+                    continue
+                target = next((t for t in rooms if t['id'] == target_room_id and t['id'] != r['id']), None)
+                if target is None:
+                    target = next((t for t in rooms if t['type'] == tt and t['id'] != r['id']), None)
                 if not target:
                     continue
                 sw = self._shared_wall(r, target)

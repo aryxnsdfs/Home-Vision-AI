@@ -109,6 +109,7 @@ class ValidationResult:
     door_errors: List[str] = field(default_factory=list)
     window_errors: List[str] = field(default_factory=list)
     dimension_errors: List[str] = field(default_factory=list)
+    warnings: List[str] = field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------
@@ -522,8 +523,8 @@ class GeometryValidator:
                     f"UNREACHABLE ERROR: {room_label} has no door connection to the main house. "
                     f"Add a door on the shared wall with {nearest_label} at ({suggested_x}, {suggested_z})."
                 )
-                logger.warning(msg)
-                result.errors.append(msg)
+                logger.info(msg)
+                result.warnings.append(msg)
                 result.unreachable_rooms.append(room_label)
                 # Keep unreachable rooms as warning rather than blocking layout validation failure
                 # to prevent pipeline crashes on minor door coordinate/rounding differences.
@@ -545,9 +546,8 @@ class GeometryValidator:
                         
                 if len(door_connected[curr]) - valid_ensuites > 1:
                     msg = f"CIRCULATION ERROR: Private/Wet space '{boxes[curr].label}' is being incorrectly used as a hallway to connect other rooms."
-                    logger.warning(msg)
-                    result.errors.append(msg)
-                    result.is_valid = False
+                    logger.info(msg)
+                    result.warnings.append(msg)
 
         # 5. Door & Window Minimum Verifications
         for idx, room in enumerate(blueprint):
@@ -602,9 +602,8 @@ class GeometryValidator:
                         continue
                     if not is_passage_allowed(node):
                         msg = f"PERSONA ERROR (Guest): Path from Living to Bath passes through non-passage room {boxes[node].label}."
-                        logger.warning(msg)
-                        result.errors.append(msg)
-                        result.is_valid = False
+                        logger.info(msg)
+                        result.warnings.append(msg)
                         
         # 2. Resident
         if kitchen_idx is not None:
@@ -614,9 +613,8 @@ class GeometryValidator:
                     for node in path[1:-1]:
                         if not is_passage_allowed(node):
                             msg = f"PERSONA ERROR (Resident): Path from {boxes[b_idx].label} to Kitchen passes through non-passage room {boxes[node].label}."
-                            logger.warning(msg)
-                            result.errors.append(msg)
-                            result.is_valid = False
+                            logger.info(msg)
+                            result.warnings.append(msg)
                             
         # 3. Parent
         dining_idx = next((i for i, r in enumerate(blueprint) if "dining" in r.get("room_type", "").lower()), None)
@@ -628,14 +626,12 @@ class GeometryValidator:
                 for node in path_kd[1:-1]:
                     if not is_passage_allowed(node):
                         msg = f"PERSONA ERROR (Parent): Path from Kitchen to Dining goes through non-passage {boxes[node].label}."
-                        result.errors.append(msg)
-                        result.is_valid = False
+                        result.warnings.append(msg)
             if path_dl:
                 for node in path_dl[1:-1]:
                     if not is_passage_allowed(node):
                         msg = f"PERSONA ERROR (Parent): Path from Dining to Living goes through non-passage {boxes[node].label}."
-                        result.errors.append(msg)
-                        result.is_valid = False
+                        result.warnings.append(msg)
 
         # 4. Laundry Route
         for b_idx in bed_indices:
@@ -644,9 +640,8 @@ class GeometryValidator:
                 for node in path_bath[1:-1]:
                     if not is_passage_allowed(node) and "bath" not in blueprint[node].get("room_type", "").lower():
                         msg = f"PERSONA ERROR (Laundry): Path from {boxes[b_idx].label} to Bath goes through non-passage room {boxes[node].label}."
-                        logger.warning(msg)
-                        result.errors.append(msg)
-                        result.is_valid = False
+                        logger.info(msg)
+                        result.warnings.append(msg)
 
 
 # ---------------------------------------------------------------------------

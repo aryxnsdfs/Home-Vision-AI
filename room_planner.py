@@ -57,6 +57,7 @@ ROOM_ZONES: Dict[str, str] = {
     "bedroom": ZONE_PRIVATE,
     "elderly_suite": ZONE_PRIVATE,
     "study_room": ZONE_PRIVATE,
+    "gym": ZONE_PRIVATE,
     "bathroom": ZONE_PRIVATE,      # attached bathrooms
     # Service Zone
     "utility": ZONE_SERVICE,
@@ -121,6 +122,7 @@ CORE_TYPES = {
     "living_room", "kitchen", "bedroom", "master_bedroom", "dining_room",
     "bathroom", "foyer", "corridor", "hallway", "staircase",
     "study_room", "elderly_suite",
+    "gym",
 }
 SUPPORTING_TYPES = {
     "pooja_room", "powder_room", "utility", "utility_area", "store_room",
@@ -237,6 +239,34 @@ def split_duplex_specs(
         # Degenerate (e.g. <=2 BR): keep the upper floor as a family space.
         first.append({"type": "living_room", "confidence": 100})
         _ensure_type(first, "staircase")
+
+    # `_ensure_type` may add the staircase after the AI topology has already
+    # been wired.  Re-attach it here so duplex splitting can never leave the
+    # vertical circulation isolated or reachable only through a bedroom.
+    def _connect_stair_to_public_core(floor_specs: List[Dict[str, Any]]) -> None:
+        stair = next(
+            (r for r in floor_specs if _canon(r.get("type", "")) in {"staircase", "stairwell"}),
+            None,
+        )
+        if stair is None:
+            return
+        hub = next(
+            (r for r in floor_specs if _canon(r.get("type", "")) in {"corridor", "hallway", "foyer"}),
+            None,
+        )
+        if hub is None:
+            hub = next(
+                (r for r in floor_specs if _canon(r.get("type", "")) in {"living_room", "dining_room"}),
+                None,
+            )
+        if hub is None or hub is stair:
+            return
+        connections = stair.setdefault("connections", [])
+        if not any(str(c.get("target_room", "")) == str(hub.get("type", "")) for c in connections):
+            connections.append({"target_room": hub.get("type"), "intent": "standard", "weight": 20})
+
+    _connect_stair_to_public_core(ground)
+    _connect_stair_to_public_core(first)
 
     return ground, first
 

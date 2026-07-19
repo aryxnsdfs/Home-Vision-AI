@@ -616,19 +616,13 @@ function PromptBar() {
     const t0 = performance.now();
     try {
       const currentState = useProjectStore.getState();
-      const response = await fetch(`${API_BASE_URL}/generate`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          prompt: clean,
-          currentProject: currentState.project,
-          layoutRules: currentState.layoutRules || [],
-          indianOptions: currentState.project.indianOptions || {},
-        })
+      const json = await currentState._readSSEStream(`${API_BASE_URL}/generate/stream`, {
+        prompt: clean,
+        currentProject: currentState.project,
+        layoutRules: currentState.layoutRules || [],
+        indianOptions: currentState.project.indianOptions || {},
       });
       const elapsed = ((performance.now() - t0) / 1000).toFixed(2);
-      if (!response.ok) throw new Error(`Backend returned ${response.status}`);
-      const json = await response.json();
 
       // Use backend logs if available, otherwise show basic info
       const backendLogs = json.logs || [];
@@ -728,18 +722,11 @@ function MiniMapFloorSwitch() {
   const visibleFloor = useProjectStore((s) => s.visibleFloor);
   const setVisibleFloor = useProjectStore((s) => s.setVisibleFloor);
   const rooms = useProjectStore((s) => (s.project.floors ? s.project.floors[s.project.current_floor_index || 0].rooms : []));
-  
-  const hasBasement = rooms.some(r => r.floorIndex === -1);
-  const hasFirst = rooms.some(r => r.floorIndex === 1 || r.isFloor1);
-  const hasSecond = rooms.some(r => r.floorIndex === 2);
-  
-  if (!hasBasement && !hasFirst && !hasSecond) return null;
-  
-  const opts = [];
-  if (hasBasement) opts.push({ v: "floor_-1", label: "Basement" });
-  opts.push({ v: "floor_0", label: "Ground" });
-  if (hasFirst) opts.push({ v: "floor_1", label: "First Floor" });
-  if (hasSecond) opts.push({ v: "floor_2", label: "Terrace" });
+  const levels = [...new Set((rooms || []).map(r => Number.isFinite(r.floorIndex) ? r.floorIndex : (r.isFloor1 ? 1 : 0)))].sort((a, b) => a - b);
+  if (levels.length <= 1) return null;
+  const label = (level) => level < 0 ? "Basement" : level === 0 ? "Ground" : `${level === 1 ? "First" : level === 2 ? "Second" : level} Floor`;
+  const opts = levels.map(level => ({ v: `floor_${level}`, label: label(level) }));
+  opts.push({ v: "all", label: "Both" });
   return (
     <div className="flex gap-1 w-full mb-1.5">
       {opts.map((o) => (
@@ -771,9 +758,11 @@ function MiniMap() {
   // the default; only an explicit "First" selection switches it. "Both" and
   // "Compare" still show the ground plan (no overlapping/combined map).
   const rooms = useMemo(() => {
-    if (visibleFloor === "floor_-1") return allRooms.filter((r) => r.floorIndex === -1);
-    if (visibleFloor === "floor_1") return allRooms.filter((r) => r.floorIndex === 1 || r.isFloor1);
-    if (visibleFloor === "floor_2") return allRooms.filter((r) => r.floorIndex === 2);
+    const match = /^floor_(-?\d+)$/.exec(visibleFloor || "");
+    if (match) {
+      const level = Number(match[1]);
+      return allRooms.filter((r) => (Number.isFinite(r.floorIndex) ? r.floorIndex : (r.isFloor1 ? 1 : 0)) === level);
+    }
     return allRooms.filter((r) => (r.floorIndex === 0 || r.floorIndex === undefined) && !r.isFloor1); // floor_0 / all / compare → ground
   }, [allRooms, visibleFloor]);
 
@@ -974,18 +963,12 @@ function RoofToggle() {
               const clean = `Generate a ${roofPrompt} roof`;
               setRoofPrompt("");
               try {
-                const response = await fetch(`${API_BASE_URL}/generate`, {
-                  method: "POST",
-                  headers: { "Content-Type": "application/json" },
-                  body: JSON.stringify({
-                    prompt: clean,
-                    currentProject: useProjectStore.getState().project
-                  })
+                const currentState = useProjectStore.getState();
+                const json = await currentState._readSSEStream(`${API_BASE_URL}/generate/stream`, {
+                  prompt: clean,
+                  currentProject: currentState.project,
                 });
-                if (response.ok) {
-                  const json = await response.json();
-                  useProjectStore.getState().applyGeneratedProject(json);
-                }
+                useProjectStore.getState().applyGeneratedProject(json);
               } catch (e) {
                 console.error(e);
               }
@@ -1468,7 +1451,9 @@ function ColorPickerSection() {
   const setWallColors = useProjectStore(s => s.setWallColors);
   const room = (project.floors ? project.floors[project.current_floor_index || 0].rooms : []).find(r => r.id === selectedRoomId);
 
-  if (!room) {
+  // Furniture uses the fixed neutral project finish; never expose a color
+  // control for a selected furniture object.
+  if (!room || selectedObject?.kind === 'furniture') {
     return null;
   }
 
@@ -1511,8 +1496,6 @@ function ColorPickerSection() {
                 setWallColors(room.id, kind, c);
               } else if (kind === 'floor') {
                 setRoomColor(room.id, c, room.furnitureColor || '#d4bfa0', room.wallColor || '#ffffff');
-              } else if (kind === 'furniture') {
-                // Do nothing for furniture color
               } else if (kind === 'wall') {
                 setRoomColor(room.id, room.floorColor || '#e2e8f0', room.furnitureColor || '#d4bfa0', c);
               } else {
@@ -2123,29 +2106,23 @@ function FloorToggleInline() {
   const visibleFloor = useProjectStore((state) => state.visibleFloor);
   const setVisibleFloor = useProjectStore((state) => state.setVisibleFloor);
   const project = useProjectStore((state) => state.project);
-  const hasFloor1 = (project.floors ? project.floors[project.current_floor_index || 0].rooms : []).some(r => r.isFloor1);
-  if (!hasFloor1) return null;
-  const btn = (val, label) => (
-    <button
-      key={val}
-      onClick={() => setVisibleFloor(val)}
-      className={`flex-1 rounded-lg py-1.5 text-[10px] font-bold tracking-wider uppercase transition ${
-        visibleFloor === val
-          ? "bg-emerald-500/25 border border-emerald-500/50 text-emerald-300"
-          : "text-slate-400 hover:bg-white/10 border border-transparent"
-      }`}
-    >
-      {label}
-    </button>
-  );
+  const rooms = project.floors ? project.floors[project.current_floor_index || 0].rooms : [];
+  const levels = [...new Set((rooms || []).map(r => Number.isFinite(r.floorIndex) ? r.floorIndex : (r.isFloor1 ? 1 : 0)))].sort((a, b) => a - b);
+  if (levels.length <= 1) return null;
   return (
     <div className="mt-2 w-full">
       <div className="text-[8px] font-bold uppercase tracking-widest text-white/25 text-center mb-1">Floor</div>
       <div className="flex gap-1 w-full">
-        {btn("floor_0", "Ground")}
-        {btn("floor_1", "First")}
-        {btn("all", "Both")}
-        {btn("compare", "Compare")}
+        <button
+          onClick={() => setVisibleFloor("compare")}
+          className={`flex-1 rounded-lg py-1.5 text-[10px] font-bold tracking-wider uppercase transition ${
+            visibleFloor === "compare"
+              ? "bg-emerald-500/25 border border-emerald-500/50 text-emerald-300"
+              : "text-slate-400 hover:bg-white/10 border border-transparent"
+          }`}
+        >
+          Compare
+        </button>
       </div>
     </div>
   );

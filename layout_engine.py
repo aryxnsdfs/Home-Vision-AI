@@ -17,6 +17,7 @@ import uuid
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 from layout_templates import get_template_for_bhk
+from asset_library import furniture_capacity, furniture_for_room, fit_furniture_assets
 
 logger = logging.getLogger(__name__)
 
@@ -211,24 +212,29 @@ class MainEntrancePlacementEngine:
             is_main=True
         ))
 
-def place_furniture(nodes: List[RoomNode], indian_options: Dict[str, Any]):
+def place_furniture(nodes: List[RoomNode], indian_options: Dict[str, Any], user_prompt: str = ""):
+    # Gemini supplies the semantic manifest for arbitrary user-created rooms.
+    # The local library remains a bounded fallback for offline/API failures.
+    ai_manifest = {}
+    try:
+        from cloud_extractor import generate_furniture_manifest
+        ai_manifest = generate_furniture_manifest([
+            {"type": node.type, "width": node.rect.width, "length": node.rect.length}
+            for node in nodes
+        ], user_prompt=user_prompt)
+    except Exception as exc:
+        logger.info("[FURNITURE] Gemini manifest skipped: %s", exc)
+
     for node in nodes:
-        ContextualFurniturePlacementEngine.place_for_room(node, indian_options)
-        if not node.furniture:
-            if "bath" in node.type.lower() or "toilet" in node.type.lower() or "powder" in node.type.lower():
-                node.furniture = [
-                    {"type": "Toilet", "x": 1.5, "z": 1.5},
-                    {"type": "Shower", "x": node.rect.width - 1.5, "z": node.rect.length - 1.5}
-                ]
-            elif "pooja" in node.type.lower():
-                node.furniture = [
-                    {"type": "Altar", "x": node.rect.width / 2.0, "z": 1.0}, 
-                    {"type": "Diya Stand", "x": 1.0, "z": 1.0}
-                ]
-            elif "store" in node.type.lower() or "utility" in node.type.lower():
-                node.furniture = [{"type": "Small Shelf", "x": 1.0, "z": 1.0}]
-            else:
-                node.furniture = []
+        # Furniture is a renderable asset manifest, not placeholder geometry.
+        # Keep it local to the room so the layout solver remains authoritative
+        # for walls, doors, and navigation.
+        key = str(node.type or "room").lower().replace(" ", "_")
+        generated = ai_manifest.get(key, [])
+        if generated:
+            node.furniture = fit_furniture_assets(generated, float(node.rect.width), float(node.rect.length), max_assets=furniture_capacity(key, node.rect.width, node.rect.length))
+        else:
+            node.furniture = furniture_for_room(node.type, node.rect.width, node.rect.length)
 
 # ---------------------------------------------------------------------------
 # Module-level helpers: shared wall computation & main entrance injection
@@ -514,6 +520,46 @@ def align_duplex_floors(
         if corridor.rect.width < 5.0:
             corridor.rect.width = 5.0
 
+        # The corridor must physically meet the stair landing.  Alignment and
+        # clipping can otherwise leave both rectangles on the same floor but
+        # separated by a wall/room, which gives the upper floor no usable path.
+        stair = next((n for n in kept if n.type in ("staircase", "stairwell")), None)
+        if stair:
+            sr, cr = stair.rect, corridor.rect
+            shares_landing = (
+                (abs((sr.x + sr.width) - cr.x) <= 0.15 or abs((cr.x + cr.width) - sr.x) <= 0.15)
+                and min(sr.z + sr.length, cr.z + cr.length) - max(sr.z, cr.z) >= 3.0
+            ) or (
+                (abs((sr.z + sr.length) - cr.z) <= 0.15 or abs((cr.z + cr.length) - sr.z) <= 0.15)
+                and min(sr.x + sr.width, cr.x + cr.width) - max(sr.x, cr.x) >= 3.0
+            )
+            if not shares_landing:
+                min_x = min(n.rect.x for n in floor0)
+                max_x = max(n.rect.x + n.rect.width for n in floor0)
+                min_z = min(n.rect.z for n in floor0)
+                max_z = max(n.rect.z + n.rect.length for n in floor0)
+                span_z = max(5.0, cr.length)
+                candidates = [
+                    Rect(sr.x + sr.width, sr.z, cr.width, span_z),
+                    Rect(sr.x - cr.width, sr.z, cr.width, span_z),
+                    Rect(sr.x, sr.z + sr.length, max(5.0, sr.width), cr.length),
+                    Rect(sr.x, sr.z - cr.length, max(5.0, sr.width), cr.length),
+                ]
+
+                def within_floor(rect: Rect) -> bool:
+                    return rect.x >= min_x - 0.1 and rect.z >= min_z - 0.1 and rect.x + rect.width <= max_x + 0.1 and rect.z + rect.length <= max_z + 0.1
+
+                def overlap_cost(rect: Rect) -> float:
+                    return sum(
+                        max(0.0, min(rect.x + rect.width, n.rect.x + n.rect.width) - max(rect.x, n.rect.x))
+                        * max(0.0, min(rect.z + rect.length, n.rect.z + n.rect.length) - max(rect.z, n.rect.z))
+                        for n in habitable
+                    )
+
+                valid = [rect for rect in candidates if within_floor(rect)]
+                if valid:
+                    corridor.rect = min(valid, key=overlap_cost)
+
     floor1[:] = kept
     return floor1
 
@@ -590,6 +636,7 @@ ROOM_MINIMUMS: Dict[str, Dict[str, float]] = {
     "utility":         {"area":  30.0, "min_dim":  4.0},
     "garage":          {"area": 150.0, "min_dim": 10.0},
     "study_room":      {"area":  60.0, "min_dim":  7.0},
+    "gym":             {"area": 120.0, "min_dim":  9.0},
     "staircase":       {"area":  30.0, "min_dim":  4.0},
     "laundry":         {"area":  25.0, "min_dim":  4.0},
     "veranda":         {"area":  40.0, "min_dim":  4.0},
@@ -944,21 +991,22 @@ class LayoutEngine:
 
             # Compute shared walls using new finite AABB logic
             self.last_walls = generate_walls_from_aabbs(nodes)
-            
+
+            # Every generated house needs a visible, usable entrance even when
+            # Gemini does not provide optional plot_info metadata.  Mark it
+            # before WindowPlacer so the main door is materialized on an
+            # exterior wall rather than remaining only a room flag.
+            inject_main_entrance(
+                nodes, self.buildable_width, self.buildable_length,
+                self.setback_x, self.setback_z,
+            )
+
             # --- DETERMINISTIC PLACEMENT ---
             # Adjacency Resolver calculates doors perfectly centered on shared walls
             AdjacencyResolver(nodes).resolve()
             WindowPlacer(nodes, self.plot_width, self.plot_length).place_windows()
             
-            if plot_info:
-                MainEntrancePlacementEngine.place_main_door(
-                    nodes, 
-                    self.last_walls, 
-                    plot_info.get("primary_entry_room_id", ""), 
-                    plot_info.get("front_orientation", "north").lower()
-                )
-            
-            place_furniture(nodes, indian_options)
+            place_furniture(nodes, indian_options, getattr(self, "furniture_prompt", ""))
             
             logger.info(f"[ZERO-STATIC] Generated {len(nodes)} nodes, {len(self.last_walls)} shared finite walls")
             return nodes
@@ -1338,7 +1386,7 @@ class LayoutEngine:
                 for n in nodes if getattr(n, "main_entrance", False)
             ],
         )
-        place_furniture(nodes, indian_options)
+        place_furniture(nodes, indian_options, getattr(self, "furniture_prompt", ""))
 
         # Validation fix: the Master Bedroom must be the largest bedroom.
         masters = [n for n in nodes if n.type == "master_bedroom"]
@@ -1396,13 +1444,27 @@ class AdjacencyResolver:
     def resolve(self):
         logger.info(f"  [AdjacencyResolver] Resolving doors for {len(self.rooms)} rooms using finite walls.")
         from layout_engine import generate_walls_from_aabbs
+
+        # The generation pipeline may call the resolver again after the engine
+        # has already materialized doors.  Keep the operation idempotent so a
+        # retry never duplicates doors and corrupts the navigation graph.
+        for room in self.rooms:
+            room.doors[:] = [door for door in room.doors if getattr(door, "is_main", False)]
+
         walls = generate_walls_from_aabbs(self.rooms)
         
         room_by_id = {r.id: r for r in self.rooms}
         placed_doors_between = set()
         
         def has_connection(src, dst):
-            return any(c.get("target_room") == dst.type for c in src.connections)
+            return any(
+                c.get("intent") != "proximity"
+                and (
+                    c.get("target_room_id") == dst.id
+                    or (not c.get("target_room_id") and c.get("target_room") == dst.type)
+                )
+                for c in src.connections
+            )
             
         def get_face(rel_x, rel_z, room, is_v):
             if is_v: return "west" if rel_x < room.rect.width / 2.0 else "east"
@@ -1486,6 +1548,15 @@ class AdjacencyResolver:
                 available_walls = [w for w in walls if w.get("is_shared") and r.id in w["room_ids"]]
                 if not available_walls:
                     continue # Truly isolated geometry 
+
+                connected_walls = []
+                for wall in available_walls:
+                    other_id = next((rid for rid in wall["room_ids"] if rid != r.id), None)
+                    other = room_by_id.get(other_id)
+                    if other and (has_connection(r, other) or has_connection(other, r)):
+                        connected_walls.append(wall)
+                if connected_walls:
+                    available_walls = connected_walls
                 
                 def wall_len(w):
                     return abs(w["z2"]-w["z1"]) if w["orientation"]=="vertical" else abs(w["x2"]-w["x1"])
@@ -1519,7 +1590,98 @@ class AdjacencyResolver:
                 r2.doors.append(Door(x=d2_x, z=d2_z, width=door_w, wall_orientation=face2))
                 
                 placed_doors_between.add(pair)
-                logger.warning(f"[DOOR PLANNER] RESCUE PASS: Forced emergency door for stranded room {r.name} to {r1.name if r.id == r2.id else r2.name} ({door_w}ft)")
+                logger.info(f"[DOOR PLANNER] Added recovery door for {r.name} to {r1.name if r.id == r2.id else r2.name} ({door_w}ft)")
+
+        # PASS 3: join disconnected door components.  A room can already have
+        # a valid door and still be in a separate component when strict
+        # topology rejected the only geometrically available edge.  Connect
+        # it through the longest shared wall; this is a real navigable door,
+        # not a warning-only fallback.
+        def door_point(room, door):
+            return room.rect.x + door.x, room.rect.z + door.z
+
+        def shares_door(a, b):
+            for da in a.doors:
+                ax, az = door_point(a, da)
+                for db in b.doors:
+                    bx, bz = door_point(b, db)
+                    if abs(ax - bx) <= 0.35 and abs(az - bz) <= 0.35:
+                        return True
+            return False
+
+        for _ in range(max(0, len(self.rooms) - 1)):
+            visited = {self.rooms[0].id} if self.rooms else set()
+            changed = True
+            while changed:
+                changed = False
+                for wall in walls:
+                    if not wall.get("is_shared") or len(wall.get("room_ids", [])) < 2:
+                        continue
+                    a = room_by_id[wall["room_ids"][0]]
+                    b = room_by_id[wall["room_ids"][1]]
+                    if a.id in visited and b.id not in visited and shares_door(a, b):
+                        visited.add(b.id); changed = True
+                    elif b.id in visited and a.id not in visited and shares_door(a, b):
+                        visited.add(a.id); changed = True
+            disconnected = [room for room in self.rooms if room.id not in visited]
+            if not disconnected:
+                break
+            target = disconnected[0]
+            candidate_walls = [w for w in walls if w.get("is_shared") and target.id in w.get("room_ids", []) and any(rid in visited for rid in w.get("room_ids", []))]
+            if not candidate_walls:
+                break
+            best_wall = max(candidate_walls, key=lambda w: abs(w["z2"] - w["z1"]) if w["orientation"] == "vertical" else abs(w["x2"] - w["x1"]))
+            other_id = next(rid for rid in best_wall["room_ids"] if rid != target.id)
+            other = room_by_id[other_id]
+            cx = (best_wall["x1"] + best_wall["x2"]) / 2.0
+            cz = (best_wall["z1"] + best_wall["z2"]) / 2.0
+            is_vert = best_wall["orientation"] == "vertical"
+            wall_len = abs(best_wall["z2"] - best_wall["z1"]) if is_vert else abs(best_wall["x2"] - best_wall["x1"])
+            door_w = max(2.0, min(3.0, round(wall_len - 0.2, 1)))
+            tx, tz = cx - target.rect.x, cz - target.rect.z
+            ox, oz = cx - other.rect.x, cz - other.rect.z
+            target.doors.append(Door(x=tx, z=tz, width=door_w, wall_orientation=get_face(tx, tz, target, is_vert)))
+            other.doors.append(Door(x=ox, z=oz, width=door_w, wall_orientation=get_face(ox, oz, other, is_vert)))
+            logger.info(f"[DOOR PLANNER] Connected navigation component: {target.name} ↔ {other.name}")
+
+        # A staircase must open directly into the public circulation core.
+        # Otherwise a graph can be technically connected while the landing is
+        # reachable only through a bedroom or behind a blocked doorway.
+        public_types = ("corridor", "hallway", "foyer", "living_room")
+        for stair in (r for r in self.rooms if r.type in ("staircase", "stairwell")):
+            public = next((r for r in self.rooms if r.type in public_types), None)
+            if public is None:
+                continue
+            common = [
+                w for w in walls
+                if w.get("is_shared")
+                and stair.id in w.get("room_ids", [])
+                and public.id in w.get("room_ids", [])
+            ]
+            if not common:
+                continue
+            if any(
+                abs((stair.rect.x + sd.x) - (public.rect.x + pd.x)) <= 0.35
+                and abs((stair.rect.z + sd.z) - (public.rect.z + pd.z)) <= 0.35
+                for sd in stair.doors for pd in public.doors
+            ):
+                continue
+            wall = max(
+                common,
+                key=lambda w: abs(w["z2"] - w["z1"])
+                if w["orientation"] == "vertical"
+                else abs(w["x2"] - w["x1"]),
+            )
+            cx = (wall["x1"] + wall["x2"]) / 2.0
+            cz = (wall["z1"] + wall["z2"]) / 2.0
+            is_vertical = wall["orientation"] == "vertical"
+            wall_length = abs(wall["z2"] - wall["z1"]) if is_vertical else abs(wall["x2"] - wall["x1"])
+            width = max(2.0, min(3.0, round(wall_length - 0.2, 1)))
+            sx, sz = cx - stair.rect.x, cz - stair.rect.z
+            px, pz = cx - public.rect.x, cz - public.rect.z
+            stair.doors.append(Door(x=sx, z=sz, width=width, wall_orientation=get_face(sx, sz, stair, is_vertical)))
+            public.doors.append(Door(x=px, z=pz, width=width, wall_orientation=get_face(px, pz, public, is_vertical)))
+            logger.info(f"[STAIR ACCESS] Connected {stair.name} directly to {public.name}")
 # ---------------------------------------------------------------------------
 # Window Generation
 # ---------------------------------------------------------------------------
@@ -1532,6 +1694,10 @@ class WindowPlacer:
     def place_windows(self):
         logger.info(f"  [WindowPlacer] Starting window placement using finite walls.")
         from layout_engine import generate_walls_from_aabbs
+        # Idempotent placement: repeated pipeline passes must not stack windows.
+        for room in self.rooms:
+            room.windows[:] = []
+            room.doors[:] = [door for door in room.doors if not getattr(door, "is_main", False)]
         walls = generate_walls_from_aabbs(self.rooms)
         room_by_id = {r.id: r for r in self.rooms}
         

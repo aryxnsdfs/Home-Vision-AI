@@ -33,7 +33,7 @@ function ProceduralFurniture({ room, isSelected, accent, onClick, color }) {
     blocks.push(
       <mesh key={i} castShadow receiveShadow position={[x, h / 2, z]}>
         <boxGeometry args={[w, h, d]} />
-        {color ? <meshStandardMaterial color={color} roughness={0.5} /> : <GlassPhysicalMaterial type="sofa" opacity={0.58} />}
+        <GlassPhysicalMaterial type="sofa" />
         {isSelected && <BoxEdges args={[w, h, d]} color={accent} scale={1.05} />}
       </mesh>
     );
@@ -68,37 +68,28 @@ function BoxEdges({ args, color = "#ffffff", scale = 1 }) {
   );
 }
 
-/* ── Furniture tint palette ── */
+/* ── Fixed, solid low-poly furniture finish ──
+   Furniture must not inherit a room/style colour: that produced the pale,
+   transparent glass look in older saved projects. */
 const glassFurniture = {
-  sofa: { color: "#86efac", emissive: "#22c55e" },
-  table: { color: "#f59e0b", emissive: "#f97316" },
-  chair: { color: "#93c5fd", emissive: "#3b82f6" },
-  bed: { color: "#a7f3d0", emissive: "#10b981" },
-  wardrobe: { color: "#bfdbfe", emissive: "#60a5fa" },
-  kitchen: { color: "#fdba74", emissive: "#fb923c" },
-  car: { color: "#c4b5fd", emissive: "#8b5cf6" }
+  sofa: { color: "#9a7255" },
+  table: { color: "#79533a" },
+  chair: { color: "#ad8564" },
+  bed: { color: "#b48b69" },
+  wardrobe: { color: "#805a40" },
+  kitchen: { color: "#987052" },
+  car: { color: "#76513b" },
+  bath: { color: "#aa8262" }
 };
 
-function GlassPhysicalMaterial({ type = "sofa", opacity = 0.66, customColor }) {
+function GlassPhysicalMaterial({ type = "sofa" }) {
   const tint = glassFurniture[type] || glassFurniture.sofa;
-  const activeColor = customColor || tint.color;
-  const activeEmiss = customColor || tint.emissive;
-  
   return (
-    <meshPhysicalMaterial
-      key={`glass-${activeColor}`} // FIX: Busts the 3D cache so furniture repaints
-      color={activeColor}
-      emissive={activeEmiss}
-      emissiveIntensity={0.08}
-      transmission={1}
-      transparent
-      opacity={opacity}
-      roughness={0.2}
-      ior={1.5}
-      thickness={2}
-      clearcoat={1}
-      clearcoatRoughness={0.08}
-      depthWrite={false}
+    <meshStandardMaterial
+      key={`furniture-${type}`}
+      color={tint.color}
+      roughness={0.72}
+      metalness={0.03}
     />
   );
 }
@@ -497,6 +488,65 @@ function CarModel({ x, z, accent, isSelected, onClick }) {
 }
 const clamp = (val, min, max) => Math.max(min, Math.min(max, val));
 
+const FURNITURE_FINISHES = ["#9b7357", "#5f7181", "#738a78", "#a36f58", "#70677d"];
+
+function assetFinish(type = "asset") {
+  const semantic = String(type).toLowerCase();
+  if (/(?:treadmill|bike|cycle|fitness|gym|weight)/.test(semantic)) return "#3f556b";
+  if (/(?:sofa|seating|chair|bench)/.test(semantic)) return "#527a7b";
+  if (/(?:bed|wardrobe|dresser)/.test(semantic)) return "#a77862";
+  if (/(?:table|desk|counter|console|shelf|rack|unit)/.test(semantic)) return "#796553";
+  if (/(?:bath|basin|toilet|shower|sink)/.test(semantic)) return "#8c9daa";
+  const hash = Array.from(semantic).reduce((sum, char) => sum + char.charCodeAt(0), 0);
+  return FURNITURE_FINISHES[hash % FURNITURE_FINISHES.length];
+}
+
+function ManifestFurniture({ item, isSelected, accent, onClick }) {
+  const type = String(item?.type || "furniture").toLowerCase();
+  const width = Math.max(0.12, Number(item?.width || 1) * SCALE);
+  const length = Math.max(0.12, Number(item?.length || 1) * SCALE);
+  const height = Math.max(0.12, Math.min(0.75, Number(item?.height || 0.8) * SCALE));
+  const color = assetFinish(type);
+  const isTreadmill = /treadmill/.test(type);
+  const isBike = /bike|cycle/.test(type);
+  const isSofa = /sofa|seating|bench/.test(type);
+  const isTable = /table|desk|counter|island|rack|console|unit/.test(type);
+
+  return (
+    <group position={[Number(item?.x || 0) * SCALE, height / 2, Number(item?.z || 0) * SCALE]} onClick={onClick}>
+      <mesh castShadow receiveShadow>
+        <boxGeometry args={[width, height, length]} />
+        <meshStandardMaterial color={color} roughness={0.7} metalness={0.04} />
+        {isSelected && <BoxEdges args={[width, height, length]} color={accent} scale={1.06} />}
+      </mesh>
+      {isSofa && (
+        <mesh castShadow receiveShadow position={[0, height * 0.42, -length * 0.34]}>
+          <boxGeometry args={[width, height * 0.65, Math.max(0.06, length * 0.22)]} />
+          <meshStandardMaterial color="#604536" roughness={0.75} />
+        </mesh>
+      )}
+      {isTable && (
+        <mesh castShadow receiveShadow position={[0, height * 0.54, 0]}>
+          <boxGeometry args={[width * 0.92, Math.max(0.04, height * 0.14), length * 0.92]} />
+          <meshStandardMaterial color="#c6a27e" roughness={0.68} />
+        </mesh>
+      )}
+      {isTreadmill && (
+        <mesh castShadow receiveShadow position={[0, height * 0.72, -length * 0.27]} rotation={[-0.34, 0, 0]}>
+          <boxGeometry args={[width * 0.68, Math.max(0.05, height * 0.22), Math.max(0.06, length * 0.18)]} />
+          <meshStandardMaterial color="#334155" roughness={0.5} metalness={0.25} />
+        </mesh>
+      )}
+      {isBike && (
+        <mesh castShadow receiveShadow position={[0, height * 0.72, 0]} rotation={[Math.PI / 2, 0, 0]}>
+          <torusGeometry args={[Math.min(width, length) * 0.28, 0.025, 8, 16]} />
+          <meshStandardMaterial color="#334155" roughness={0.45} metalness={0.35} />
+        </mesh>
+      )}
+    </group>
+  );
+}
+
 function InteriorObjects({ rooms, accent }) {
   const selectedRoomId = useProjectStore(state => state.selectedRoomId);
   const selectedObject = useProjectStore(state => state.selectedObject);
@@ -514,7 +564,9 @@ function InteriorObjects({ rooms, accent }) {
         const roomL = room.length * SCALE;
         const clearance = 0.08;
         const isSelected = selectedRoomId === room.id && selectedObject?.kind === "furniture";
-        const color = room.furnitureColor || (isSelected ? room.color : null);
+        // Always use the shared furniture finish.  Old room-level palette data
+        // is intentionally ignored so saved layouts cannot turn translucent.
+        const color = null;
 
         const handleFurnitureClick = e => {
           if (selectionMode === "furniture") {
@@ -523,72 +575,29 @@ function InteriorObjects({ rooms, accent }) {
           }
         };
 
-        let furnitureElement = null;
-
-        if (room.type === "bedroom") {
-          furnitureElement = (
-            <>
-              <BedModel
-                x={0}
-                z={0}
-                roomWidth={room.width}
-                roomLength={room.length}
-                isSelected={isSelected}
-                accent={accent}
-                onClick={handleFurnitureClick}
-                color={color}
-              />
-              <WardrobeModel
-                x={0}
-                z={0}
-                roomWidth={room.width}
-                roomLength={room.length}
-                isSelected={isSelected}
-                accent={accent}
-                onClick={handleFurnitureClick}
-                color={color}
-              />
-              {color && (
-                <mesh position={[room.width * SCALE * 0.45, 0.05, room.length * SCALE * 0.5]}>
-                  <boxGeometry args={[room.width * SCALE * 0.6, 0.02, room.length * SCALE * 0.6]} />
-                  <meshStandardMaterial color={color} roughness={0.5} transparent opacity={0.18} />
-                </mesh>
-              )}
-            </>
-          );
-        } else if (room.type === "bathroom") {
-          const bf = Math.min(1, (room.width * SCALE) / 1.5);
-          const bathW = 0.86 * bf;
-          const bathL = 0.90 * bf;
-          const clampedX = clamp(roomW * 0.5, bathW / 2 + clearance, roomW - bathW / 2 - clearance);
-          const clampedZ = clamp(roomL * 0.5, bathL / 2 + clearance, roomL - bathL / 2 - clearance);
-          furnitureElement = (
-            <BathroomModel
-              x={clampedX}
-              z={clampedZ}
-              scale={bf}
-              isSelected={isSelected}
-              accent={accent}
-              onClick={handleFurnitureClick}
-              color={color}
-            />
-          );
-        } else if (room.type === "parking") {
-          const cf = Math.min(1, (room.width * SCALE) / 2.0);
-          furnitureElement = (
-            <CarModel
-              x={room.width * SCALE * 0.5}
-              z={room.length * SCALE * 0.5}
-              accent={accent}
-              isSelected={isSelected}
-              onClick={handleFurnitureClick}
-            />
-          );
-        } else {
-          furnitureElement = (
-            <ProceduralFurniture room={room} isSelected={isSelected} accent={accent} onClick={handleFurnitureClick} color={color} />
-          );
-        }
+        // The backend/Gemini manifest is already measured, collision-checked,
+        // and capped at two primary objects.  Render it directly rather than
+        // replacing it with the old procedural room blocks.
+        const fallback = [{
+          type: "furniture",
+          width: Math.min(4, Math.max(1.5, room.width * 0.28)),
+          length: Math.min(2, Math.max(1, room.length * 0.16)),
+          height: 1.6,
+          x: room.width / 2,
+          z: room.length / 2,
+        }];
+        const manifest = Array.isArray(room.furniture) && room.furniture.length
+          ? room.furniture.slice(0, 2)
+          : fallback;
+        const furnitureElement = manifest.map((item, index) => (
+          <ManifestFurniture
+            key={`${room.id}-${item.type || "asset"}-${index}`}
+            item={item}
+            isSelected={isSelected}
+            accent={accent}
+            onClick={handleFurnitureClick}
+          />
+        ));
 
         if (!furnitureElement) return null;
 
@@ -1234,7 +1243,7 @@ function SceneContent() {
           zoomToCursor
           minDistance={focusMinDist}
           maxDistance={focusMaxDist}
-          minPolarAngle={0.12}
+          minPolarAngle={0}
           maxPolarAngle={Math.PI / 2 - 0.05}
         />
       ) : null}

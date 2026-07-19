@@ -95,12 +95,14 @@ def extract_keywords_to_json(user_prompt: str, vocabulary: dict) -> Dict[str, An
     
     system_prompt = f"""You are a strict JSON translation engine.
 Read the user's architectural request.
-You MUST map their requested styles, materials, and rooms ONLY to the exact words provided in these lists:
-ROOMS: {known_rooms}
+Map known styles and materials to the exact words provided in those lists.
+Rooms and facilities are open-ended: preserve EVERY requested room/space as a concise snake_case label in
+target_rooms, even when it is not in the room list. Never drop, replace, or reject an unfamiliar user-created space.
+Also return every requested exterior/open-air facility in outdoor_rooms (for example a swimming pool, swing court, garden, parking, terrace, or a custom outdoor facility).
 STYLES: {known_styles}
 MATERIALS: {known_materials}
 
-Schema: {{"intent": "CREATE" | "ADD" | "REMOVE" | "RESIZE" | "COLOR" | "MODIFY_MEP" | "MOVE", "bhk": int, "style": str, "materials": [str], "target_rooms": [str], "color_hex": str, "theme_description": str, "move_target_room": str, "move_destination": str, "vastu_specifics": [{{"room": str, "location": str}}], "negative_constraints": [str], "mep_additions": [{{"room": str, "item": str}}], "needs_pooja_room": bool, "utility_area": bool, "powder_room": bool, "elderly_suite": bool, "foyer": bool, "brahmasthan": bool, "angan": bool, "bhandar_ghar": bool, "maliya": bool, "sump_tank": bool, "overhead_tank": bool, "diwan": bool, "otta": bool, "portico": bool, "flat_terrace": bool, "parapet": bool, "mumty": bool, "double_height": bool, "jali": bool, "chhajja": bool, "jharokha": bool, "stack_vent": bool, "facing": "North" | "South" | "East" | "West" | ""}}
+Schema: {{"intent": "CREATE" | "ADD" | "REMOVE" | "RESIZE" | "COLOR" | "MODIFY_MEP" | "MOVE", "bhk": int, "style": str, "materials": [str], "target_rooms": [str], "outdoor_rooms": [str], "color_hex": str, "theme_description": str, "move_target_room": str, "move_destination": str, "vastu_specifics": [{{"room": str, "location": str}}], "negative_constraints": [str], "mep_additions": [{{"room": str, "item": str}}], "needs_pooja_room": bool, "utility_area": bool, "powder_room": bool, "elderly_suite": bool, "foyer": bool, "brahmasthan": bool, "angan": bool, "bhandar_ghar": bool, "maliya": bool, "sump_tank": bool, "overhead_tank": bool, "diwan": bool, "otta": bool, "portico": bool, "flat_terrace": bool, "parapet": bool, "mumty": bool, "double_height": bool, "jali": bool, "chhajja": bool, "jharokha": bool, "stack_vent": bool, "facing": "North" | "South" | "East" | "West" | ""}}
 
 Indian feature detection rules (set to true if user mentions):
 - needs_pooja_room: "pooja room", "prayer room", "mandir", "temple", "puja", "devghar"
