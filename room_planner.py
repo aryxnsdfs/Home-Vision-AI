@@ -554,6 +554,17 @@ def can_place_room(free_area: float, rtype: str) -> bool:
     return free_area >= needed
 
 
+FATAL_CATEGORIES = {
+    "ROOM_OVERLAP",
+    "INVALID_ROOM_DIMENSIONS",
+    "CIRCULATION_ERROR",
+    "UNREACHABLE_ROOM",
+    "OUT_OF_BOUNDS",
+    "SLAB_VIOLATION",
+    "FIDELITY_ERROR",
+}
+
+
 def final_layout_validation(
     nodes: List[RoomNode],
     indian_options: Optional[Dict[str, Any]] = None,
