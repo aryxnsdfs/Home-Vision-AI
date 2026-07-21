@@ -942,6 +942,8 @@ export const useProjectStore = create((set, get) => ({
         currentProject: get().project, requestMode: "create", indianOptions, colors,
         package: packageLevel, country, customMaterials,
         layoutRules: get().layoutRules || [],
+        analysis_id: analysisId,
+        clarifications: clarifications
       });
       if (get().generationEpoch !== requestEpoch) return;
       get()._finishProgress();
