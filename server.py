@@ -6051,11 +6051,11 @@ def _stream_generate_work(req: "GenerateRequest", emit_fn: Callable) -> None:
         # design. Validate each floor independently; treating the combined
         # duplex as one 2-D plane produced false overlap failures everywhere.
         floor_validation_reports = [
-            (0, final_layout_validation(generated_nodes_0, indian_options=indian_opts, is_duplex=(floors > 1)))
+            (0, final_layout_validation(generated_nodes_0, indian_options=indian_opts, is_duplex=(floors > 1), canonical_specs=floor_0_rooms))
         ]
         if generated_nodes_1:
             floor_validation_reports.append(
-                (1, final_layout_validation(generated_nodes_1, indian_options=indian_opts, is_duplex=True))
+                (1, final_layout_validation(generated_nodes_1, indian_options=indian_opts, is_duplex=True, canonical_specs=first_spec))
             )
         validation_report = {
             "ok": all(report["ok"] for _, report in floor_validation_reports),
