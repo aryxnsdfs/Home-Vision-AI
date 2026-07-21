@@ -5547,7 +5547,8 @@ def _stream_generate_work(req: "GenerateRequest", emit_fn: Callable) -> None:
 
         # Wire topology on the final list of rooms to guarantee graph/door semantics!
         from cloud_extractor import auto_wire_topology
-        layout_params["rooms"] = auto_wire_topology(layout_params["rooms"], ai_categories=slm_result or {})
+        bathroom_reqs = (slm_result or {}).get("bathroom_requirements")
+        layout_params["rooms"] = auto_wire_topology(layout_params["rooms"], ai_categories=slm_result or {}, bathroom_requirements=bathroom_reqs)
         layout_params["rooms"] = apply_prompt_proximities(layout_params["rooms"], req.prompt)
 
         plot_w = layout_params.get("plot_width") or req.width or 40.0
@@ -5632,7 +5633,8 @@ def _stream_generate_work(req: "GenerateRequest", emit_fn: Callable) -> None:
                         level_outdoor_types.add(canonical_type(normalized.get("type")))
                         floor_outdoor_types.add(canonical_type(normalized.get("type")))
                     normalized_specs.append(normalized)
-                wired_specs = auto_wire_topology(normalized_specs, ai_categories=slm_result or {})
+                bathroom_reqs = (slm_result or {}).get("bathroom_requirements")
+                wired_specs = auto_wire_topology(normalized_specs, ai_categories=slm_result or {}, bathroom_requirements=bathroom_reqs)
                 wired_specs = apply_floor_outdoor_connections(wired_specs, level_outdoor_types, req.prompt)
                 wired_specs = apply_courtyard_and_suite_relationships(wired_specs, req.prompt)
                 wired_specs = apply_prompt_proximities(wired_specs, req.prompt)

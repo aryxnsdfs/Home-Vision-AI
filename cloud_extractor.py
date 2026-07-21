@@ -697,7 +697,7 @@ def extract_keywords_groq(user_prompt: str, vocabulary: dict) -> Dict[str, Any]:
 def reason_modifications_deepseek(user_prompt: str, current_floorplan: dict) -> dict:
     return QueryRouter.route(user_prompt, {}, current_floorplan)
 
-def auto_wire_topology(room_types: list, ai_categories: dict = None) -> list:
+def auto_wire_topology(room_types: list, ai_categories: dict = None, bathroom_requirements: dict = None) -> list:
     """Wire an open-ended room program using stable instance IDs.
 
     Repeated room types (three bedrooms, two ensuites) cannot be connected by
@@ -862,6 +862,18 @@ def auto_wire_topology(room_types: list, ai_categories: dict = None) -> list:
         or "attached" in room_specs[index]["type"]
         or "ensuite" in room_specs[index]["type"]
     ]
+    
+    if bathroom_requirements:
+        requested_attached = bathroom_requirements.get("attached", [])
+        requested_attached_count = len(requested_attached)
+        if len(attached_baths) > requested_attached_count:
+            excess = len(attached_baths) - requested_attached_count
+            for bath_i in attached_baths[-excess:]:
+                room_specs[bath_i]["bathroom_role"] = "common"
+                if "attached" in room_specs[bath_i]["type"]:
+                    room_specs[bath_i]["type"] = "bathroom"
+            attached_baths = attached_baths[:-excess]
+
     common_baths = [index for index in available_baths if index not in attached_baths]
 
     # Pair each requested ensuite with one distinct bedroom using stable IDs.
