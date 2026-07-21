@@ -818,14 +818,15 @@ def auto_wire_topology(room_types: list, ai_categories: dict = None, bathroom_re
 
     # Phase 2: Dynamic Topology Wiring based on AI Bins
     
-    # 0. If there's a staircase but no circulation space, inject a Lobby.
-    if not circulation_idx:
-        has_staircase = any(r["type"] in {"staircase", "stairwell"} for r in room_specs)
-        if has_staircase:
-            import uuid
-            lobby = {"id": f"lobby_{uuid.uuid4().hex[:8]}", "type": "lobby", "name": "Lobby", "connections": [], "role": {'traffic': 'high', 'can_be_passage': True}}
-            room_specs.append(lobby)
-            circulation_idx.append(len(room_specs) - 1)
+    # 0. If there's a staircase but no horizontal circulation space, inject a Lobby.
+    has_staircase = any(r["type"] in {"staircase", "stairwell"} for r in room_specs)
+    has_horizontal_circ = any(room_specs[i]["type"] in {"corridor", "hallway", "passage", "lobby"} for i in circulation_idx)
+    
+    if has_staircase and not has_horizontal_circ:
+        import uuid
+        lobby = {"id": f"lobby_{uuid.uuid4().hex[:8]}", "type": "lobby", "name": "Lobby", "connections": [], "role": {'traffic': 'high', 'can_be_passage': True}}
+        room_specs.append(lobby)
+        circulation_idx.append(len(room_specs) - 1)
             
     # 1. Determine Primary Hub for Circulation. Prefer a real corridor over a
     # foyer; the foyer is an entry transition, not the whole-house spine.

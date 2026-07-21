@@ -32,8 +32,13 @@ def generate_architecture_task(request_data: dict, job_id: str):
         _stream_generate_work(req, emit_fn)
     except Exception as e:
         logger.error(f"[WORKER] Job {job_id} failed: {e}")
-        emit_fn({"error": str(e)})
-
+        emit_fn({
+            "success": False,
+            "status": "generation_failed",
+            "error_code": "INVALID_LAYOUT",
+            "message": str(e)
+        })
+        raise
 @app.task(name="generate_template")
 def generate_template_task(request_data: dict, job_id: str):
     logger.info(f"[WORKER] Starting template job {job_id}")
@@ -46,4 +51,10 @@ def generate_template_task(request_data: dict, job_id: str):
         _stream_template_work(req, emit_fn)
     except Exception as e:
         logger.error(f"[WORKER] Job {job_id} failed: {e}")
-        emit_fn({"error": str(e)})
+        emit_fn({
+            "success": False,
+            "status": "generation_failed",
+            "error_code": "INVALID_LAYOUT",
+            "message": str(e)
+        })
+        raise

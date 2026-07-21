@@ -533,20 +533,33 @@ def split_duplex_specs(
         )
         if stair is None:
             return
+            
+        # Invariant: Staircase must not act as a universal hub.
+        if len(stair.get("connections", [])) > 2:
+            import logging
+            logging.getLogger(__name__).warning("STAIRCASE_USED_AS_UNIVERSAL_HUB: Staircase had more than 2 connections. Severing direct paths.")
+            
+        # Sever all AI-hallucinated direct paths to bedrooms/kitchen/etc.
+        stair["connections"] = []
+        
         hub = next(
-            (r for r in floor_specs if _canon(r.get("type", "")) in {"corridor", "hallway", "foyer"}),
+            (r for r in floor_specs if _canon(r.get("type", "")) in {"lobby", "stair_landing", "corridor", "hallway"}),
             None,
         )
         if hub is None:
             hub = next(
-                (r for r in floor_specs if _canon(r.get("type", "")) in {"living_room", "dining_room"}),
+                (r for r in floor_specs if _canon(r.get("type", "")) in {"foyer", "living_room", "family_lounge"}),
                 None,
             )
         if hub is None or hub is stair:
             return
-        connections = stair.setdefault("connections", [])
-        if not any(str(c.get("target_room", "")) == str(hub.get("type", "")) for c in connections):
-            connections.append({"target_room": hub.get("type"), "intent": "standard", "weight": 20})
+            
+        stair["connections"].append({
+            "target_room": hub.get("type"), 
+            "target_room_id": hub.get("id"), 
+            "intent": "standard", 
+            "weight": 20
+        })
 
     _connect_stair_to_public_core(ground)
     _connect_stair_to_public_core(first)
