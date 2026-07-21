@@ -5051,14 +5051,34 @@ def _stream_generate_work(req: "GenerateRequest", emit_fn: Callable) -> None:
                 return
 
         slm_result = None
-        if USE_SLM_ENGINE:
+        if getattr(req, "analysis_id", None):
+            cached_data = redis_client.get(f"analysis:{req.analysis_id}")
+            if cached_data:
+                slm_result = json.loads(cached_data)
+                logger.info(f"[API] Restored analysis_id {req.analysis_id} from Redis.")
+                
+                # Apply clarifications
+                if getattr(req, "clarifications", None):
+                    cl = req.clarifications
+                    if cl.get("road_side") and not slm_result.get("front_orientation"):
+                        slm_result["front_orientation"] = str(cl["road_side"]).lower().split()[0]
+                    if cl.get("coverage_preference"):
+                        slm_result["coverage_preference"] = cl["coverage_preference"]
+                    if cl.get("parking_count"):
+                        v = str(cl["parking_count"])
+                        if v.startswith("1"): slm_result.setdefault("target_rooms", []).append("parking")
+                        elif v.startswith("2"): slm_result.setdefault("target_rooms", []).extend(["parking", "parking"])
+                        elif v.startswith("3"): slm_result.setdefault("target_rooms", []).extend(["parking", "parking", "parking"])
+
+        if not slm_result and USE_SLM_ENGINE:
             try:
                 if existing_rooms:
                     slm_result = reason_modifications_deepseek(
                         req.prompt, build_ai_project_context(req.currentProject)
                     )
                 else:
-                    slm_result = extract_keywords_to_json(req.prompt, ALL_VOCABULARIES)
+                    from cloud_extractor import extract_keywords_groq
+                    slm_result = extract_keywords_groq(req.prompt, ALL_VOCABULARIES)
             except Exception as slm_e:
                 logger.error("SLM Extraction Failed: %s", slm_e)
                 slm_result = None
@@ -6475,8 +6495,6 @@ QUESTION_LIBRARY = {
     },
 }
 
-ANALYSIS_SESSIONS = {}
-
 @app.post("/api/analyze-prompt")
 async def analyze_prompt(req: GenerateRequest):
     logger.info("[API] Analyzing prompt for missing information...")
@@ -6495,8 +6513,8 @@ async def analyze_prompt(req: GenerateRequest):
                     "options": QUESTION_LIBRARY[key]["options"]
                 })
                 
-        # Save session
-        ANALYSIS_SESSIONS[analysis_id] = slm_result
+        # Save session to Redis (expire in 1 hour)
+        redis_client.set(f"analysis:{analysis_id}", json.dumps(slm_result), ex=3600)
         
         return {
             "analysis_id": analysis_id,
