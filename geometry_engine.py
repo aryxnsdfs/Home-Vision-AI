@@ -412,7 +412,11 @@ class CPSolver:
             model.Add(cx == 2 * rv['x'] + rv['w'])
             model.Add(cz == 2 * rv['z'] + rv['l'])
 
-            if rv.get('preferred_location') == 'center':
+            if rv.get('location_pref') == 'front':
+                obj_terms.append(10 * cz)
+            elif rv.get('location_pref') == 'rear':
+                obj_terms.append(10 * (plot_l * 2 - cz))
+            elif rv.get('location_pref') == 'center':
                 # Minimise distance between room centre and buildable-plot
                 # centre. This remains soft so hard access, adjacency and
                 # non-overlap constraints can select a nearby feasible spot.
