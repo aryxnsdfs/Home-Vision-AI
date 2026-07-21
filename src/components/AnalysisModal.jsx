@@ -30,7 +30,7 @@ export default function AnalysisModal() {
     // Grab state from project store to re-run generation
     // We don't have the original prompt/w/l here easily unless we stored it in analyzePrompt.
     // Wait, analyzePrompt doesn't store them in the store?
-    // We should just store lastPrompt, lastWidth, lastLength in useProjectStore when analyzePrompt is called.
+    const state = useProjectStore.getState();
     const finalPrompt = state.lastPrompt || "";
     await generateWithAI(
       finalPrompt,
