@@ -64,6 +64,19 @@ class CPSolver:
 
         if not rooms_spec:
             return floor_data
+            
+        # 1. Pre-solver feasibility check
+        total_min_area = sum(ROOM_MINIMUMS.get(r.get('type', 'room'), _DEFAULT_MIN).get('area', 64) for r in rooms_spec if not r.get('is_outdoor'))
+        if allowed_bounds:
+            slab_area = max(0.1, float(allowed_bounds[2]) - float(allowed_bounds[0])) * max(0.1, float(allowed_bounds[3]) - float(allowed_bounds[1]))
+        else:
+            slab_area = plot_w_ft * plot_l_ft * 0.85 # Approximation of buildable footprint
+            
+        if total_min_area > slab_area:
+            # We fast-fail before spinning up CP-SAT or multi-topology looping.
+            # Downstream logic in server.py (or layout_engine fallback) can handle this error appropriately.
+            logger.error(f"[PRE-CHECK] Infeasible layout: needs {int(total_min_area)} sq ft, but only {int(slab_area)} sq ft available.")
+            raise RuntimeError(f"Requested rooms require at least {int(total_min_area)} sq ft, but the available footprint is only {int(slab_area)} sq ft.")
 
         TOPOLOGY_TYPES = ["compact_hub", "hub_and_branch", "linear_spine"]
         
