@@ -3486,20 +3486,37 @@ def _preserve_modified_project_rooms(rooms: List[Dict[str, Any]]) -> Tuple[Dict[
     for level, floor_rooms in by_floor.items():
         if not floor_rooms:
             continue
-        nodes = [RoomNode(
-            id=str(r.get("id")),
-            type=str(r.get("type", "living_room")),
-            name=str(r.get("name", r.get("type", "Room"))),
-            rect=Rect(float(r["x"]), float(r["z"]), float(r["width"]), float(r["length"])),
-            wallThicknessIn=float(r.get("wallThicknessIn", 6) or 6),
-            floorColor=r.get("floorColor", "") or "",
-            wallColor=r.get("wallColor", "") or "",
-            furnitureColor=r.get("furnitureColor", "") or "",
-            furniture=r.get("furniture", []) or [],
-            mep_nodes=r.get("mep_nodes", []) or [],
-        ) for r in floor_rooms]
+        from layout_engine import AdjacencyResolver, compute_shared_walls, Door, Window
+        
+        nodes = []
+        for r in floor_rooms:
+            doors = [Door(**d) if isinstance(d, dict) else d for d in (r.get("doors") or [])]
+            windows = [Window(**w) if isinstance(w, dict) else w for w in (r.get("windows") or [])]
+            
+            nodes.append(RoomNode(
+                id=str(r.get("id")),
+                type=str(r.get("type", "living_room")),
+                name=str(r.get("name", r.get("type", "Room"))),
+                rect=Rect(float(r["x"]), float(r["z"]), float(r["width"]), float(r["length"])),
+                wallThicknessIn=float(r.get("wallThicknessIn", 6) or 6),
+                floorColor=r.get("floorColor", "") or "",
+                wallColor=r.get("wallColor", "") or "",
+                furnitureColor=r.get("furnitureColor", "") or "",
+                furniture=r.get("furniture", []) or [],
+                mep_nodes=r.get("mep_nodes", []) or [],
+                connections=r.get("connections", []) or [],
+                doors=doors,
+                windows=windows,
+            ))
+        
+        AdjacencyResolver(nodes).resolve()
+        
         walls = compute_shared_walls(nodes)
         layout_data[f"walls_floor_{level}"] = walls
+        
+        # Write back the resolved geometry (doors, windows, etc.)
+        for r, node in zip(floor_rooms, nodes):
+            r.update(node.to_dict())
 
     return layout_data, [room for level in sorted(by_floor) for room in by_floor[level]]
 
