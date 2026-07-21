@@ -19,6 +19,13 @@ FORBIDDEN_PAIRS = {
 # Minimum shared wall length (feet) required to place a door
 MIN_DOOR_WALL_FT = 4.0
 
+COORD_SCALE = 4  # quarter-foot precision
+
+def to_cp(value: float) -> int:
+    return int(round(value * COORD_SCALE))
+
+def from_cp(value: int) -> float:
+    return value / COORD_SCALE
 
 class CandidateStatus:
     GENERATED = "generated"
@@ -120,11 +127,10 @@ class CPSolver:
         if not rooms_spec:
             return floor_data
 
-        # Grid: 1 unit = 0.5 feet
-        scale = 2
-        plot_w = int(plot_w_ft * scale)
-        plot_l = int(plot_l_ft * scale)
-        door_w = int(MIN_DOOR_WALL_FT * scale)  # 8 grid units = 4 ft
+        # Grid uses quarter-foot precision via COORD_SCALE
+        plot_w = to_cp(plot_w_ft)
+        plot_l = to_cp(plot_l_ft)
+        door_w = to_cp(MIN_DOOR_WALL_FT)
 
         model = cp_model.CpModel()
 
@@ -167,9 +173,9 @@ class CPSolver:
             min_dim = max(1, min(min_dim, plot_w, plot_l))
 
             base_area = room.get("target_area") or ROOM_MINIMUMS.get(r_type, _DEFAULT_MIN).get("area", 64)
-            min_area_ft = min(
+            min_area_ft = max(
                 base_area,
-                max(1.0, (plot_w / scale) * (plot_l / scale)),
+                max(1.0, (from_cp(plot_w)) * (from_cp(plot_l))),
             )
             if room.get("min_w_override") and room.get("min_l_override"):
                 min_area_ft = max(min_area_ft, float(room["min_w_override"] * room["min_l_override"]))
@@ -186,10 +192,10 @@ class CPSolver:
                     model.Add(100 * w <= 200 * l)   # w/l ≤ 2.0
                 else:
                     # Corridor: at least one dimension must be narrow (≤ 5 ft)
-                    b1 = model.NewBoolVar(f'corr_narrow_w_{r_id}')
-                    b2 = model.NewBoolVar(f'corr_narrow_l_{r_id}')
-                    model.Add(w <= int(5.0 * scale)).OnlyEnforceIf(b1)
-                    model.Add(l <= int(5.0 * scale)).OnlyEnforceIf(b2)
+                    b1 = model.NewBoolVar(f'w_{r_id}_limit')
+                    b2 = model.NewBoolVar(f'l_{r_id}_limit')
+                    model.Add(w <= to_cp(5.0)).OnlyEnforceIf(b1)
+                    model.Add(l <= to_cp(5.0)).OnlyEnforceIf(b2)
                     model.AddBoolOr([b1, b2])
 
             if "fixed_rect" in room:
@@ -201,10 +207,10 @@ class CPSolver:
                 # exact stair after solving could then overlap a corridor by a
                 # fraction of a foot and leave no finite wall for its door.
                 # Reserve the complete enclosing grid box instead.
-                fixed_x = math.floor(fx * scale)
-                fixed_z = math.floor(fz * scale)
-                fixed_x_end = math.ceil((fx + fw) * scale)
-                fixed_z_end = math.ceil((fz + fl) * scale)
+                fixed_x = math.floor(fx * COORD_SCALE)
+                fixed_z = math.floor(fz * COORD_SCALE)
+                fixed_x_end = math.ceil((fx + fw) * COORD_SCALE)
+                fixed_z_end = math.ceil((fz + fl) * COORD_SCALE)
                 model.Add(x == fixed_x)
                 model.Add(z == fixed_z)
                 model.Add(w == fixed_x_end - fixed_x)
@@ -219,10 +225,10 @@ class CPSolver:
             # slab. Balconies/open-air projections may extend beyond it, but
             # still remain inside the plot domains above.
             if allowed_bounds and not room.get("is_outdoor") and str(room.get("roof_type", "")).lower() != "open":
-                bx0 = math.ceil(float(allowed_bounds[0]) * scale)
-                bz0 = math.ceil(float(allowed_bounds[1]) * scale)
-                bx1 = math.floor(float(allowed_bounds[2]) * scale)
-                bz1 = math.floor(float(allowed_bounds[3]) * scale)
+                bx0 = math.ceil(float(allowed_bounds[0]) * COORD_SCALE)
+                bz0 = math.ceil(float(allowed_bounds[1]) * COORD_SCALE)
+                bx1 = math.floor(float(allowed_bounds[2]) * COORD_SCALE)
+                bz1 = math.floor(float(allowed_bounds[3]) * COORD_SCALE)
                 model.Add(x >= max(0, bx0))
                 model.Add(z >= max(0, bz0))
                 model.Add(x_end <= min(plot_w, bx1))
@@ -234,8 +240,8 @@ class CPSolver:
             # Minimum area (HARD)
             area = model.NewIntVar(0, max(plot_w * plot_l, 1000000), f'area_{r_id}')
             model.AddMultiplicationEquality(area, [w, l])
-            if "fixed_rect" not in room:
-                model.Add(area >= int(min_area_ft * scale * scale))
+            if min_area_ft > 0:
+                model.Add(area >= int(min_area_ft * COORD_SCALE * COORD_SCALE))
 
             loc_pref = room.get('location_pref') or room.get('preferred_location') or (
                 'front' if r_type in {'foyer', 'porch', 'verandah', 'portico', 'entrance_lobby'} else ''
@@ -625,12 +631,13 @@ class CPSolver:
     # ── helpers ──────────────────────────────────────
 
     @staticmethod
-    def _add_touch_constraint(model, a, b, a_id, b_id, min_overlap=1.0):
+    def _add_touch_constraint(model, a, b, a_id, b_id, min_overlap_ft=1.0):
         """
         HARD: rooms *a* and *b* must share a wall with ≥ min_overlap overlap (adjacency).
 
         Encodes four directional cases; at least one must be true.
         """
+        min_overlap = to_cp(min_overlap_ft)
         tag = f'{a_id}__{b_id}'
 
         # Case 1 — A left of B  (A.x_end == B.x, Z overlap ≥ min_overlap)
