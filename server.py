@@ -257,10 +257,12 @@ _INTERNAL_OPEN_TYPES = {"courtyard", "angan", "aangan", "open_courtyard", "open_
 def is_instruction_like_room_label(value: Any) -> bool:
     """Reject action clauses accidentally emitted as open-ended room names."""
     label = re.sub(r"[_-]+", " ", str(value or "").lower()).strip()
+    if any(stair in label for stair in ("staircase", "stairwell", "stair", "landing", "lift", "elevator")):
+        return False
     has_floor_clause = bool(re.search(
         r"\b(?:ground|first|second|third|fourth|fifth|\d+(?:st|nd|rd|th)?)\s+floor\b", label,
     ))
-    has_action = bool(re.search(r"\b(?:add\d*|add|generate|create|build|make|put|floor)\b", label))
+    has_action = bool(re.search(r"\b(?:add\d*|add|generate|create|build|make|put)\b", label))
     return has_floor_clause and has_action
 
 
@@ -343,14 +345,21 @@ def ensure_internal_open_spaces(
     if extraction.get("angan"):
         requested.append("courtyard")
     internal = ["courtyard" if value in _INTERNAL_OPEN_TYPES else value for value in requested if value in _INTERNAL_OPEN_TYPES]
-    if not internal:
-        return program
-    ground = program.setdefault(0, [])
-    existing = {canonical_type(spec.get("type")) for specs in program.values() for spec in specs}
-    for room_type in dict.fromkeys(internal):
-        if room_type not in existing:
-            ground.append(normalize_ai_room_spec({"type": room_type, "name": room_type}) or {"type": room_type})
-            existing.add(room_type)
+    upper_outdoor = [value for value in requested if value in {"balcony", "terrace", "open_terrace"}]
+    if internal:
+        ground = program.setdefault(0, [])
+        existing = {canonical_type(spec.get("type")) for specs in program.values() for spec in specs}
+        for room_type in dict.fromkeys(internal):
+            if room_type not in existing:
+                ground.append(normalize_ai_room_spec({"type": room_type, "name": room_type}) or {"type": room_type})
+                existing.add(room_type)
+    if upper_outdoor:
+        upper = program.setdefault(1 if len(program) > 1 else 0, [])
+        existing_upper = {canonical_type(spec.get("type")) for spec in upper}
+        for room_type in dict.fromkeys(upper_outdoor):
+            if room_type not in existing_upper:
+                upper.append({"type": room_type, "name": room_type.replace("_", " ").title(), "is_outdoor": True})
+                existing_upper.add(room_type)
     return program
 
 
@@ -5130,15 +5139,7 @@ def _stream_generate_work(req: "GenerateRequest", emit_fn: Callable) -> None:
                         normalized_specs.append(normalized)
                 if normalized_specs:
                     explicit_program[level] = normalized_specs
-            if written_program:
-                if explicit_program and {
-                    level: [_program_room_class(spec.get("type")) for spec in specs]
-                    for level, specs in explicit_program.items()
-                } != {
-                    level: [_program_room_class(spec.get("type")) for spec in specs]
-                    for level, specs in written_program.items()
-                }:
-                    warnings.append("The written per-floor room schedule overrode a conflicting AI extraction.")
+            if written_program and not explicit_program:
                 explicit_program = written_program
             if explicit_program:
                 source = "written floor schedule" if written_program else "Gemini floor program"
