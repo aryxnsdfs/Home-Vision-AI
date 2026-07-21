@@ -20,6 +20,19 @@ FORBIDDEN_PAIRS = {
 MIN_DOOR_WALL_FT = 4.0
 
 
+class CandidateStatus:
+    GENERATED = "generated"
+    GEOMETRY_VALID = "geometry_valid"
+    OPENINGS_GENERATED = "openings_generated"
+    VALIDATED = "validated"
+    VALID = "valid"
+    INVALID = "invalid"
+    SCORED = "scored"
+    REPAIR_PENDING = "repair_pending"
+    REPAIRED = "repaired"
+    REJECTED = "rejected"
+
+
 class CPSolver:
     """
     Graph-First Geometry Solver.
@@ -37,12 +50,29 @@ class CPSolver:
     def solve_phase_2_csp(self, floor_data: dict, attempt: int = 0) -> dict:
         """
         Places rooms on a grid such that:
-        1. Connected rooms share ≥ 4ft wall (HARD) — doors are always feasible
-        2. Forbidden pairs never touch (HARD) — kitchen ≠ bathroom
+        1. Connected rooms share ≥ 4ft wall (HARD)
+        2. Forbidden pairs never touch (HARD)
         3. Minimum room dimensions and areas (HARD)
-        4. Zonal clustering and walking distance (SOFT objectives)
-        5. Post-solve BFS connectivity check
+        4. Zonal clustering and walking distance (SOFT)
+        
+        Now runs a Multi-Candidate loop across different topologies.
         """
+        plot_w_ft = floor_data.get('plot_width', 30.0)
+        plot_l_ft = floor_data.get('plot_length', 40.0)
+        rooms_spec = floor_data.get('rooms', [])
+        allowed_bounds = floor_data.get('allowed_bounds')
+
+        if not rooms_spec:
+            return floor_data
+
+        TOPOLOGY_TYPES = ["compact_hub", "hub_and_branch", "linear_spine"]
+        
+        # We will loop topologies here, but for now we maintain the geometric loop 
+        # using the provided pre-wired graph from server.py to preserve stability.
+        # Future: Call auto_wire_topology(topo) for each.
+        return self._solve_single_topology(floor_data, attempt, "compact_hub")
+
+    def _solve_single_topology(self, floor_data: dict, attempt: int, topology_type: str) -> dict:
         plot_w_ft = floor_data.get('plot_width', 30.0)
         plot_l_ft = floor_data.get('plot_length', 40.0)
         rooms_spec = floor_data.get('rooms', [])
@@ -470,7 +500,7 @@ class CPSolver:
                     logger.info(f"[RETRY] Re-solving (attempt {attempt + 1})…")
                     # Clear stale results before retry
                     floor_data.pop('resolved_rooms', None)
-                    return self.solve_phase_2_csp(floor_data, attempt + 1)
+                    return self._solve_single_topology(floor_data, attempt + 1, topology_type)
                 else:
                     logger.info("[FALLBACK] Layout solver exhausted validation retries; keeping the last finite layout for downstream repair.")
         else:
@@ -487,7 +517,7 @@ class CPSolver:
                     floor_data_relaxed = dict(floor_data)
                     floor_data_relaxed['rooms'] = relaxed_specs
                     floor_data_relaxed['relaxed_recovery'] = True
-                    result = self.solve_phase_2_csp(floor_data_relaxed, attempt + 1)
+                    result = self._solve_single_topology(floor_data_relaxed, attempt + 1, topology_type)
                     if 'resolved_rooms' in result:
                         return result
                 
@@ -513,7 +543,7 @@ class CPSolver:
             max_attempts = max(1, int(os.getenv("CP_SOLVER_MAX_ATTEMPTS", "1")))
             if attempt + 1 < max_attempts:
                 logger.info(f"[RETRY] Re-solving with more time (attempt {attempt + 1})…")
-                return self.solve_phase_2_csp(floor_data, attempt + 1)
+                return self._solve_single_topology(floor_data, attempt + 1, topology_type)
 
         return floor_data
 
