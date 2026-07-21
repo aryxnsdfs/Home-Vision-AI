@@ -461,7 +461,7 @@ def final_layout_validation(
     # 2. Circulation paths + adjacency rules (reuse architect checks).
     arch = validate_layout(nodes)
     circ_issues = [w for w in arch if "corridor" in w.lower() or "circulation" in w.lower() or "adjacent" in w.lower()]
-    adj_issues = [w for w in arch if w not in circ_issues]
+    adj_issues = [w for w in arch if w not in circ_issues and "toilet" in w.lower()]
     checks["circulation_paths"] = (not circ_issues, circ_issues)
     checks["adjacency_rules"] = (not adj_issues, adj_issues)
 

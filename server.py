@@ -5511,10 +5511,17 @@ def _stream_generate_work(req: "GenerateRequest", emit_fn: Callable) -> None:
         layout_params["rooms"] = auto_wire_topology(layout_params["rooms"], ai_categories=slm_result or {})
         layout_params["rooms"] = apply_prompt_proximities(layout_params["rooms"], req.prompt)
 
-        layout_params["floors"] = floors
-
         plot_w = layout_params.get("plot_width") or req.width or 40.0
         plot_l = layout_params.get("plot_length") or req.length or 40.0
+        buildable_plot_area = plot_w * plot_l * 0.85
+
+        from layout_engine import get_min_area
+        total_required_area = sum(get_min_area(r.get("type", "room")) for r in layout_params.get("rooms", []))
+        if total_required_area > buildable_plot_area:
+            needed_floors = math.ceil(total_required_area / max(1.0, buildable_plot_area))
+            floors = max(floors, min(3, needed_floors))
+            logger.info(f"[VERTICAL ESCALATION] Total required room area ({total_required_area:.0f} sq ft) exceeds buildable plot area ({buildable_plot_area:.0f} sq ft). Auto-escalating to {floors}-story layout.")
+            layout_params["floors"] = floors
 
         if explicit_program:
             validated_program: Dict[int, List[Dict]] = {}
@@ -5599,6 +5606,15 @@ def _stream_generate_work(req: "GenerateRequest", emit_fn: Callable) -> None:
                 if room_type and room_type not in _INTERNAL_OPEN_TYPES and room_type not in existing_outdoor:
                     outdoor_specs.append({"type": room_type, "name": room_type.replace("_", " "), "is_outdoor": True})
                     existing_outdoor.add(room_type)
+
+            # --- AUTOMATIC VERTICAL ESCALATION FOR OVERSIZED GROUND FLOOR ---
+            all_ground_rooms = floor_specs_by_level.get(0, [])
+            f0_min_area = sum(get_min_area(r.get("type", "room")) for r in all_ground_rooms)
+            if floors > 1 and (f0_min_area > buildable_plot_area or len(floor_specs_by_level.get(1, [])) == 0):
+                ground_spec, first_spec = split_duplex_specs(all_ground_rooms, bhk_val)
+                floor_specs_by_level[0] = sort_spec_by_generation_order(ground_spec)
+                floor_specs_by_level[1] = sort_spec_by_generation_order(first_spec)
+                logger.info(f"[VERTICAL ESCALATION] Split oversized ground floor ({f0_min_area:.0f} sq ft) into Duplex: {len(floor_specs_by_level[0])} ground rooms, {len(floor_specs_by_level[1])} upper rooms.")
 
             # --- ABSOLUTE FAIL-SAFE: PYTHON FLOOR BALANCER ---
             if floors > 1 and len(floor_specs_by_level.get(1, [])) > 0:
