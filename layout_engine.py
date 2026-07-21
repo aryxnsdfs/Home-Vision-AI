@@ -2038,8 +2038,8 @@ class AdjacencyResolver:
                 face1 = get_face(d1_x, d1_z, r1, is_vert)
                 face2 = get_face(d2_x, d2_z, r2, is_vert)
                 
-                r1.doors.append(Door(x=d1_x, z=d1_z, width=door_w, wall_orientation=face1))
-                r2.doors.append(Door(x=d2_x, z=d2_z, width=door_w, wall_orientation=face2))
+                r1.doors.append(Door(x=d1_x, z=d1_z, width=door_w, wall_orientation=face1, target_room_id=r2.id))
+                r2.doors.append(Door(x=d2_x, z=d2_z, width=door_w, wall_orientation=face2, target_room_id=r1.id))
                 
                 placed_doors_between.add(pair)
                 logger.info(f"    Placed door between '{r1.name}' and '{r2.name}'")
