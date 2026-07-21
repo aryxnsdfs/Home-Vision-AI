@@ -5579,6 +5579,57 @@ def _stream_generate_work(req: "GenerateRequest", emit_fn: Callable) -> None:
                 if room_type and room_type not in _INTERNAL_OPEN_TYPES and room_type not in existing_outdoor:
                     outdoor_specs.append({"type": room_type, "name": room_type.replace("_", " "), "is_outdoor": True})
                     existing_outdoor.add(room_type)
+
+            # --- ABSOLUTE FAIL-SAFE: PYTHON FLOOR BALANCER ---
+            if floors > 1 and len(floor_specs_by_level.get(1, [])) > 0:
+                from layout_engine import get_min_area
+                
+                f0_area = sum(get_min_area(r.get("type", "room")) for r in floor_specs_by_level.get(0, []))
+                f1_area = sum(get_min_area(r.get("type", "room")) for r in floor_specs_by_level.get(1, []))
+                
+                # If Floor 1 is heavier than Floor 0, forcefully intervene
+                if f1_area > f0_area:
+                    FLEXIBLE_TYPES = {'study_room', 'gym', 'children_s_play_area', 'family_lounge', 'home_office', 'bedroom'}
+                    f1_specs = list(floor_specs_by_level[1])
+                    
+                    for spec in reversed(f1_specs):  # Iterate backwards to pull secondary rooms first
+                        rtype = spec.get("type", "").lower()
+                        rname = spec.get("name", "").lower()
+                        if rtype in FLEXIBLE_TYPES or "bedroom" in rname:
+                            # Move room to ground floor
+                            floor_specs_by_level[0].append(spec)
+                            floor_specs_by_level[1].remove(spec)
+                            
+                            # Update areas
+                            shifted_area = get_min_area(rtype)
+                            f0_area += shifted_area
+                            f1_area -= shifted_area
+                            
+                            logger.info(f"[BALANCER] Overrode Gemini: Moved {spec.get('name')} to Floor 0 to fix Inverse Pyramid.")
+                            
+                            # Stop moving once balanced
+                            if f0_area >= f1_area:
+                                break
+
+            # --- ABSOLUTE FAIL-SAFE: STRUCTURAL PADDER ---
+            # If Floor 1 STILL requires more area, inject an outdoor pad to expand the foundation
+            if floors > 1 and len(floor_specs_by_level.get(1, [])) > 0:
+                f0_area = sum(get_min_area(r.get("type", "room")) for r in floor_specs_by_level.get(0, []))
+                f1_area = sum(get_min_area(r.get("type", "room")) for r in floor_specs_by_level.get(1, []))
+                if f1_area > f0_area:
+                    padding_needed = f1_area - f0_area
+                    pad_dim = int(math.sqrt(padding_needed)) + 1
+                    floor_specs_by_level[0].append({
+                        "type": "outdoor_space",
+                        "name": "covered_verandah_pad",
+                        "bathroom_role": "",
+                        "is_outdoor": True,
+                        "roof_type": "open",
+                        "min_w_override": pad_dim,
+                        "min_l_override": pad_dim
+                    })
+                    logger.info(f"[PADDER] Injected {pad_dim}x{pad_dim} structural verandah to support Floor 1.")
+
             floor_0_rooms = floor_specs_by_level.get(0, [])
             first_spec = floor_specs_by_level.get(1, [])
             room_pool = [spec for specs in floor_specs_by_level.values() for spec in specs]
