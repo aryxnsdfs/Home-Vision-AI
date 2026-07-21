@@ -217,7 +217,7 @@ class CPSolver:
             # Upper indoor rooms require structural support from the lower
             # slab. Balconies/open-air projections may extend beyond it, but
             # still remain inside the plot domains above.
-            if allowed_bounds and not room.get("is_outdoor") and str(room.get("roof_type", "")).lower() != "open":
+            if allowed_bounds and "fixed_rect" not in room and not room.get("is_outdoor") and str(room.get("roof_type", "")).lower() != "open":
                 bx0 = math.ceil(float(allowed_bounds[0]) * COORD_SCALE)
                 bz0 = math.ceil(float(allowed_bounds[1]) * COORD_SCALE)
                 bx1 = math.floor(float(allowed_bounds[2]) * COORD_SCALE)
@@ -597,6 +597,8 @@ class CPSolver:
                 return self._solve_single_topology(floor_data, attempt + 1, topology_type)
 
             # Final diagnostic if all attempts fail
+            failing_stage = self._diagnose_model_stages(floor_data)
+            logger.info(f"[MODEL DIAGNOSTIC] Final failing stage identified: {failing_stage}")
             if allowed_bounds:
                 total_min = sum(ROOM_MINIMUMS.get(r.get('type', 'room'), _DEFAULT_MIN)['area'] 
                                 for r in rooms_spec if not r.get('is_outdoor'))
@@ -611,9 +613,121 @@ class CPSolver:
                 else:
                     raise RuntimeError(
                         f"The requested layout ({len(rooms_spec)} rooms, {int(total_min)} sq ft min) "
-                        f"could not satisfy all spatial or door adjacency rules within the buildable footprint ({int(slab_area)} sq ft available). "
-                        f"Please simplify room count or relax layout rules."
+                        f"could not satisfy all spatial or door adjacency rules within the buildable footprint ({int(slab_area)} sq ft available) "
+                        f"[Failing stage: {failing_stage}]. Please simplify room count or relax layout rules."
                     )
+
+        return floor_data
+
+    def _diagnose_model_stages(self, floor_data: dict) -> str:
+        """Staged CP-SAT diagnostic tool to pinpoint constraint conflicts."""
+        plot_w_ft = floor_data.get('plot_width', 30.0)
+        plot_l_ft = floor_data.get('plot_length', 40.0)
+        rooms_spec = floor_data.get('rooms', [])
+        allowed_bounds = floor_data.get('allowed_bounds')
+        
+        stages = [
+            "variables_only",
+            "inside_boundary",
+            "room_dimensions",
+            "no_overlap",
+            "fixed_rooms",
+            "structural_adjacency",
+            "forbidden_adjacency",
+        ]
+        
+        first_failing_stage = "none"
+        for final_stage in stages:
+            model = cp_model.CpModel()
+            plot_w = to_cp(plot_w_ft)
+            plot_l = to_cp(plot_l_ft)
+            room_vars = {}
+            for idx, room in enumerate(rooms_spec):
+                r_type = room.get("type", "room")
+                r_id = room.get("id", f"{r_type}_{idx}")
+                base_min_dim = room.get("target_min_dim") or ROOM_MINIMUMS.get(r_type, _DEFAULT_MIN).get("min_dim", 8)
+                min_dim = to_cp(base_min_dim)
+                min_dim = max(1, min(min_dim, plot_w, plot_l))
+                
+                if "fixed_rect" in room and final_stage in {"fixed_rooms", "structural_adjacency", "forbidden_adjacency"}:
+                    fx, fz, fw, fl = room["fixed_rect"]
+                    fixed_x = math.floor(fx * COORD_SCALE)
+                    fixed_z = math.floor(fz * COORD_SCALE)
+                    fixed_x_end = math.ceil((fx + fw) * COORD_SCALE)
+                    fixed_z_end = math.ceil((fz + fl) * COORD_SCALE)
+                    x = model.NewIntVar(fixed_x, fixed_x, f'x_{r_id}')
+                    z = model.NewIntVar(fixed_z, fixed_z, f'z_{r_id}')
+                    w = model.NewIntVar(fixed_x_end - fixed_x, fixed_x_end - fixed_x, f'w_{r_id}')
+                    l = model.NewIntVar(fixed_z_end - fixed_z, fixed_z_end - fixed_z, f'l_{r_id}')
+                else:
+                    x = model.NewIntVar(0, max(0, plot_w - min_dim), f'x_{r_id}')
+                    z = model.NewIntVar(0, max(0, plot_l - min_dim), f'z_{r_id}')
+                    w = model.NewIntVar(min_dim, plot_w, f'w_{r_id}')
+                    l = model.NewIntVar(min_dim, plot_l, f'l_{r_id}')
+
+                x_end = model.NewIntVar(0, max(plot_w, 2000), f'xe_{r_id}')
+                z_end = model.NewIntVar(0, max(plot_l, 2000), f'ze_{r_id}')
+                model.Add(x_end == x + w)
+                model.Add(z_end == z + l)
+
+                if final_stage != "variables_only" and allowed_bounds and "fixed_rect" not in room and not room.get("is_outdoor") and str(room.get("roof_type", "")).lower() != "open":
+                    bx0 = math.ceil(float(allowed_bounds[0]) * COORD_SCALE)
+                    bz0 = math.ceil(float(allowed_bounds[1]) * COORD_SCALE)
+                    bx1 = math.floor(float(allowed_bounds[2]) * COORD_SCALE)
+                    bz1 = math.floor(float(allowed_bounds[3]) * COORD_SCALE)
+                    model.Add(x >= max(0, bx0))
+                    model.Add(z >= max(0, bz0))
+                    model.Add(x_end <= min(plot_w, bx1))
+                    model.Add(z_end <= min(plot_l, bz1))
+
+                x_iv = model.NewIntervalVar(x, w, x_end, f'xi_{r_id}')
+                z_iv = model.NewIntervalVar(z, l, z_end, f'zi_{r_id}')
+
+                if final_stage in {"room_dimensions", "no_overlap", "fixed_rooms", "structural_adjacency", "forbidden_adjacency"}:
+                    base_area = room.get("target_area") or ROOM_MINIMUMS.get(r_type, _DEFAULT_MIN).get("area", 64)
+                    min_area_ft = max(1.0, float(base_area))
+                    area = model.NewIntVar(0, max(plot_w * plot_l, 1000000), f'area_{r_id}')
+                    model.AddMultiplicationEquality(area, [w, l])
+                    model.Add(area >= int(min_area_ft * COORD_SCALE * COORD_SCALE))
+
+                room_vars[r_id] = {'type': r_type, 'connections': room.get('connections', []), 'x': x, 'z': z, 'w': w, 'l': l, 'x_end': x_end, 'z_end': z_end, 'x_iv': x_iv, 'z_iv': z_iv}
+
+            if final_stage in {"no_overlap", "fixed_rooms", "structural_adjacency", "forbidden_adjacency"}:
+                model.AddNoOverlap2D([rv['x_iv'] for rv in room_vars.values()], [rv['z_iv'] for rv in room_vars.values()])
+
+            if final_stage == "structural_adjacency":
+                for r_id, rv in room_vars.items():
+                    for conn in rv['connections']:
+                        intent = conn.get('intent', 'standard')
+                        target_type = conn.get('target_room', '')
+                        target_room_id = conn.get('target_room_id', '')
+                        target_id = target_room_id if target_room_id in room_vars and target_room_id != r_id else None
+                        if target_id and (intent == "attached" or intent == "open_flow" or "stair" in rv['type']):
+                            self._add_touch_constraint(model, rv, room_vars[target_id], r_id, target_id)
+
+            if final_stage == "forbidden_adjacency":
+                all_ids = list(room_vars.keys())
+                for i in range(len(all_ids)):
+                    for j in range(i + 1, len(all_ids)):
+                        id_a, id_b = all_ids[i], all_ids[j]
+                        if frozenset({room_vars[id_a]['type'], room_vars[id_b]['type']}) in FORBIDDEN_PAIRS:
+                            a, b = room_vars[id_a], room_vars[id_b]
+                            s1, s2, s3, s4 = model.NewBoolVar('s1'), model.NewBoolVar('s2'), model.NewBoolVar('s3'), model.NewBoolVar('s4')
+                            model.Add(a['x'] + a['w'] + 1 <= b['x']).OnlyEnforceIf(s1)
+                            model.Add(b['x'] + b['w'] + 1 <= a['x']).OnlyEnforceIf(s2)
+                            model.Add(a['z'] + a['l'] + 1 <= b['z']).OnlyEnforceIf(s3)
+                            model.Add(b['z'] + b['l'] + 1 <= a['z']).OnlyEnforceIf(s4)
+                            model.AddBoolOr([s1, s2, s3, s4])
+
+            solver = cp_model.CpSolver()
+            solver.parameters.max_time_in_seconds = 1.0
+            status = solver.Solve(model)
+            status_name = solver.StatusName(status)
+            logger.info(f"[MODEL DIAGNOSTIC] stage={final_stage} status={status_name}")
+            if status == cp_model.INFEASIBLE and first_failing_stage == "none":
+                first_failing_stage = final_stage
+
+        return first_failing_stage
 
         return floor_data
 
