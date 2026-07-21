@@ -550,8 +550,9 @@ class GeometryValidator:
                         
                 if len(door_connected[curr]) - valid_ensuites > 1:
                     msg = f"CIRCULATION ERROR: Private/Wet space '{boxes[curr].label}' is being incorrectly used as a hallway to connect other rooms."
-                    logger.info(msg)
-                    result.warnings.append(msg)
+                    logger.warning(msg)
+                    result.errors.append(msg)
+                    result.is_valid = False
 
         # 5. Door & Window Minimum Verifications
         for idx, room in enumerate(blueprint):
