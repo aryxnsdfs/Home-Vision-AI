@@ -6075,12 +6075,14 @@ def _stream_generate_work(req: "GenerateRequest", emit_fn: Callable) -> None:
 
         # LOCAL REPAIR PASS for repairable validation issues
         if not validation_report["ok"]:
+            import copy
+            repaired_nodes_0 = copy.deepcopy(generated_nodes_0)
             repaired_any = False
             for error in validation_report["errors"]:
                 msg = error.get("message", "")
                 if "Kitchen is not adjacent to the Dining Room" in msg or "not adjacent" in msg.lower():
-                    k_node = next((n for n in generated_nodes_0 if "kitchen" in getattr(n, "type", "").lower()), None)
-                    d_node = next((n for n in generated_nodes_0 if "dining" in getattr(n, "type", "").lower()), None)
+                    k_node = next((n for n in repaired_nodes_0 if "kitchen" in getattr(n, "type", "").lower()), None)
+                    d_node = next((n for n in repaired_nodes_0 if "dining" in getattr(n, "type", "").lower()), None)
                     if k_node and d_node:
                         logger.info("[LOCAL REPAIR] Attempting local replan to bring Kitchen and Dining Room together...")
                         k_dict = k_node.to_dict()
@@ -6092,13 +6094,13 @@ def _stream_generate_work(req: "GenerateRequest", emit_fn: Callable) -> None:
                             d_node.connections = d_dict.get("connections", [])
                             repaired_any = True
                         else:
-                            all_dicts = [n.to_dict() for n in generated_nodes_0]
+                            all_dicts = [n.to_dict() for n in repaired_nodes_0]
                             k_idx = next((i for i, r in enumerate(all_dicts) if r.get("id") == k_node.id), -1)
                             d_idx = next((i for i, r in enumerate(all_dicts) if r.get("id") == d_node.id), -1)
                             if k_idx != -1 and d_idx != -1:
                                 if _place_room_next_to(all_dicts, d_idx, k_idx):
                                     _ensure_door_between_rooms(all_dicts[k_idx], all_dicts[d_idx])
-                                    for idx, nd in enumerate(generated_nodes_0):
+                                    for idx, nd in enumerate(repaired_nodes_0):
                                         updated_r = all_dicts[idx]
                                         nd.rect.x = updated_r["x"]
                                         nd.rect.z = updated_r["z"]
@@ -6109,27 +6111,42 @@ def _stream_generate_work(req: "GenerateRequest", emit_fn: Callable) -> None:
                                     repaired_any = True
 
             if repaired_any:
-                AdjacencyResolver(generated_nodes_0, open_rooms=layout_params.get("open_rooms", [])).resolve()
-                floor_validation_reports = [
-                    (0, final_layout_validation(generated_nodes_0, indian_options=indian_opts, is_duplex=(floors > 1)))
+                AdjacencyResolver(repaired_nodes_0, open_rooms=layout_params.get("open_rooms", [])).resolve()
+                repaired_validation_reports = [
+                    (0, final_layout_validation(repaired_nodes_0, indian_options=indian_opts, is_duplex=(floors > 1)))
                 ]
                 if generated_nodes_1:
-                    floor_validation_reports.append(
+                    repaired_validation_reports.append(
                         (1, final_layout_validation(generated_nodes_1, indian_options=indian_opts, is_duplex=True))
                     )
-                validation_report = {
-                    "ok": all(report["ok"] for _, report in floor_validation_reports),
+                repaired_validation_report = {
+                    "ok": all(report["ok"] for _, report in repaired_validation_reports),
                     "checks": {
                         f"floor_{level}_{name}": check
-                        for level, report in floor_validation_reports
+                        for level, report in repaired_validation_reports
                         for name, check in report["checks"].items()
                     },
                     "errors": [
                         error if isinstance(error, dict) else {"code": "WARNING", "message": str(error)}
-                        for level, report in floor_validation_reports
+                        for level, report in repaired_validation_reports
                         for error in report.get("errors", report.get("issues", []))
                     ],
                 }
+                
+                # Transactional Commit: Only accept the repair if it fixed the fatal errors
+                if repaired_validation_report["ok"]:
+                    logger.info("[LOCAL REPAIR] Repair succeeded and passed validation! Committing changes.")
+                    generated_nodes_0 = repaired_nodes_0
+                    validation_report = repaired_validation_report
+                    floor_validation_reports = repaired_validation_reports
+                    
+                    # Update layout_data to reflect the repaired nodes
+                    shared_walls_0 = compute_shared_walls(generated_nodes_0)
+                    layout_data["floor_0"] = [n.to_dict() for n in generated_nodes_0]
+                    layout_data["walls_floor_0"] = shared_walls_0
+                    layout_data["mep_data"] = compute_mep_heuristics(generated_nodes_0)
+                else:
+                    logger.warning("[LOCAL REPAIR] Repair produced an invalid layout. Rolling back.")
 
         response["validation"] = validation_report
         if not validation_report["ok"]:
