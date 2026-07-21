@@ -178,6 +178,23 @@ class CPSolver:
             [rv['z_iv'] for rv in room_vars.values()],
         )
 
+        # Linear foundation sizing constraint for Floor 0
+        min_dims = floor_data.get('min_foundation_dims')
+        if min_dims and room_vars:
+            min_fw = int(min_dims[0] * scale)
+            min_fl = int(min_dims[1] * scale)
+            global_x0 = model.NewIntVar(0, plot_w, 'gx0')
+            global_x1 = model.NewIntVar(0, plot_w, 'gx1')
+            global_z0 = model.NewIntVar(0, plot_l, 'gz0')
+            global_z1 = model.NewIntVar(0, plot_l, 'gz1')
+            for rv in room_vars.values():
+                model.Add(global_x0 <= rv['x'])
+                model.Add(global_x1 >= rv['x_end'])
+                model.Add(global_z0 <= rv['z'])
+                model.Add(global_z1 >= rv['z_end'])
+            model.Add(global_x1 - global_x0 >= min(plot_w, min_fw))
+            model.Add(global_z1 - global_z0 >= min(plot_l, min_fl))
+
         # Master bedroom area ≥ any regular bedroom
         masters = [rv for rv in room_vars.values() if rv['type'] == 'master_bedroom']
         beds = [rv for rv in room_vars.values() if rv['type'] == 'bedroom']
@@ -451,15 +468,58 @@ class CPSolver:
                     logger.info("[FALLBACK] Layout solver exhausted validation retries; keeping the last finite layout for downstream repair.")
         else:
             if status == cp_model.MODEL_INVALID:
-                logger.info(f"[FALLBACK] CP model was invalid; using deterministic layout fallback. Details: {model.Validate()}")
-            logger.info(f"CP Solver did not return a solution (status {status}, attempt {attempt}); using deterministic fallback.")
+                logger.info(f"[FALLBACK] CP model was invalid; Details: {model.Validate()}")
+            logger.info(f"CP Solver did not return a solution (status {status}, attempt {attempt}).")
             floor_data['validation'] = {'passed': False, 'errors': ['Solver infeasible']}
+            
+            # Relaxation pass + hard abort for slab-constrained upper floors
+            if allowed_bounds and 'resolved_rooms' not in floor_data:
+                relaxed_specs = self._relax_optional_rooms(rooms_spec)
+                if relaxed_specs is not None:
+                    logger.info("[RELAXATION] Shrinking optional rooms to architectural minimums and retrying...")
+                    floor_data_relaxed = dict(floor_data)
+                    floor_data_relaxed['rooms'] = relaxed_specs
+                    floor_data_relaxed['relaxed_recovery'] = True
+                    result = self.solve_phase_2_csp(floor_data_relaxed, attempt + 1)
+                    if 'resolved_rooms' in result:
+                        return result
+                
+                # Hard abort if relaxation also failed or was not possible
+                total_min = sum(ROOM_MINIMUMS.get(r.get('type', 'room'), _DEFAULT_MIN)['area'] 
+                                for r in rooms_spec if not r.get('is_outdoor'))
+                slab_w = max(0.1, float(allowed_bounds[2]) - float(allowed_bounds[0]))
+                slab_l = max(0.1, float(allowed_bounds[3]) - float(allowed_bounds[1]))
+                slab_area = slab_w * slab_l
+                raise RuntimeError(
+                    f"Your requested upper-floor layout requires a minimum of {int(total_min)} sq ft, "
+                    f"but the ground floor foundation only provides {int(slab_area)} sq ft. "
+                    f"Please reduce upper-floor rooms or increase the plot size."
+                )
+
             max_attempts = max(1, int(os.getenv("CP_SOLVER_MAX_ATTEMPTS", "1")))
             if attempt + 1 < max_attempts:
                 logger.info(f"[RETRY] Re-solving with more time (attempt {attempt + 1})…")
                 return self.solve_phase_2_csp(floor_data, attempt + 1)
 
         return floor_data
+
+    def _relax_optional_rooms(self, rooms_spec: list) -> list | None:
+        """Shrink flexible rooms to their absolute architectural minimums."""
+        import copy
+        relaxable_types = {'study_room', 'gym', 'children_s_play_area', 'family_lounge',
+                           'home_office', 'play_area', 'media_room', 'home_theater'}
+        relaxed = copy.deepcopy(rooms_spec)
+        changed = False
+        for room in relaxed:
+            rtype = room.get('type', '')
+            if rtype in relaxable_types:
+                mins = ROOM_MINIMUMS.get(rtype, _DEFAULT_MIN)
+                min_side = mins['min_dim']
+                if room.get('width', 999) > min_side or room.get('length', 999) > min_side:
+                    room['width'] = min_side
+                    room['length'] = min_side
+                    changed = True
+        return relaxed if changed else None
 
     # ── helpers ──────────────────────────────────────
 

@@ -5549,7 +5549,7 @@ def _stream_generate_work(req: "GenerateRequest", emit_fn: Callable) -> None:
                     # entry/foyer room unless the user actually requested it.
                     normalized_type = canonical_type(normalized.get("type"))
                     if normalized_type in {"entry", "entrance", "foyer"} and not re.search(
-                        r"\b(?:entry|entrance\s+foyer|foyer)\b", req.prompt.lower(),
+                        r"\b(?:entry|entrance|foyer|mudroom|shoe\s*area|lobby)\b", req.prompt.lower(),
                     ):
                         logger.info("[SEMANTIC GUARD] Removed unrequested optional room: %s", normalized_type)
                         continue
@@ -5619,6 +5619,16 @@ def _stream_generate_work(req: "GenerateRequest", emit_fn: Callable) -> None:
                 r["attempt"] = attempt
 
             try:
+                # Calculate minimum foundation dimensions needed for Floor 1
+                if floors > 1 and first_spec:
+                    from layout_engine import get_min_area
+                    floor_1_min_area = sum(get_min_area(r.get("type", "room")) for r in first_spec)
+                    if floor_1_min_area > 0:
+                        aspect = plot_w / max(1.0, plot_l)
+                        min_l_needed = math.sqrt(floor_1_min_area / max(0.1, aspect))
+                        min_w_needed = floor_1_min_area / max(1.0, min_l_needed)
+                        engine.min_foundation_dims = (min_w_needed, min_l_needed)
+
                 # Generate Floor 0
                 generated_nodes_0 = engine.generate(
                     floor_0_rooms,

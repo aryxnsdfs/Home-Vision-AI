@@ -534,12 +534,12 @@ def inject_main_entrance(
     """
     candidate = None
     for r in rooms:
-        if r.type == "living_room":
+        if r.type == "foyer":
             candidate = r
             break
     if candidate is None:
         for r in rooms:
-            if r.type == "foyer":
+            if r.type == "living_room":
                 candidate = r
                 break
     if candidate is None:
@@ -1442,6 +1442,8 @@ class LayoutEngine:
             }
             if isinstance(plot_info, dict) and plot_info.get("allowed_bounds"):
                 floor_data["allowed_bounds"] = tuple(plot_info["allowed_bounds"])
+            if hasattr(self, "min_foundation_dims") and self.min_foundation_dims:
+                floor_data["min_foundation_dims"] = self.min_foundation_dims
             solved_data = engine.solve_phase_2_csp(floor_data)
 
             # Dense but valid schedules can spend the primary deadline proving
@@ -1486,8 +1488,19 @@ class LayoutEngine:
                 )
         except Exception as e:
             logger.error(f"CP Solver exception: {e}")
-            # Fall back to legacy BSP if solver crashes or fails
-            
+            if isinstance(plot_info, dict) and plot_info.get("allowed_bounds"):
+                raise RuntimeError(
+                    "The requested upper-floor layout exceeds the ground floor foundation size. "
+                    "Please reduce upper-floor rooms or increase the plot size."
+                )
+            # Fall back to legacy BSP only for ground floor (no slab constraints)
+
+        if isinstance(plot_info, dict) and plot_info.get("allowed_bounds"):
+            raise RuntimeError(
+                "The requested upper-floor layout exceeds the ground floor foundation size. "
+                "Please reduce upper-floor rooms or increase the plot size."
+            )
+
         # --- LEGACY BSP ENGINE FALLBACK ---
 
         type_counts: Dict[str, int] = {}
