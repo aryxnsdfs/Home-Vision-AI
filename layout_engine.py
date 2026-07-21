@@ -45,6 +45,7 @@ class Door:
     width: float = 3.0
     height: float = 7.0
     is_main: bool = False
+    target_room_id: str = ""
 
 @dataclass
 class Window:
@@ -2095,8 +2096,8 @@ class AdjacencyResolver:
                 face1 = get_face(d1_x, d1_z, r1, is_vert)
                 face2 = get_face(d2_x, d2_z, r2, is_vert)
                 
-                r1.doors.append(Door(x=d1_x, z=d1_z, width=door_w, wall_orientation=face1))
-                r2.doors.append(Door(x=d2_x, z=d2_z, width=door_w, wall_orientation=face2))
+                r1.doors.append(Door(x=d1_x, z=d1_z, width=door_w, wall_orientation=face1, target_room_id=r2.id))
+                r2.doors.append(Door(x=d2_x, z=d2_z, width=door_w, wall_orientation=face2, target_room_id=r1.id))
                 
                 placed_doors_between.add(pair)
                 logger.info(f"[DOOR PLANNER] Added recovery door for {r.name} to {r1.name if r.id == r2.id else r2.name} ({door_w}ft)")
@@ -2156,8 +2157,8 @@ class AdjacencyResolver:
             door_w = max(2.0, min(3.0, round(wall_len - 0.2, 1)))
             tx, tz = cx - target.rect.x, cz - target.rect.z
             ox, oz = cx - other.rect.x, cz - other.rect.z
-            target.doors.append(Door(x=tx, z=tz, width=door_w, wall_orientation=get_face(tx, tz, target, is_vert)))
-            other.doors.append(Door(x=ox, z=oz, width=door_w, wall_orientation=get_face(ox, oz, other, is_vert)))
+            target.doors.append(Door(x=tx, z=tz, width=door_w, wall_orientation=get_face(tx, tz, target, is_vert), target_room_id=other.id))
+            other.doors.append(Door(x=ox, z=oz, width=door_w, wall_orientation=get_face(ox, oz, other, is_vert), target_room_id=target.id))
             logger.info(f"[DOOR PLANNER] Connected navigation component: {target.name} ↔ {other.name}")
 
         # A staircase must open directly into the public circulation core.
