@@ -5884,7 +5884,8 @@ def _stream_generate_work(req: "GenerateRequest", emit_fn: Callable) -> None:
 
                 if not val_0.is_valid:
                     logger.warning(f"[PIPELINE] Floor 0 validation failed on attempt {attempt + 1}: {val_0.errors}")
-                    if attempt < max_attempts - 1:
+                    has_overlap_error = any("OVERLAP" in str(err) for err in val_0.errors)
+                    if attempt < max_attempts - 1 and not has_overlap_error:
                         logger.info(f"[PIPELINE] Attempting LOCAL REPAIR for Floor 0 (Attempt {attempt + 2})")
                         # Freeze the public core (excluding circulation) so solver can adjust private rooms and corridors around it
                         public_core_types = {"living_room", "kitchen", "dining_room", "foyer", "staircase", "stairwell", "open_kitchen", "dining_area"}
@@ -5905,10 +5906,15 @@ def _stream_generate_work(req: "GenerateRequest", emit_fn: Callable) -> None:
                         logger.info(f"[LOCAL REPAIR] Unlocked rooms: {', '.join(unlocked)}")
                         continue  # Retry with frozen core!
                     else:
-                        raise RuntimeError(
-                            "Floor 0 failed geometry/accessibility validation after repair retries: "
-                            + "; ".join(val_0.errors[:8])
-                        )
+                        # Clear any frozen rects so retries don't carry broken coordinates
+                        for spec in floor_0_rooms:
+                            spec.pop("fixed_rect", None)
+                        if attempt == max_attempts - 1:
+                            raise RuntimeError(
+                                "Floor 0 failed geometry/accessibility validation after repair retries: "
+                                + "; ".join(val_0.errors[:8])
+                            )
+                        continue
 
                 # Initialize layout_data
                 shared_walls_0 = compute_shared_walls(generated_nodes_0)
