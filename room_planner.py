@@ -21,6 +21,90 @@ from layout_engine import (
     validate_layout,
     _share_edge,
 )
+from dataclasses import dataclass
+import copy
+
+@dataclass
+class RoomAreaProfile:
+    min_area: float
+    preferred_area: float
+    max_area: float
+    min_dim: float
+    expansion_priority: float
+
+ROOM_PROFILES = {
+    "formal_living_room": RoomAreaProfile(150, 250, 400, 11.0, 1.0),
+    "family_lounge": RoomAreaProfile(120, 200, 300, 10.0, 1.0),
+    "living_room": RoomAreaProfile(150, 250, 400, 11.0, 1.0),
+    "master_bedroom": RoomAreaProfile(160, 220, 350, 11.0, 0.9),
+    "bedroom": RoomAreaProfile(140, 180, 250, 10.0, 0.6),
+    "dining_room": RoomAreaProfile(80, 140, 220, 8.0, 0.85),
+    "kitchen": RoomAreaProfile(60, 120, 200, 7.0, 0.8),
+    "gym": RoomAreaProfile(120, 160, 250, 9.0, 0.75),
+    "library": RoomAreaProfile(100, 140, 200, 8.0, 0.65),
+    "study_room": RoomAreaProfile(60, 100, 150, 7.0, 0.6),
+    "home_office": RoomAreaProfile(80, 120, 180, 8.0, 0.6),
+    "bathroom": RoomAreaProfile(40, 50, 80, 5.0, 0.25),
+    "toilet": RoomAreaProfile(25, 30, 45, 4.0, 0.1),
+    "powder_room": RoomAreaProfile(25, 30, 45, 4.0, 0.1),
+    "staircase": RoomAreaProfile(40, 50, 70, 6.0, 0.0),
+    "foyer": RoomAreaProfile(30, 60, 100, 4.0, 0.7),
+    "corridor": RoomAreaProfile(40, 60, 100, 4.0, 0.1),
+    "balcony": RoomAreaProfile(40, 60, 120, 4.0, 0.3),
+    "store_room": RoomAreaProfile(25, 40, 80, 4.0, 0.1),
+    "pooja_room": RoomAreaProfile(20, 30, 60, 4.0, 0.2),
+    "utility": RoomAreaProfile(30, 40, 60, 4.0, 0.1),
+    "garage": RoomAreaProfile(150, 200, 400, 10.0, 0.5),
+    "parking": RoomAreaProfile(100, 140, 200, 8.0, 0.1),
+}
+
+def apply_room_scaling(rooms_spec: List[Dict[str, Any]], target_ground_footprint: float) -> List[Dict[str, Any]]:
+    """Distributes extra area to rooms based on target_ground_footprint and expansion_priority."""
+    if not rooms_spec or target_ground_footprint <= 0:
+        return rooms_spec
+        
+    scaled_rooms = copy.deepcopy(rooms_spec)
+    
+    # Calculate base sum
+    total_min = 0.0
+    for r in scaled_rooms:
+        if r.get("is_outdoor"):
+            continue
+        rtype = r.get("type", "")
+        prof = ROOM_PROFILES.get(rtype, RoomAreaProfile(40, 50, 80, 5.0, 0.1))
+        r["target_area"] = prof.min_area
+        r["target_min_dim"] = prof.min_dim
+        r["_profile"] = prof
+        total_min += prof.min_area
+
+    if total_min >= target_ground_footprint:
+        return scaled_rooms # No extra area to distribute
+
+    extra_area = target_ground_footprint - total_min
+    
+    # Distribute based on expansion priority towards max_area
+    total_priority = sum(r["_profile"].expansion_priority for r in scaled_rooms if not r.get("is_outdoor") and r["_profile"].expansion_priority > 0)
+    if total_priority <= 0:
+        return scaled_rooms
+        
+    for r in scaled_rooms:
+        if r.get("is_outdoor") or r["_profile"].expansion_priority <= 0:
+            continue
+            
+        weight = r["_profile"].expansion_priority / total_priority
+        added_area = extra_area * weight
+        
+        # Cap at max_area
+        new_area = r["target_area"] + added_area
+        if new_area > r["_profile"].max_area:
+            new_area = r["_profile"].max_area
+            
+        r["target_area"] = new_area
+        # Scale min_dim roughly by square root of area scaling
+        area_ratio = new_area / r["_profile"].min_area
+        r["target_min_dim"] = r["_profile"].min_dim * (area_ratio ** 0.5)
+
+    return scaled_rooms
 
 # ---------------------------------------------------------------------------
 # 1. Classification Matrix
