@@ -745,7 +745,7 @@ def auto_wire_topology(room_types: list, ai_categories: dict = None) -> list:
         else:
             # Default to public zone if it isn't private, wet, or outdoor
             public_idx.append(i)
-            r['role'] = {'traffic': 'medium', 'can_be_passage': True}
+            r['role'] = {'traffic': 'medium', 'can_be_passage': False}
 
     def add_conn(src_idx, target_idx, intent, weight):
         room_specs[src_idx]['connections'].append({
