@@ -514,15 +514,15 @@ def split_duplex_specs(
             zone = classify_zone(rt)
             (first if zone == ZONE_PRIVATE and first_has_private(first) else ground).append(r)
 
-    # Guarantee circulation + a continuous staircase on both floors.
-    _ensure_type(ground, "staircase")
+    # Guarantee circulation on ground floor.
     _ensure_type(ground, "corridor")
-    _ensure_type(first, "staircase")
-    _ensure_type(first, "corridor")
-    if not first:
-        # Degenerate (e.g. <=2 BR): keep the upper floor as a family space.
-        first.append({"type": "living_room", "confidence": 100})
-        _ensure_type(first, "staircase")
+    
+    # Only inject staircase and upper floor circulation if this is genuinely a multi-floor layout!
+    if len(first) > 0 or any(_canon(r.get("type", "")) == "staircase" for r in ground):
+        _ensure_type(ground, "staircase")
+        if len(first) > 0:
+            _ensure_type(first, "staircase")
+            _ensure_type(first, "corridor")
 
     # `_ensure_type` may add the staircase after the AI topology has already
     # been wired.  Re-attach it here so duplex splitting can never leave the

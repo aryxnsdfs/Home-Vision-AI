@@ -547,7 +547,65 @@ def extract_explicit_floor_program(prompt: str, candidates: Iterable[Dict[str, A
                     occupied.append((found.start(), found.end()))
         if specs:
             program[level] = specs
-    return program
+def enforce_floor_intent(prompt: str, slm_result: dict, requested_floors: int = 1) -> dict:
+    if not slm_result or not isinstance(slm_result, dict):
+        return slm_result
+        
+    prompt_lower = (prompt or "").lower()
+    explicit_keywords = [
+        "duplex", "first floor", "upper floor", "two storey", "2 storey",
+        "second floor", "upstairs", "two floor", "2 floor", "two-storey",
+        "multi floor", "multifloor", "3 storey", "three storey", "triple story",
+        "ground + first", "ground+first"
+    ]
+    has_explicit_mention = any(k in prompt_lower for k in explicit_keywords)
+    has_schedule = bool(slm_result.get("has_explicit_floor_schedule", False))
+    evidence = slm_result.get("floor_evidence", [])
+
+    # Strict Rule: If prompt does not explicitly mention a multi-floor layout and has no evidence:
+    if not has_explicit_mention and not has_schedule and not evidence and requested_floors == 1:
+        slm_result["floors"] = 1
+        slm_result["floor_count"] = 1
+        slm_result["has_explicit_floor_schedule"] = False
+        slm_result["generate_only_floor"] = None
+        
+        # Merge all floor programs and unassigned rooms into Floor 0
+        all_rooms = []
+        floor_program = slm_result.get("floor_program")
+        if isinstance(floor_program, list):
+            for item in floor_program:
+                if isinstance(item, dict):
+                    all_rooms.extend(item.get("rooms", []))
+        elif isinstance(floor_program, dict):
+            for level, rooms in floor_program.items():
+                if isinstance(rooms, list):
+                    all_rooms.extend(rooms)
+        
+        if slm_result.get("unassigned_rooms"):
+            all_rooms.extend(slm_result["unassigned_rooms"])
+
+        if slm_result.get("target_rooms"):
+            for tr in slm_result["target_rooms"]:
+                if tr not in all_rooms:
+                    all_rooms.append(tr)
+
+        # STRIP AUTO-GENERATED STAIRCASES AND BALCONIES FOR SINGLE-FLOOR HOUSES
+        clean_rooms = []
+        for r in all_rooms:
+            r_str = r if isinstance(r, str) else (r.get("type") if isinstance(r, dict) else str(r))
+            r_canon = canonical_type(r_str)
+            if r_canon in {"staircase", "stairwell", "stair"} and "stair" not in prompt_lower:
+                logger.info(f"[FLOOR INTENT] Stripping auto-added staircase '{r_str}' from single-floor request.")
+                continue
+            if r_canon in {"balcony", "terrace"} and not any(k in prompt_lower for k in ["balcony", "terrace"]):
+                logger.info(f"[FLOOR INTENT] Stripping auto-added balcony '{r_str}' from single-floor request.")
+                continue
+            clean_rooms.append(r)
+
+        slm_result["floor_program"] = {"0": clean_rooms}
+        logger.info(f"[FLOOR INTENT] Enforced single ground floor (Floor 0) with {len(clean_rooms)} rooms.")
+    
+    return slm_result
 
 
 def _program_room_class(value: Any) -> str:
@@ -5087,6 +5145,7 @@ def _stream_generate_work(req: "GenerateRequest", emit_fn: Callable) -> None:
         warnings: List[str] = []
 
         if slm_result:
+            slm_result = enforce_floor_intent(req.prompt, slm_result, req.floors or 1)
             slm_result = apply_spatial_analysis_defaults(slm_result)
             layout_params: Dict[str, Any] = {}
             if slm_result.get("bhk"):
