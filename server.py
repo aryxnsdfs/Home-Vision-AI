@@ -6031,13 +6031,10 @@ def _stream_generate_work(req: "GenerateRequest", emit_fn: Callable) -> None:
 
                 ArchitecturalRules.optimize_wet_walls(generated_nodes_0)
                 arch_warnings = ArchitecturalRules.validate_rules(generated_nodes_0)
+                ArchitecturalRules.optimize_wet_walls(generated_nodes_0)
+                arch_warnings = ArchitecturalRules.validate_rules(generated_nodes_0)
                 AdjacencyResolver(generated_nodes_0, open_rooms=layout_params.get("open_rooms", [])).resolve()
-                WindowPlacer(generated_nodes_0, engine.plot_width, engine.plot_length,
-                             setback_x=engine.setback_x, setback_z=engine.setback_z).place_windows()
-                courtyard_window_count = place_courtyard_facing_windows(generated_nodes_0, req.prompt)
-                if any(canonical_type(spec.get("type")) == "courtyard" for spec in floor_0_rooms):
-                    trace(f"Courtyard-facing windows placed={courtyard_window_count}")
-                
+
                 # Post-placement validation Floor 0
                 from geometry_validator import GeometryValidator
                 val_0 = GeometryValidator.validate_post_placement(generated_nodes_0)
@@ -6045,28 +6042,45 @@ def _stream_generate_work(req: "GenerateRequest", emit_fn: Callable) -> None:
                 if not val_0.is_valid:
                     logger.warning(f"[PIPELINE] Floor 0 validation failed on attempt {attempt + 1}: {val_0.errors}")
                     has_overlap_error = any("OVERLAP" in str(err) for err in val_0.errors)
+                    # Extract affected room names/IDs from errors
+                    affected_terms = set()
+                    for err in val_0.errors:
+                        for token in str(err).replace("↔", " ").replace(":", " ").split():
+                            affected_terms.add(token.lower())
+
                     if attempt < max_attempts - 1 and not has_overlap_error:
                         logger.info(f"[PIPELINE] Attempting LOCAL REPAIR for Floor 0 (Attempt {attempt + 2})")
-                        # Freeze the public core (excluding circulation) so solver can adjust private rooms and corridors around it
-                        public_core_types = {"living_room", "kitchen", "dining_room", "foyer", "staircase", "stairwell", "open_kitchen", "dining_area"}
+                        # Freeze public core ONLY IF it is NOT one of the affected broken rooms!
+                        public_core_types = {"living_room", "kitchen", "dining_room", "foyer", "staircase", "open_kitchen", "dining_area"}
                         frozen = []
                         unlocked = []
                         for spec in floor_0_rooms:
                             rt = canonical_type(spec.get("type"))
+                            spec_id = str(spec.get("id") or "").lower()
                             room_name = spec.get("id") or rt
-                            if rt in public_core_types:
-                                # Find the generated node to get its coordinates
+                            is_affected = any(t in spec_id or t in rt for t in affected_terms)
+
+                            if rt in public_core_types and not is_affected:
                                 generated = next((n for n in generated_nodes_0 if n.id == spec.get("id") or canonical_type(n.type) == rt), None)
                                 if generated:
                                     spec["fixed_rect"] = (generated.rect.x, generated.rect.z, generated.rect.width, generated.rect.length)
                                     frozen.append(room_name)
+                                else:
+                                    unlocked.append(room_name)
                             else:
+                                spec.pop("fixed_rect", None)
                                 unlocked.append(room_name)
-                        logger.info(f"[LOCAL REPAIR] Frozen rooms: {', '.join(frozen)}")
-                        logger.info(f"[LOCAL REPAIR] Unlocked rooms: {', '.join(unlocked)}")
-                        continue  # Retry with frozen core!
+
+                        if not frozen:
+                            logger.info("[LOCAL REPAIR] Abandoned because all candidate rooms are affected by errors. Starting fresh solve.")
+                            for spec in floor_0_rooms:
+                                spec.pop("fixed_rect", None)
+                        else:
+                            logger.info(f"[LOCAL REPAIR] Frozen rooms: {', '.join(frozen)}")
+                            logger.info(f"[LOCAL REPAIR] Unlocked rooms: {', '.join(unlocked)}")
+                        continue
                     else:
-                        # Clear any frozen rects so retries don't carry broken coordinates
+                        logger.info("[LOCAL REPAIR] Abandoned because candidate is invalid. Discarding candidate and starting fresh solve.")
                         for spec in floor_0_rooms:
                             spec.pop("fixed_rect", None)
                         if attempt == max_attempts - 1:
@@ -6075,6 +6089,13 @@ def _stream_generate_work(req: "GenerateRequest", emit_fn: Callable) -> None:
                                 + "; ".join(val_0.errors[:8])
                             )
                         continue
+
+                # Generate windows ONCE after access validation succeeds
+                WindowPlacer(generated_nodes_0, engine.plot_width, engine.plot_length,
+                             setback_x=engine.setback_x, setback_z=engine.setback_z).place_windows()
+                courtyard_window_count = place_courtyard_facing_windows(generated_nodes_0, req.prompt)
+                if any(canonical_type(spec.get("type")) == "courtyard" for spec in floor_0_rooms):
+                    trace(f"Courtyard-facing windows placed={courtyard_window_count}")
 
                 # Initialize layout_data
                 shared_walls_0 = compute_shared_walls(generated_nodes_0)

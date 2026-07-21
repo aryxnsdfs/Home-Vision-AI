@@ -1297,6 +1297,11 @@ class LayoutEngine:
             for donor in sorted(nodes, key=donor_rank):
                 if donor.type in protected or donor.roof_type == "open" or getattr(donor, "is_outdoor", False):
                     continue
+                # Restrict partition fallback: only attached bathrooms may be partitioned from their assigned bedroom
+                is_attached_bath = (room_type in {"bathroom", "attached_bathroom", "ensuite"} and source.get("bathroom_role") == "attached")
+                if not is_attached_bath or "bedroom" not in donor.type:
+                    continue
+
                 donor_min = ROOM_MINIMUMS.get(donor.type, _DEFAULT_MIN)
                 donor_min_dim = float(donor_min.get("min_dim", 6.0))
                 donor_min_area = float(donor_min.get("area", 36.0))
@@ -2165,6 +2170,13 @@ class AdjacencyResolver:
                 pair = tuple(sorted([r1_id, r2_id]))
                 
                 r1, r2 = room_by_id[r1_id], room_by_id[r2_id]
+                t1, t2 = canonical_type(r1.type), canonical_type(r2.type)
+
+                # Never allow illegal recovery doors: bathroom ↔ bathroom, bedroom ↔ living, bathroom ↔ foyer
+                if (t1 == "bathroom" and t2 == "bathroom") or (t1 == "bedroom" and t2 == "living_room") or (t1 == "living_room" and t2 == "bedroom") or (t1 == "bathroom" and t2 == "foyer") or (t1 == "foyer" and t2 == "bathroom"):
+                    logger.warning(f"[DOOR PLANNER] Rejected unapproved recovery door between {r1.name} ({t1}) and {r2.name} ({t2})")
+                    continue
+
                 w_len = wall_len(best_wall)
                 
                 door_w = 3.0

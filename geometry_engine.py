@@ -304,6 +304,8 @@ class CPSolver:
         # ────────────────────────────────────────────
         processed_edges = set()
         hard_touch_count = 0
+        direct_door_count = 0
+        soft_count = 0
         for r_id, rv in room_vars.items():
             for conn in rv['connections']:
                 intent = conn.get('intent', 'standard')
@@ -332,22 +334,37 @@ class CPSolver:
                 t_a = rv['type'].lower()
                 t_b = trv['type'].lower()
 
-                # Determine if this edge is a HARD shared-wall requirement
-                is_attached_bath = (("bath" in t_a or "toilet" in t_a) and "bed" in t_b) or (("bath" in t_b or "toilet" in t_b) and "bed" in t_a)
+                # Determine edge relation type
+                is_direct_door = intent in {"direct_door", "standard", "attached"} or (("bath" in t_a or "toilet" in t_a) and "bed" in t_b) or (("bath" in t_b or "toilet" in t_b) and "bed" in t_a)
                 is_stair_landing = "stair" in t_a or "stair" in t_b
                 is_open_flow = intent == "open_flow"
 
-                if is_attached_bath or is_stair_landing or is_open_flow:
-                    min_overlap = 0.5 if floor_data.get('relaxed_recovery') else 1.0
+                if is_direct_door or is_stair_landing or is_open_flow:
+                    min_overlap = 1.0 if floor_data.get('relaxed_recovery') else (1.5 if is_open_flow else 3.0)
                     self._add_touch_constraint(model, rv, trv, r_id, target_id, min_overlap_ft=min_overlap)
-                    hard_touch_count += 1
+                    if is_direct_door:
+                        direct_door_count += 1
+                    else:
+                        hard_touch_count += 1
+                else:
+                    soft_count += 1
 
-        logger.info(f"[CP-SAT] {hard_touch_count} structural edges (out of {len(processed_edges)} total edges) encoded as HARD constraints.")
+        logger.info(
+            f"[CP-SAT] {hard_touch_count} structural-touch edges, "
+            f"{direct_door_count} direct-door edges, "
+            f"{soft_count} soft proximity edges encoded as HARD constraints."
+        )
 
         # ────────────────────────────────────────────
         # PHASE 4 — Forbidden Adjacencies (HARD)
-        # Kitchen ≠ Bathroom, Dining ≠ Bathroom, etc.
         # ────────────────────────────────────────────
+        HARD_FORBIDDEN_SANITATION = {
+            frozenset({"kitchen", "bathroom"}),
+            frozenset({"kitchen", "toilet"}),
+            frozenset({"kitchen", "attached_bathroom"}),
+            frozenset({"kitchen", "common_bathroom"}),
+        }
+
         all_ids = list(room_vars.keys())
         forbidden_count = 0
         for i in range(len(all_ids)):
@@ -355,8 +372,11 @@ class CPSolver:
                 id_a, id_b = all_ids[i], all_ids[j]
                 t_a = room_vars[id_a]['type']
                 t_b = room_vars[id_b]['type']
+                pair_set = frozenset({t_a, t_b})
 
-                if not floor_data.get('relaxed_recovery') and frozenset({t_a, t_b}) in FORBIDDEN_PAIRS:
+                # Sanitation prohibitions remain HARD even during relaxation!
+                is_forbidden = (pair_set in FORBIDDEN_PAIRS and not floor_data.get('relaxed_recovery')) or (pair_set in HARD_FORBIDDEN_SANITATION)
+                if is_forbidden:
                     a, b = room_vars[id_a], room_vars[id_b]
                     # Force ≥ 1 grid-unit gap in at least one direction
                     s1 = model.NewBoolVar(f'fsep_l_{id_a}_{id_b}')

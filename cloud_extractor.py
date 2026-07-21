@@ -842,51 +842,49 @@ def auto_wire_topology(room_types: list, ai_categories: dict = None, bathroom_re
         room_specs.append(lobby)
         circulation_idx.append(len(room_specs) - 1)
             
-    # 1. Determine Primary Hub for Circulation. Prefer a real corridor over a
-    # foyer; the foyer is an entry transition, not the whole-house spine.
-    # Prefer a horizontal circulation space as the hub. Gemini often lists
-    # the staircase first; using it as the hub leaves it disconnected from the
-    # corridor and can make the staircase act like an exterior entrance.
+    # 1. Determine Primary Hub for Circulation (Corridor/Passage/Lobby).
     hub_idx = next(
         (index for index in circulation_idx if room_specs[index]["type"] in {"corridor", "hallway", "passage", "lobby"}),
         circulation_idx[0] if circulation_idx else (public_idx[0] if public_idx else 0),
     )
 
-    # The circulation spine itself must open into the public entry zone.
-    if circulation_idx and public_idx and hub_idx != public_idx[0]:
-        add_conn(hub_idx, public_idx[0], "standard", 20)
+    foyer_idx = next((i for i, r in enumerate(room_specs) if r["type"] == "foyer"), None)
+    living_idx = next((i for i, r in enumerate(room_specs) if r["type"] in {"living_room", "living"}), None)
+    dining_idx = next((i for i, r in enumerate(room_specs) if r["type"] in {"dining_room", "dining_area"}), None)
+    kitchen_idx = next((i for i, r in enumerate(room_specs) if r["type"] in {"kitchen", "open_kitchen"}), None)
 
-    # Every public/destination space receives its own hub connection. Never
-    # manufacture a railway-carriage chain such as dining -> office -> theater
-    # -> prayer merely because Gemini listed those rooms in that order.
-    for pi in public_idx:
-        if pi != hub_idx and pi != public_idx[0]:
-            add_conn(pi, hub_idx, "standard", 10)
+    # Entry Tree: Foyer → Living Room
+    if foyer_idx is not None and living_idx is not None:
+        add_conn(foyer_idx, living_idx, "direct_door", 30)
 
-    # The final architectural validator treats kitchen/dining adjacency as a
-    # buildability contract. Encode that same contract before solving instead
-    # of discovering the mismatch after two floors have already been packed.
-    kitchen_idx = next((i for i, room in enumerate(room_specs) if room["type"] in {"kitchen", "open_kitchen"}), None)
-    dining_idx = next((i for i, room in enumerate(room_specs) if room["type"] in {"dining_room", "dining_area"}), None)
-    if kitchen_idx is not None and dining_idx is not None:
-        add_conn(kitchen_idx, dining_idx, "open_flow", 25)
+    # Public Core Tree: Living → Dining, Dining → Kitchen
+    if living_idx is not None and dining_idx is not None:
+        add_conn(living_idx, dining_idx, "direct_door", 25)
+    if dining_idx is not None and kitchen_idx is not None:
+        add_conn(dining_idx, kitchen_idx, "direct_door", 25)
+    elif living_idx is not None and kitchen_idx is not None and dining_idx is None:
+        add_conn(living_idx, kitchen_idx, "direct_door", 25)
 
-    # Vertical circulation is never a bedroom passage. A staircase must open
-    # to the circulation hub (corridor/foyer/living), which also guides the
-    # geometric solver to place it beside public access.
+    # Circulation Tree: Living → Corridor
+    if living_idx is not None and hub_idx != living_idx:
+        add_conn(living_idx, hub_idx, "direct_door", 30)
+    elif foyer_idx is not None and hub_idx != foyer_idx and living_idx is None:
+        add_conn(foyer_idx, hub_idx, "direct_door", 30)
+
+    # Vertical circulation: Staircase → Hub
     for ci in circulation_idx:
         if ci != hub_idx and room_specs[ci]["type"] in {"staircase", "stairwell"}:
-            add_conn(ci, hub_idx, "standard", 20)
+            add_conn(ci, hub_idx, "direct_door", 20)
 
     # 3. Connect Outdoor Spaces to the Hub
     for oi in outdoor_idx:
         if hub_idx != oi:
             add_conn(hub_idx, oi, "open_flow", 10)
 
-    # 4. Connect Private Zones to the Hub
+    # 4. Connect Private Zones (Bedrooms) to the Corridor Hub via Direct Doors
     for pi in private_idx:
         if hub_idx != pi:
-            add_conn(pi, hub_idx, "standard", 10)
+            add_conn(pi, hub_idx, "direct_door", 20)
 
     # 5. Distribute Wet Zones (Bathrooms)
     available_baths = list(wet_idx)
@@ -915,18 +913,14 @@ def auto_wire_topology(room_types: list, ai_categories: dict = None, bathroom_re
 
     common_baths = [index for index in available_baths if index not in attached_baths]
 
-    # Pair each requested ensuite with one distinct bedroom using stable IDs.
+    # Pair each requested ensuite with one distinct bedroom (Bedroom → Attached Bath)
     for bedroom_i, bath_i in zip(bedroom_idx, attached_baths):
-        add_conn(bedroom_i, bath_i, "standard", 20)
+        add_conn(bedroom_i, bath_i, "direct_door", 30)
 
-    # Generic bathrooms become ensuite only when the program explicitly marks
-    # them as attached; otherwise they remain common and open to circulation.
-    available_baths = common_baths
-
-    # Remaining wet zones act as common baths connected to the hub
-    for bath_i in available_baths:
+    # Common bathrooms connect to Corridor Hub
+    for bath_i in common_baths:
         if hub_idx != bath_i:
-            add_conn(hub_idx, bath_i, "standard", 6)
+            add_conn(hub_idx, bath_i, "direct_door", 20)
 
     # 6. Post-processing Topology Rules
     # Rule A: Ensure foyer connects to hub
