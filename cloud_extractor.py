@@ -137,6 +137,10 @@ class HouseDesignRequest(BaseModel):
         default_factory=list,
         description="Requested floor programs. For ADD-floor edits include only newly requested floors.",
     )
+    has_explicit_floor_schedule: bool = Field(default=False, description="True ONLY if user directly assigned rooms to specific floors in the prompt.")
+    generate_only_floor: Optional[int] = Field(default=None, description="Set if user specifically requested layout ONLY for a single upper floor (e.g. 1 for first floor).")
+    floor_evidence: List[str] = Field(default_factory=list, description="Exact quotes from the prompt justifying multi-floor classification.")
+    unassigned_rooms: List[str] = Field(default_factory=list, description="Rooms mentioned without explicit floor assignment.")
     
     # --- ZERO HARDCODING: FULL AI ROOM CLASSIFICATION ---
     outdoor_rooms: List[str] = Field(default_factory=list, description="Rooms open to the sky (e.g., courtyard, angan).")
@@ -589,13 +593,24 @@ Select the best circulation topology:
 - core_and_cluster (commercial towers, multi-floor offices)
 - hybrid
 
+Floor interpretation rules:
+1. Do not invent additional floors.
+2. If the user does not mention a floor, assign all requested rooms to Floor 0.
+3. A BHK count (e.g. "3BHK house") does NOT imply multiple floors or staircases.
+4. Create Floor 1 only when the user explicitly mentions: "first floor", "upper floor", "duplex", "two-storey", "multiple floors", or "rooms upstairs".
+5. Preserve every explicit floor assignment exactly.
+6. Rooms without an explicit floor assignment default to Floor 0. Set unassigned_rooms for any rooms lacking floor spec.
+7. Do NOT add a staircase unless the request explicitly requires more than one floor or user prompt requests a staircase.
+8. Do NOT add balconies, terraces, verandahs or structural pads unless requested or structurally required for an explicitly requested upper floor.
+9. Do NOT move rooms between floors to balance floor area.
+10. Return no explanation outside the JSON schema.
+
 Create an access graph before geometry:
 - Every required room must be reachable from the main entrance through valid circulation/hub spaces.
 - Bedrooms, bathrooms, kitchens, closets, stores and utility rooms must NOT be used as passage spaces.
 - An attached bathroom must connect ONLY to its assigned bedroom.
-- A gym, office, library or home_theater must have direct access from a foyer, family_lounge, lobby or corridor (NOT solely through a bedroom or bathroom).
+- A gym, office, library or home_theater must have direct access from a foyer, family_lounge, lobby or corridor.
 - A kitchen should preferably connect directly to dining.
-- STRUCTURAL BALANCING RULE (NO INVERSE PYRAMIDS): Floor 0 (Ground Floor) is the foundation and MUST have an equal or greater total floor area than Floor 1. If the request creates a top-heavy house, automatically rebalance flexible rooms (workspaces, play areas, secondary lounges) to Floor 0.
 
 MISSING INFORMATION EXTRACTION:
 Evaluate if the prompt explicitly or implicitly provides answers for the following keys:

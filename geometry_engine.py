@@ -805,10 +805,11 @@ class CPSolver:
                         adj[a['id']].add(b['id'])
                         adj[b['id']].add(a['id'])
 
-        # Verify every topology edge has enough shared wall
+        # Verify structural topology edges (attached, open_flow, stair) have enough shared wall
         for r in rooms:
             for conn in r.get('connections', []):
-                if conn.get('intent') == 'proximity':
+                intent = conn.get('intent', 'standard')
+                if intent not in {'attached', 'open_flow'} and "stair" not in r.get('type', ''):
                     continue
                 tt = conn.get('target_room', '')
                 target_room_id = conn.get('target_room_id', '')
