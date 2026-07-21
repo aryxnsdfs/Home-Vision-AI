@@ -2960,6 +2960,24 @@ def _replan_floor_with_constraint(
         logger.exception("[EDIT] Constraint replanning failed: %s", exc)
         return None
 
+def snapshot_layout_state(rooms: List[Dict[str, Any]]) -> str:
+    """Create a hashable snapshot of layout geometry, walls, doors, and connections."""
+    import json
+    simplified = []
+    for r in rooms or []:
+        if isinstance(r, dict):
+            simplified.append({
+                "id": r.get("id"),
+                "x": round(float(r.get("x", 0)), 2),
+                "z": round(float(r.get("z", 0)), 2),
+                "width": round(float(r.get("width", 0)), 2),
+                "length": round(float(r.get("length", 0)), 2),
+                "doors": r.get("doors", []),
+                "connections": r.get("connections", []),
+            })
+    return json.dumps(simplified, sort_keys=True)
+
+
 def build_room_changes(
     prompt: str,
     current_rooms: List[Dict[str, Any]],
@@ -3006,6 +3024,38 @@ def build_room_changes(
                 room_types.append(room_type)
 
     rooms = copy.deepcopy(current_rooms)
+
+    # ADD_OPENING / ADD_DOOR intent
+    is_door_intent = bool(re.search(
+        r"\b(?:add|create|make|cut|put|place)\s+(?:a\s+|an\s+|the\s+)?(?:proper\s+|open\s+|direct\s+)?(?:door|doorway|opening|archway|passageway|entrance)\b",
+        text,
+    )) or any(kw in text for kw in ("doorway", "open doorway", "direct access", "opening between"))
+
+    if is_door_intent or "add_opening" in intents or "add_door" in intents:
+        matched_indices = _all_prompt_room_matches(prompt, rooms)
+        if len(matched_indices) >= 2:
+            src_idx, tgt_idx = matched_indices[0], matched_indices[1]
+            src_room, tgt_room = rooms[src_idx], rooms[tgt_idx]
+            
+            logger.info(f"[EDIT PLAN] Operation: add_opening")
+            logger.info(f"[EDIT PLAN] Source: {src_room.get('id')} ({src_room.get('type')})")
+            logger.info(f"[EDIT PLAN] Target: {tgt_room.get('id')} ({tgt_room.get('type')})")
+            
+            # Check if they share a wall
+            has_wall = _ensure_door_between_rooms(src_room, tgt_room)
+            if not has_wall:
+                logger.warning(f"[EDIT RECOVERY] {src_room.get('name')} and {tgt_room.get('name')} do not share a wall. Performing local replan...")
+                repositioned = _place_room_next_to(rooms, tgt_idx, src_idx)
+                if repositioned:
+                    logger.info(f"[EDIT RECOVERY] Repositioned {tgt_room.get('name')} adjacent to {src_room.get('name')}")
+                    has_wall = _ensure_door_between_rooms(rooms[src_idx], rooms[tgt_idx])
+            
+            if has_wall:
+                logger.info(f"[EDIT SUCCESS] Shared wall found/created & doorway added between {src_room.get('id')} and {tgt_room.get('id')}")
+                return rooms
+            else:
+                logger.warning(f"[EDIT FAILED] Could not create doorway between {src_room.get('id')} and {tgt_room.get('id')}")
+                return None
 
     # ADD intent — constraint re-plan of the affected floor.
     if "add" in intents and room_types:
@@ -3954,11 +4004,8 @@ async def generate_plan(req: GenerateRequest):
             valid_rooms_spec = [r for r in details.get("rooms", []) if r.get("canonical") not in ("door", "window", "furniture", "wiring", "plumbing")]
             _log("info", f"Room modification intent: intents={[i.get('canonical','?') for i in details.get('intents',[])]}")
             
-            # Existing plans are patched in place.  Sending an edit through the
-            # full Gemini + CP generation path re-packed every room, which made
-            # unrelated rooms disappear and discarded doors, furniture and
-            # finishes. Gemini still interprets the request above; geometry is
-            # changed deterministically against the existing room identities.
+            before_snapshot = snapshot_layout_state(current_rooms)
+
             modified_rooms = build_room_changes(
                 req.prompt, current_rooms, details.get("intents", []),
                 valid_rooms_spec, details.get("sizes", []),
@@ -3974,54 +4021,46 @@ async def generate_plan(req: GenerateRequest):
                 )
 
             if modified_rooms is not None:
-                _log("success", f"build_room_changes returned {len(modified_rooms)} room(s)")
-            else:
-                _log("warn", "build_room_changes returned None (no structural change detected)")
-                if edit_report is not None:
-                    return build_edit_advisory_result(
-                        req, current_rooms, edit_rejection_message(edit_report), edit_report, response,
-                    )
-                structural_intents = {
-                    str(item.get("canonical", "")).lower()
-                    for item in details.get("intents", []) if isinstance(item, dict)
-                }
-                if structural_intents.intersection({"add", "move", "remove", "delete", "resize"}):
-                    ai_reason = str((slm_result or {}).get("analysis_summary") or "").strip()
-                    blockers = (slm_result or {}).get("blocking_constraints", []) or []
-                    explanation = ai_reason or "; ".join(str(item) for item in blockers[:3])
+                after_snapshot = snapshot_layout_state(modified_rooms)
+                if before_snapshot == after_snapshot and not details.get("room_colors"):
+                    logger.warning("[EDIT FAILED] No layout property changed after edit operation.")
                     return build_edit_advisory_result(
                         req, current_rooms,
-                        (
-                            "The requested layout change could not satisfy geometry and adjacency constraints; "
-                            "the existing plan was left unchanged."
-                            + (f" Analysis: {explanation}" if explanation else "")
-                        ),
+                        "No layout change was produced for your edit request. Please check room names and try again.",
                         base_response=response,
                     )
+                _log("success", f"build_room_changes returned {len(modified_rooms)} modified room(s)")
+            else:
+                _log("warn", "build_room_changes returned None (edit could not be completed)")
+                return build_edit_advisory_result(
+                    req, current_rooms,
+                    "The requested layout edit could not be completed cleanly; the existing plan was left unchanged to preserve project integrity.",
+                    base_response=response,
+                )
 
-            # Fix 2: Preserve colors when modifying rooms
+            # Preserve colors & furniture when modifying rooms
             if modified_rooms:
                 for mr in modified_rooms:
                     for cr in current_rooms:
-                        # IDs are stable in the frontend. Matching by type can
-                        # copy Bedroom-1's furniture/colors onto Bedroom-2.
                         if cr.get("id") == mr.get("id"):
                             if "floorColor" in cr and not mr.get("floorColor"): mr["floorColor"] = cr["floorColor"]
                             if "wallColor" in cr and not mr.get("wallColor"): mr["wallColor"] = cr["wallColor"]
-                            # Fix 3: Also preserve furniture
                             if "furniture" in cr and "furniture" not in mr:
                                 mr["furniture"] = cr["furniture"]
                             break
 
+                rev = int(req.currentProject.get("revision", 1)) if (req.currentProject and isinstance(req.currentProject, dict)) else 1
+                response["layout_changed"] = True
+                response["revision"] = rev + 1
+                response["changed_rooms"] = [r.get("id") for r in modified_rooms if r.get("id")]
                 response["layout_data"], _ = _preserve_modified_project_rooms(modified_rooms)
-                if req.currentProject and req.currentProject.get("style"):
+                response["updated_blueprint"] = response["layout_data"]
+                if req.currentProject and isinstance(req.currentProject, dict) and req.currentProject.get("style"):
                     response["style"] = {
                         **response.get("style", {}),
                         **req.currentProject.get("style", {}),
                     }
-                response["understood"].append(
-                    "Applied only the requested room change and preserved the rest of the plan"
-                )
+                response["understood"].append("Applied requested structural modification and updated blueprint")
                 response["logs"] = _logs
                 return response
                             
