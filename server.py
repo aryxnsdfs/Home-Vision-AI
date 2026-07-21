@@ -6455,6 +6455,59 @@ redis_client = redis.Redis.from_url(REDIS_URL)
 import redis.asyncio as aioredis
 async_redis_client = aioredis.from_url(REDIS_URL)
 
+QUESTION_LIBRARY = {
+    "road_side": {
+        "question": "Which side of the plot faces the main road?",
+        "options": ["North", "South", "East", "West"],
+    },
+    "coverage_preference": {
+        "question": "How much of the available building area should be used?",
+        "options": [
+            "More Garden (40%)",
+            "Balanced (50%)",
+            "Spacious Villa (70%)",
+            "Maximum Allowed (85%)",
+        ],
+    },
+    "parking_count": {
+        "question": "How many cars should the plan accommodate?",
+        "options": ["None", "1 Car", "2 Cars", "3+ Cars"],
+    },
+}
+
+ANALYSIS_SESSIONS = {}
+
+@app.post("/api/analyze-prompt")
+async def analyze_prompt(req: GenerateRequest):
+    logger.info("[API] Analyzing prompt for missing information...")
+    try:
+        from cloud_extractor import extract_keywords_groq
+        slm_result = extract_keywords_groq(req.prompt, ALL_VOCABULARIES)
+        
+        analysis_id = str(uuid.uuid4())
+        missing_keys = slm_result.get("missing_keys", [])
+        questions = []
+        for key in missing_keys:
+            if key in QUESTION_LIBRARY:
+                questions.append({
+                    "key": key,
+                    "question": QUESTION_LIBRARY[key]["question"],
+                    "options": QUESTION_LIBRARY[key]["options"]
+                })
+                
+        # Save session
+        ANALYSIS_SESSIONS[analysis_id] = slm_result
+        
+        return {
+            "analysis_id": analysis_id,
+            "canonical_spec_preview": slm_result,
+            "questions": questions
+        }
+    except Exception as e:
+        logger.error(f"[API] Error analyzing prompt: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @app.post('/api/generate/stream')
 async def generate_plan_stream(req: GenerateRequest):
     job_id = str(uuid.uuid4())
