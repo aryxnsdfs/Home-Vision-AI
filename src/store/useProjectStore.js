@@ -910,7 +910,15 @@ export const useProjectStore = create((set, get) => ({
   isAnalyzing: false,
 
   analyzePrompt: async (prompt, width, length, floors = 1) => {
-    set({ apiError: null, isAnalyzing: true, analysisResult: null });
+    set({ 
+      apiError: null, 
+      isAnalyzing: true, 
+      analysisResult: null,
+      lastPrompt: prompt,
+      lastWidth: width,
+      lastLength: length,
+      lastFloors: floors
+    });
     try {
       const res = await fetch(`${API_BASE_URL}/analyze-prompt`, {
         method: 'POST',
