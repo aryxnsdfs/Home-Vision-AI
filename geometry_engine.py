@@ -85,6 +85,11 @@ class CPSolver:
             elif "bath" in r_type or "toilet" in r_type:
                 min_dim = max(min_dim, int(5.0 * scale))
 
+            # Check for explicit dimension overrides (e.g. structural padder)
+            if room.get("min_w_override") and room.get("min_l_override"):
+                override_dim = int(min(room["min_w_override"], room["min_l_override"]) * scale)
+                min_dim = max(min_dim, override_dim)
+
             # Never construct an invalid CP-SAT domain when a previous
             # request supplied an oversized/custom minimum or the plot is
             # compact. Infeasible geometry may fall back, but MODEL_INVALID
@@ -95,6 +100,8 @@ class CPSolver:
                 ROOM_MINIMUMS.get(r_type, _DEFAULT_MIN).get("area", 64),
                 max(1.0, (plot_w / scale) * (plot_l / scale)),
             )
+            if room.get("min_w_override") and room.get("min_l_override"):
+                min_area_ft = max(min_area_ft, float(room["min_w_override"] * room["min_l_override"]))
 
             x = model.NewIntVar(0, plot_w - min_dim, f'x_{r_id}')
             z = model.NewIntVar(0, plot_l - min_dim, f'z_{r_id}')
