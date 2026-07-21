@@ -36,7 +36,6 @@ export default function GenerationOverlay() {
   const clearGenerationProgress = useProjectStore(s => s.clearGenerationProgress);
 
   const [mockStage, setMockStage] = useState(0);
-  const [showReady, setShowReady] = useState(false);
   const timerRef = useRef(null);
   const ffRef = useRef(null);
 
@@ -45,10 +44,11 @@ export default function GenerationOverlay() {
   const meta = generationProgress?.meta ?? {};
   const capacity = generationProgress?.capacity;
 
+  const isComplete = mockStage >= 9 && (finalizing || !generationProgress);
+
   useEffect(() => {
     if (!visible) return;
     setMockStage(0);
-    setShowReady(false);
     let cur = 0;
     const advance = () => {
       cur += 1;
@@ -68,24 +68,10 @@ export default function GenerationOverlay() {
       setMockStage(cur);
       if (cur < 9) {
         ffRef.current = setTimeout(ff, 80);
-      } else {
-        ffRef.current = setTimeout(() => setShowReady(true), 250);
-        ffRef.current = setTimeout(() => {
-          setShowReady(false);
-          clearGenerationProgress();
-          setMockStage(0);
-        }, 1400);
       }
     };
     if (cur < 9) ffRef.current = setTimeout(ff, 80);
-    else {
-      ffRef.current = setTimeout(() => setShowReady(true), 250);
-      ffRef.current = setTimeout(() => {
-        setShowReady(false);
-        clearGenerationProgress();
-        setMockStage(0);
-      }, 1400);
-    }
+    else setMockStage(9);
     return () => clearTimeout(ffRef.current);
   }, [finalizing]); // eslint-disable-line react-hooks/exhaustive-deps
 
@@ -100,15 +86,14 @@ export default function GenerationOverlay() {
       {visible && (
         <motion.div
           key="gen-overlay"
-          className="fixed inset-0 z-[300] flex flex-col items-center justify-center"
+          className="fixed inset-0 z-[300] flex flex-col items-center justify-center p-4"
           style={{ background: "#0a0a0a" }}
           initial={{ opacity: 0 }}
           animate={{ opacity: 1 }}
           exit={{ opacity: 0 }}
           transition={{ duration: 0.25 }}
         >
-          {/* Ambient animated background — colorful drifting glow blobs on pure
-              black. No grid. Multiple hues drift + pulse for a lively feel. */}
+          {/* Ambient animated background */}
           <div className="pointer-events-none absolute inset-0 overflow-hidden">
             <motion.div
               className="absolute -top-40 -left-32 h-[30rem] w-[30rem] rounded-full blur-2xl"
@@ -142,143 +127,146 @@ export default function GenerationOverlay() {
             />
           </div>
 
-          {/* Completion screen */}
-          <AnimatePresence>
-            {showReady && (
-              <motion.div
-                className="absolute inset-0 flex flex-col items-center justify-center z-10"
-                style={{ background: "#0a0a0a" }}
-                initial={{ opacity: 0 }}
-                animate={{ opacity: 1 }}
-                exit={{ opacity: 0 }}
-                transition={{ duration: 0.3 }}
-              >
-                <motion.div
-                  initial={{ opacity: 0, y: 10 }}
-                  animate={{ opacity: 1, y: 0 }}
-                  exit={{ opacity: 0, y: -6 }}
-                  transition={{ duration: 0.35 }}
-                  className="text-center"
-                >
-                  <p className="text-white text-2xl font-semibold tracking-tight mb-1">
+          {/* Main content card */}
+          <div className="w-full max-w-sm px-6 relative z-10 my-auto">
+            {/* Header */}
+            <motion.div
+              className="mb-8"
+              initial={{ opacity: 0, y: 8 }}
+              animate={{ opacity: 1, y: 0 }}
+              transition={{ duration: 0.4 }}
+            >
+              {isComplete ? (
+                <div className="flex items-center justify-between mb-1.5">
+                  <p className="text-white text-xl font-semibold tracking-tight">
                     Your home is ready
                   </p>
-                  <p className="text-white/30 text-sm">Design generation complete</p>
-                </motion.div>
-              </motion.div>
-
-            )}
-          </AnimatePresence>
-
-          {/* Main content */}
-          {!showReady && (
-            <div className="w-full max-w-sm px-6">
-              {/* Header */}
-              <motion.div
-                className="mb-10"
-                initial={{ opacity: 0, y: 8 }}
-                animate={{ opacity: 1, y: 0 }}
-                transition={{ duration: 0.4 }}
-              >
+                  <span className="inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-full text-xs font-medium bg-emerald-500/20 text-emerald-400 border border-emerald-500/30">
+                    <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse" />
+                    Complete
+                  </span>
+                </div>
+              ) : (
                 <p className="text-white text-xl font-semibold tracking-tight mb-1.5">
                   Generating your home
                 </p>
-              </motion.div>
-
-              {capacity && (
-                <motion.div
-                  className="mb-7 rounded-xl border border-white/10 bg-white/5 p-3"
-                  initial={{ opacity: 0, y: 6 }}
-                  animate={{ opacity: 1, y: 0 }}
-                >
-                  <div className="mb-2 flex items-center justify-between text-xs">
-                    <span className="font-medium text-white/70">Area budget</span>
-                    <span className={capacity.fits ? "text-emerald-400" : "text-red-400"}>
-                      {capacity.required_sqft?.toLocaleString()} / {capacity.available_sqft?.toLocaleString()} sq ft
-                    </span>
-                  </div>
-                  <div className="h-2 overflow-hidden rounded-full bg-white/10">
-                    <motion.div
-                      className={`h-full rounded-full ${capacity.fits ? "bg-emerald-400" : "bg-red-500"}`}
-                      initial={{ width: 0 }}
-                      animate={{ width: `${Math.min(100, capacity.usage_percent || 0)}%` }}
-                    />
-                  </div>
-                  <p className="mt-2 text-[11px] text-white/45">
-                    {capacity.fits
-                      ? `${Math.max(0, capacity.available_sqft - capacity.required_sqft).toLocaleString()} sq ft remains for flexibility.`
-                      : `Needs ${(capacity.required_sqft - capacity.available_sqft).toLocaleString()} sq ft more. Consider another floor, a ${capacity.recommended_plot?.width}×${capacity.recommended_plot?.length} ft plot, or optimization.`}
-                  </p>
-                </motion.div>
               )}
+            </motion.div>
 
-              {/* Stage list */}
-              <div className="space-y-4">
-                {STAGES.map((s, idx) => {
-                  const done   = mockStage > s.id;
-                  const active = mockStage === s.id;
-                  const future = mockStage < s.id;
-
-                  return (
-                    <motion.div
-                      key={s.id}
-                      className="flex items-center gap-3"
-                      initial={{ opacity: 0 }}
-                      animate={{ opacity: future ? 0.2 : 1 }}
-                      transition={{ duration: 0.3, delay: idx * 0.025 }}
-                    >
-                      <Dot active={active} done={done} />
-                      <motion.span
-                        className="text-sm"
-                        animate={{
-                          color: done
-                            ? "rgba(255,255,255,0.35)"
-                            : active
-                            ? "rgba(255,255,255,1)"
-                            : "rgba(255,255,255,0.2)",
-                        }}
-                        transition={{ duration: 0.25 }}
-                      >
-                        {s.label}
-                      </motion.span>
-                      {done && (
-                        <motion.span
-                          className="text-emerald-500 text-xs ml-auto"
-                          initial={{ opacity: 0 }}
-                          animate={{ opacity: 1 }}
-                          transition={{ duration: 0.2 }}
-                        >
-                          ✓
-                        </motion.span>
-                      )}
-                    </motion.div>
-                  );
-                })}
-              </div>
-
-              {/* Progress bar — colorful gradient + moving shimmer */}
+            {capacity && (
               <motion.div
-                className="mt-10 h-1.5 bg-white/8 rounded-full overflow-hidden relative"
-                initial={{ opacity: 0 }}
-                animate={{ opacity: 1 }}
-                transition={{ delay: 0.4 }}
+                className="mb-7 rounded-xl border border-white/10 bg-white/5 p-3"
+                initial={{ opacity: 0, y: 6 }}
+                animate={{ opacity: 1, y: 0 }}
+              >
+                <div className="mb-2 flex items-center justify-between text-xs">
+                  <span className="font-medium text-white/70">Area budget</span>
+                  <span className={capacity.fits ? "text-emerald-400" : "text-red-400"}>
+                    {capacity.required_sqft?.toLocaleString()} / {capacity.available_sqft?.toLocaleString()} sq ft
+                  </span>
+                </div>
+                <div className="h-2 overflow-hidden rounded-full bg-white/10">
+                  <motion.div
+                    className={`h-full rounded-full ${capacity.fits ? "bg-emerald-400" : "bg-red-500"}`}
+                    initial={{ width: 0 }}
+                    animate={{ width: `${Math.min(100, capacity.usage_percent || 0)}%` }}
+                  />
+                </div>
+                <p className="mt-2 text-[11px] text-white/45">
+                  {capacity.fits
+                    ? `${Math.max(0, capacity.available_sqft - capacity.required_sqft).toLocaleString()} sq ft remains for flexibility.`
+                    : `Needs ${(capacity.required_sqft - capacity.available_sqft).toLocaleString()} sq ft more. Consider another floor, a ${capacity.recommended_plot?.width}×${capacity.recommended_plot?.length} ft plot, or optimization.`}
+                </p>
+              </motion.div>
+            )}
+
+            {/* Stage list */}
+            <div className="space-y-3.5">
+              {STAGES.map((s, idx) => {
+                const done   = isComplete || mockStage > s.id;
+                const active = !isComplete && mockStage === s.id;
+                const future = !isComplete && mockStage < s.id;
+
+                return (
+                  <motion.div
+                    key={s.id}
+                    className="flex items-center gap-3"
+                    initial={{ opacity: 0 }}
+                    animate={{ opacity: future ? 0.2 : 1 }}
+                    transition={{ duration: 0.3, delay: idx * 0.025 }}
+                  >
+                    <Dot active={active} done={done} />
+                    <motion.span
+                      className="text-sm font-medium"
+                      animate={{
+                        color: done
+                          ? "rgba(255,255,255,0.45)"
+                          : active
+                          ? "rgba(255,255,255,1)"
+                          : "rgba(255,255,255,0.2)",
+                      }}
+                      transition={{ duration: 0.25 }}
+                    >
+                      {s.label}
+                    </motion.span>
+                    {done && (
+                      <motion.span
+                        className="text-emerald-400 text-xs ml-auto font-semibold"
+                        initial={{ opacity: 0, scale: 0.8 }}
+                        animate={{ opacity: 1, scale: 1 }}
+                        transition={{ duration: 0.2 }}
+                      >
+                        ✓
+                      </motion.span>
+                    )}
+                  </motion.div>
+                );
+              })}
+            </div>
+
+            {/* Progress bar — colorful gradient + moving shimmer */}
+            <motion.div
+              className="mt-8 h-1.5 bg-white/8 rounded-full overflow-hidden relative"
+              initial={{ opacity: 0 }}
+              animate={{ opacity: 1 }}
+              transition={{ delay: 0.4 }}
+            >
+              <motion.div
+                className="h-full rounded-full relative overflow-hidden"
+                style={{ background: "linear-gradient(90deg, #10b981, #38bdf8, #a855f7)" }}
+                animate={{ width: `${(Math.min(mockStage, 9) / 9) * 100}%` }}
+                transition={{ duration: 0.5, ease: "easeOut" }}
               >
                 <motion.div
-                  className="h-full rounded-full relative overflow-hidden"
-                  style={{ background: "linear-gradient(90deg, #10b981, #38bdf8, #a855f7)" }}
-                  animate={{ width: `${(Math.min(mockStage, 9) / 9) * 100}%` }}
-                  transition={{ duration: 0.5, ease: "easeOut" }}
-                >
-                  <motion.div
-                    className="absolute inset-y-0 w-1/3"
-                    style={{ background: "linear-gradient(90deg, transparent, rgba(255,255,255,0.6), transparent)" }}
-                    animate={{ x: ["-120%", "320%"] }}
-                    transition={{ duration: 1.4, repeat: Infinity, ease: "easeInOut" }}
-                  />
-                </motion.div>
+                  className="absolute inset-y-0 w-1/3"
+                  style={{ background: "linear-gradient(90deg, transparent, rgba(255,255,255,0.6), transparent)" }}
+                  animate={{ x: ["-120%", "320%"] }}
+                  transition={{ duration: 1.4, repeat: Infinity, ease: "easeInOut" }}
+                />
               </motion.div>
-            </div>
-          )}
+            </motion.div>
+
+            {/* "Show us" button rendered after generation is complete */}
+            {isComplete && (
+              <motion.button
+                initial={{ opacity: 0, y: 14, scale: 0.96 }}
+                animate={{ opacity: 1, y: 0, scale: 1 }}
+                transition={{ duration: 0.35, ease: "easeOut" }}
+                whileHover={{ scale: 1.02, boxShadow: "0 12px 28px -6px rgba(16, 185, 129, 0.4)" }}
+                whileTap={{ scale: 0.98 }}
+                onClick={() => {
+                  clearGenerationProgress();
+                  setMockStage(0);
+                }}
+                className="mt-8 w-full rounded-xl bg-gradient-to-r from-emerald-500 via-teal-500 to-emerald-500 bg-[length:200%_auto] py-3.5 px-6 font-semibold text-white shadow-xl shadow-emerald-500/25 transition-all cursor-pointer flex items-center justify-center gap-2.5 tracking-wide text-base border border-emerald-400/30"
+              >
+                <span>Show us</span>
+                <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2.5" d="M14 5l7 7m0 0l-7 7m7-7H3" />
+                </svg>
+              </motion.button>
+            )}
+          </div>
         </motion.div>
       )}
     </AnimatePresence>
