@@ -2235,6 +2235,15 @@ class AdjacencyResolver:
                 if other_id in visited and other and (has_connection(target, other) or has_connection(other, target)) and is_legal_door_pair(target, other):
                     candidate_walls.append(wall)
             if not candidate_walls:
+                # Fallback: connect to ANY adjacent visited room as long as the door pair is architecturally legal
+                for wall in walls:
+                    if not wall.get("is_shared") or target.id not in wall.get("room_ids", []):
+                        continue
+                    other_id = next((rid for rid in wall.get("room_ids", []) if rid != target.id), None)
+                    other = room_by_id.get(other_id)
+                    if other_id in visited and other and is_legal_door_pair(target, other):
+                        candidate_walls.append(wall)
+            if not candidate_walls:
                 break
             best_wall = max(candidate_walls, key=lambda w: abs(w["z2"] - w["z1"]) if w["orientation"] == "vertical" else abs(w["x2"] - w["x1"]))
             other_id = next(rid for rid in best_wall["room_ids"] if rid != target.id)
