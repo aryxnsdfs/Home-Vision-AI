@@ -2253,7 +2253,7 @@ class AdjacencyResolver:
         # A staircase must open directly into the public circulation core.
         # Otherwise a graph can be technically connected while the landing is
         # reachable only through a bedroom or behind a blocked doorway.
-        public_types = ("corridor", "hallway", "foyer", "living_room")
+        public_types = ("lobby", "stair_landing", "corridor", "hallway", "foyer", "living_room")
         for stair in (r for r in self.rooms if r.type in ("staircase", "stairwell")):
             public_ids = {r.id for r in self.rooms if r.type in public_types}
             common = [

@@ -146,24 +146,24 @@ class CPSolver:
             r_id = room.get("id", f"{r_type}_{idx}")
 
             base_min_dim = room.get("target_min_dim") or ROOM_MINIMUMS.get(r_type, _DEFAULT_MIN).get("min_dim", 8)
-            min_dim = int(base_min_dim * scale)
+            min_dim = to_cp(base_min_dim)
             # Enforce architectural minimums
             if "master" in r_type:
-                min_dim = max(min_dim, int(11.0 * scale))
+                min_dim = max(min_dim, to_cp(11.0))
             elif "bedroom" in r_type:
-                min_dim = max(min_dim, int(10.0 * scale))
+                min_dim = max(min_dim, to_cp(10.0))
             elif "living" in r_type:
-                min_dim = max(min_dim, int(11.0 * scale))
+                min_dim = max(min_dim, to_cp(11.0))
             elif "dining" in r_type:
-                min_dim = max(min_dim, int(9.0 * scale))
+                min_dim = max(min_dim, to_cp(9.0))
             elif "kitchen" in r_type:
-                min_dim = max(min_dim, int(8.0 * scale))
+                min_dim = max(min_dim, to_cp(8.0))
             elif "bath" in r_type or "toilet" in r_type:
-                min_dim = max(min_dim, int(5.0 * scale))
+                min_dim = max(min_dim, to_cp(5.0))
 
             # Check for explicit dimension overrides (e.g. structural padder)
             if room.get("min_w_override") and room.get("min_l_override"):
-                override_dim = int(min(room["min_w_override"], room["min_l_override"]) * scale)
+                override_dim = to_cp(min(room["min_w_override"], room["min_l_override"]))
                 min_dim = max(min_dim, override_dim)
 
             # Never construct an invalid CP-SAT domain when a previous
@@ -279,8 +279,8 @@ class CPSolver:
 
         min_dims = floor_data.get('min_foundation_dims')
         if min_dims and room_vars:
-            min_fw = int(min_dims[0] * scale)
-            min_fl = int(min_dims[1] * scale)
+            min_fw = to_cp(min_dims[0])
+            min_fl = to_cp(min_dims[1])
             global_x0 = model.NewIntVar(0, plot_w, 'gx0')
             global_x1 = model.NewIntVar(0, plot_w, 'gx1')
             global_z1 = model.NewIntVar(0, plot_l, 'gz1')
