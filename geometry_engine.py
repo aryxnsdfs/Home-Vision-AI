@@ -568,11 +568,12 @@ class CPSolver:
                 max_attempts = max(1, int(os.getenv("CP_SOLVER_MAX_ATTEMPTS", "1")))
                 if attempt + 1 < max_attempts:
                     logger.info(f"[RETRY] Re-solving (attempt {attempt + 1})…")
-                    # Clear stale results before retry
                     floor_data.pop('resolved_rooms', None)
                     return self._solve_single_topology(floor_data, attempt + 1, topology_type)
                 else:
-                    logger.info("[FALLBACK] Layout solver exhausted validation retries; keeping the last finite layout for downstream repair.")
+                    logger.info("[DISCARD] Post-validation failed and retries exhausted; discarding invalid candidate layout.")
+                    floor_data.pop('resolved_rooms', None)
+                    floor_data['validation'] = {'passed': False, 'errors': validation['errors']}
         else:
             if status == cp_model.MODEL_INVALID:
                 logger.info(f"[FALLBACK] CP model was invalid; Details: {model.Validate()}")

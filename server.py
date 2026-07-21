@@ -608,6 +608,38 @@ def enforce_floor_intent(prompt: str, slm_result: dict, requested_floors: int = 
     return slm_result
 
 
+def run_semantic_gate(intent: dict, room_specs: list) -> Tuple[bool, list]:
+    errors = []
+    requested_bhk = intent.get("bhk")
+    if requested_bhk:
+        actual_bedrooms = sum(1 for r in room_specs if "bedroom" in canonical_type(r.get("type", "") if isinstance(r, dict) else str(r)))
+        if actual_bedrooms != requested_bhk:
+            errors.append(f"BHK mismatch: requested {requested_bhk}, generated {actual_bedrooms}")
+    
+    floor_policy = intent.get("floor_policy", "flexible")
+    if floor_policy == "ground_only" and intent.get("floors", 1) > 1:
+        errors.append("Additional floor was generated without user permission")
+
+    SINGLETONS = {"foyer", "living_room", "dining_room", "kitchen", "staircase", "family_lounge"}
+    type_counts = {}
+    for r in room_specs:
+        t = canonical_type(r.get("type", "") if isinstance(r, dict) else str(r))
+        if t in SINGLETONS:
+            type_counts[t] = type_counts.get(t, 0) + 1
+    
+    duplicates = [t for t, count in type_counts.items() if count > 1]
+    if duplicates:
+        errors.append(f"Unrequested duplicate rooms: {duplicates}")
+
+    is_valid = len(errors) == 0
+    if is_valid:
+        actual_br = sum(1 for r in room_specs if "bedroom" in canonical_type(r.get("type", "") if isinstance(r, dict) else str(r)))
+        logger.info(f"[SEMANTIC GATE] Requested BHK: {requested_bhk or 'N/A'} | Bedrooms generated: {actual_br} | Floor policy: {floor_policy} | Unrequested duplicates: none | PASSED")
+    else:
+        logger.error(f"[SEMANTIC GATE] FAILED with errors: {'; '.join(errors)}")
+    return is_valid, errors
+
+
 def _program_room_class(value: Any) -> str:
     """Normalize only equivalences that do not change a room's meaning."""
     room_type = canonical_type(value)
@@ -5823,6 +5855,17 @@ def _stream_generate_work(req: "GenerateRequest", emit_fn: Callable) -> None:
         gemini_result = None
         bp0 = None
         logger.info("[ZERO-STATIC] Bypassing Gemini Stage 2 coordinates (slow/redundant). Routing directly to high-speed CP Solver.")
+
+        # ─── SEMANTIC GATE VERIFICATION ───
+        intent_info = {
+            "bhk": layout_params.get("bhk", bhk_val),
+            "floor_policy": "ground_only" if floors == 1 else "explicit_multi_floor",
+            "floors": floors
+        }
+        all_planned_rooms = [r for specs in floor_specs_by_level.values() for r in specs] if floor_specs_by_level else floor_0_rooms
+        gate_ok, gate_errors = run_semantic_gate(intent_info, all_planned_rooms)
+        if not gate_ok:
+            raise RuntimeError("Semantic gate failed: " + "; ".join(gate_errors))
 
         # ─── GEOMETRIC GENERATION & VALIDATION PIPELINE (RETRY LOOP) ───
         # One bounded geometry pass keeps end-to-end creation below the 30 s
