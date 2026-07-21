@@ -107,6 +107,126 @@ def _canon(rtype: str) -> str:
     return (rtype or "").replace(" ", "_").lower()
 
 
+# Universal Access Policies Database
+ACCESS_POLICIES: Dict[str, Dict[str, Any]] = {
+    "bedroom": {
+        "allowed_from": ["corridor", "lobby", "family_lounge", "private_landing", "foyer"],
+        "transit_allowed": False,
+    },
+    "master_bedroom": {
+        "allowed_from": ["corridor", "lobby", "family_lounge", "private_landing", "foyer"],
+        "transit_allowed": False,
+    },
+    "attached_bathroom": {
+        "allowed_from": ["assigned_bedroom", "bedroom", "master_bedroom"],
+        "maximum_connections": 1,
+        "transit_allowed": False,
+    },
+    "common_bathroom": {
+        "allowed_from": ["corridor", "lobby", "foyer", "family_lounge"],
+        "transit_allowed": False,
+    },
+    "bathroom": {
+        "allowed_from": ["corridor", "lobby", "foyer", "family_lounge", "bedroom", "master_bedroom"],
+        "transit_allowed": False,
+    },
+    "gym": {
+        "allowed_from": ["foyer", "family_lounge", "lobby", "corridor"],
+        "transit_allowed": False,
+    },
+    "kitchen": {
+        "allowed_from": ["dining_room", "service_passage", "corridor", "family_lounge"],
+        "transit_allowed": False,
+    },
+    "dining_room": {
+        "allowed_from": ["living_room", "family_lounge", "foyer", "corridor"],
+        "preferred_connections": ["kitchen"],
+        "transit_allowed": True,
+    },
+    "office": {
+        "allowed_from": ["foyer", "living_room", "lobby", "corridor"],
+        "transit_allowed": False,
+    },
+    "study_room": {
+        "allowed_from": ["foyer", "family_lounge", "lobby", "corridor", "bedroom", "master_bedroom"],
+        "transit_allowed": False,
+    },
+    "home_theater": {
+        "allowed_from": ["foyer", "family_lounge", "lobby", "corridor"],
+        "transit_allowed": False,
+    },
+}
+
+FORBIDDEN_TRANSIT_TYPES = {
+    "bedroom",
+    "master_bedroom",
+    "bathroom",
+    "powder_room",
+    "kitchen",
+    "closet",
+    "store_room",
+    "utility",
+    "utility_area",
+}
+
+
+def validate_circulation_access(nodes: List[RoomNode]) -> Dict[str, Any]:
+    """Validate walking routes from main entrance to all destination rooms."""
+    import collections
+    node_by_id = {n.id: n for n in nodes}
+    adj: Dict[str, List[str]] = {n.id: [] for n in nodes}
+    
+    for n in nodes:
+        for other in nodes:
+            if other.id == n.id:
+                continue
+            if _share_edge(n.rect, other.rect):
+                if other.id not in adj[n.id]:
+                    adj[n.id].append(other.id)
+
+    entrance_node = next(
+        (n for n in nodes if _canon(n.type) in {"foyer", "entrance", "living_room", "corridor"}),
+        nodes[0] if nodes else None
+    )
+
+    if not entrance_node:
+        return {"passed": True, "errors": []}
+
+    errors = []
+    for n in nodes:
+        if n.id == entrance_node.id or _canon(n.type) in {"corridor", "hallway", "staircase", "void"}:
+            continue
+        
+        queue = collections.deque([[entrance_node.id]])
+        visited = {entrance_node.id}
+        found_path = None
+        
+        while queue:
+            path = queue.popleft()
+            curr = path[-1]
+            if curr == n.id:
+                found_path = path
+                break
+            for nxt in adj.get(curr, []):
+                if nxt not in visited:
+                    visited.add(nxt)
+                    queue.append(path + [nxt])
+
+        if not found_path:
+            errors.append(f"UNREACHABLE: '{n.name}' ({n.id}) has no walking path from main entrance.")
+            continue
+
+        intermediate_ids = found_path[1:-1]
+        for mid_id in intermediate_ids:
+            mid_node = node_by_id.get(mid_id)
+            if mid_node and _canon(mid_node.type) in FORBIDDEN_TRANSIT_TYPES:
+                errors.append(
+                    f"FORBIDDEN_TRANSIT: Path to '{n.name}' passes through private/service space '{mid_node.name}' ({mid_node.type})."
+                )
+
+    return {"passed": len(errors) == 0, "errors": errors}
+
+
 # ---------------------------------------------------------------------------
 # 2. Generation Order Pipeline
 #    Step 1 Core → Step 2 Supporting → Step 3 Architectural → Step 4 Structural
@@ -533,6 +653,10 @@ def final_layout_validation(
             if ox > 0.3 and oz > 0.3:
                 build_issues.append(f"{a.name} overlaps {b.name}.")
     checks["buildability"] = (not build_issues, build_issues)
+
+    # 7. Universal Circulation & Transit Policy Check
+    circ_access = validate_circulation_access(nodes)
+    checks["universal_circulation_policy"] = (circ_access["passed"], circ_access["errors"])
 
     ok = all(passed for passed, _ in checks.values())
     issues_all = [i for _, issues in checks.values() for i in issues]
