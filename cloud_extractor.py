@@ -817,13 +817,23 @@ def auto_wire_topology(room_types: list, ai_categories: dict = None, bathroom_re
         })
 
     # Phase 2: Dynamic Topology Wiring based on AI Bins
+    
+    # 0. If there's a staircase but no circulation space, inject a Lobby.
+    if not circulation_idx:
+        has_staircase = any(r["type"] in {"staircase", "stairwell"} for r in room_specs)
+        if has_staircase:
+            import uuid
+            lobby = {"id": f"lobby_{uuid.uuid4().hex[:8]}", "type": "lobby", "name": "Lobby", "connections": [], "role": {'traffic': 'high', 'can_be_passage': True}}
+            room_specs.append(lobby)
+            circulation_idx.append(len(room_specs) - 1)
+            
     # 1. Determine Primary Hub for Circulation. Prefer a real corridor over a
     # foyer; the foyer is an entry transition, not the whole-house spine.
     # Prefer a horizontal circulation space as the hub. Gemini often lists
     # the staircase first; using it as the hub leaves it disconnected from the
     # corridor and can make the staircase act like an exterior entrance.
     hub_idx = next(
-        (index for index in circulation_idx if room_specs[index]["type"] in {"corridor", "hallway", "passage"}),
+        (index for index in circulation_idx if room_specs[index]["type"] in {"corridor", "hallway", "passage", "lobby"}),
         circulation_idx[0] if circulation_idx else (public_idx[0] if public_idx else 0),
     )
 
