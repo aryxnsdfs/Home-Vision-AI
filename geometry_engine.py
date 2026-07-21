@@ -606,11 +606,17 @@ class CPSolver:
                 slab_w = max(0.1, float(allowed_bounds[2]) - float(allowed_bounds[0]))
                 slab_l = max(0.1, float(allowed_bounds[3]) - float(allowed_bounds[1]))
                 slab_area = slab_w * slab_l
-                raise RuntimeError(
-                    f"The requested upper-floor rooms ({len(rooms_spec)} rooms, {int(total_min)} sq ft min) "
-                    f"could not be packed into the ground floor footprint ({int(slab_area)} sq ft available) "
-                    f"due to strict spatial or door adjacency constraints. Please simplify upper-floor room count or relax layout rules."
-                )
+                if total_min > slab_area:
+                    raise RuntimeError(
+                        f"Requested layout requires a minimum of {int(total_min)} sq ft, "
+                        f"but available buildable footprint is only {int(slab_area)} sq ft."
+                    )
+                else:
+                    raise RuntimeError(
+                        f"The requested layout ({len(rooms_spec)} rooms, {int(total_min)} sq ft min) "
+                        f"could not satisfy all spatial or door adjacency rules within the buildable footprint ({int(slab_area)} sq ft available). "
+                        f"Please simplify room count or relax layout rules."
+                    )
 
         return floor_data
 
