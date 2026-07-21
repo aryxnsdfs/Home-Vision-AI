@@ -75,6 +75,7 @@ class RoomNode:
     roof_type: str = "flat"  # flat, open, pitched
     is_outdoor: bool = False
     furnitureColor: str = ""
+    furniture: List[Any] = field(default_factory=list)
     mep_nodes: List[Dict[str, Any]] = field(default_factory=list)
     bathroom_role: str = ""
     assigned_to: str = ""
