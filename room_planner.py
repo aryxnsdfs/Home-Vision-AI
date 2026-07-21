@@ -516,6 +516,7 @@ def split_duplex_specs(
 
     # Guarantee circulation + a continuous staircase on both floors.
     _ensure_type(ground, "staircase")
+    _ensure_type(ground, "corridor")
     _ensure_type(first, "staircase")
     _ensure_type(first, "corridor")
     if not first:

@@ -5884,8 +5884,8 @@ def _stream_generate_work(req: "GenerateRequest", emit_fn: Callable) -> None:
                     logger.warning(f"[PIPELINE] Floor 0 validation failed on attempt {attempt + 1}: {val_0.errors}")
                     if attempt < max_attempts - 1:
                         logger.info(f"[PIPELINE] Attempting LOCAL REPAIR for Floor 0 (Attempt {attempt + 2})")
-                        # Freeze the public core so the solver only shuffles private/wet rooms around it
-                        public_core_types = {"living_room", "kitchen", "dining_room", "foyer", "corridor", "hallway", "lobby", "staircase", "stairwell", "open_kitchen", "dining_area"}
+                        # Freeze the public core (excluding circulation) so solver can adjust private rooms and corridors around it
+                        public_core_types = {"living_room", "kitchen", "dining_room", "foyer", "staircase", "stairwell", "open_kitchen", "dining_area"}
                         frozen = []
                         unlocked = []
                         for spec in floor_0_rooms:

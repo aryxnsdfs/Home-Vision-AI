@@ -300,20 +300,23 @@ class CPSolver:
                 model.Add(ma >= ba)
 
         # ────────────────────────────────────────────
-        # PHASE 3 — Required Door Graph (HARD)
-        # Every topology edge MUST produce ≥ 4 ft shared wall.
+        # PHASE 3 — Required Door Graph (HARD vs SOFT)
+        # Only strictly required structural adjacencies (attached bath ↔ bedroom,
+        # open flow kitchen ↔ dining, stair ↔ landing) are encoded as HARD shared walls.
+        # Access relationships (room ↔ corridor/lobby/foyer) are solved via soft walking-distance objectives.
         # ────────────────────────────────────────────
         processed_edges = set()
+        hard_touch_count = 0
         for r_id, rv in room_vars.items():
             for conn in rv['connections']:
-                if conn.get('intent') == 'proximity':
+                intent = conn.get('intent', 'standard')
+                if intent == 'proximity':
                     continue
                 target_type = conn.get('target_room', '')
                 target_room_id = conn.get('target_room_id', '')
                 if not target_type and not target_room_id:
                     continue
 
-                # Instance IDs are authoritative for repeated room types.
                 target_id = target_room_id if target_room_id in room_vars and target_room_id != r_id else None
                 if not target_id:
                     for tid, trv in room_vars.items():
@@ -329,9 +332,20 @@ class CPSolver:
                 processed_edges.add(edge)
 
                 trv = room_vars[target_id]
-                self._add_touch_constraint(model, rv, trv, r_id, target_id)
+                t_a = rv['type'].lower()
+                t_b = trv['type'].lower()
 
-        logger.info(f"[CP-SAT] {len(processed_edges)} required adjacency edges encoded as HARD constraints.")
+                # Determine if this edge is a HARD shared-wall requirement
+                is_attached_bath = (("bath" in t_a or "toilet" in t_a) and "bed" in t_b) or (("bath" in t_b or "toilet" in t_b) and "bed" in t_a)
+                is_stair_landing = "stair" in t_a or "stair" in t_b
+                is_open_flow = intent == "open_flow"
+
+                if is_attached_bath or is_stair_landing or is_open_flow:
+                    min_overlap = 0.5 if floor_data.get('relaxed_recovery') else 1.0
+                    self._add_touch_constraint(model, rv, trv, r_id, target_id, min_overlap_ft=min_overlap)
+                    hard_touch_count += 1
+
+        logger.info(f"[CP-SAT] {hard_touch_count} structural edges (out of {len(processed_edges)} total edges) encoded as HARD constraints.")
 
         # ────────────────────────────────────────────
         # PHASE 4 — Forbidden Adjacencies (HARD)
