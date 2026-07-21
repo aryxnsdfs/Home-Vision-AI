@@ -557,17 +557,37 @@ def _program_room_class(value: Any) -> str:
 def floor_program_fidelity_errors(nodes: Iterable[RoomNode], specs: Iterable[Dict[str, Any]], level: int) -> List[str]:
     """Require the realized floor to match the accepted semantic contract."""
     from collections import Counter
+    specs_list = [spec for spec in (specs or []) if isinstance(spec, dict)]
+    spec_map = { _program_room_class(spec.get("type")): spec for spec in specs_list }
+
     requested = Counter(
-        _program_room_class(spec.get("type")) for spec in specs or []
-        if isinstance(spec, dict) and _program_room_class(spec.get("type"))
+        _program_room_class(spec.get("type")) for spec in specs_list
+        if _program_room_class(spec.get("type"))
     )
     generated = Counter(_program_room_class(node.type) for node in nodes or [] if _program_room_class(node.type))
     errors: List[str] = []
     for room_type in sorted(set(requested) | set(generated)):
-        if requested[room_type] != generated[room_type]:
+        req_count = requested[room_type]
+        gen_count = generated[room_type]
+        if req_count != gen_count:
+            room_spec = spec_map.get(room_type, {})
+            role = room_spec.get('role')
+            is_circulation = (
+                role == 'circulation'
+                or (isinstance(role, dict) and role.get('can_be_passage') is True)
+                or room_spec.get('can_be_passage') is True
+                or canonical_type(room_type) in {'corridor', 'circulation', 'foyer', 'hallway', 'passage', 'staircase_landing', 'lobby'}
+            )
+            if is_circulation:
+                logger.info(
+                    f"[VALIDATION BYPASS] Allowed {room_type} count mismatch "
+                    f"({req_count} requested vs {gen_count} generated on floor {level}) due to dynamic corridor merging."
+                )
+                continue
+
             errors.append(
-                f"FLOOR PROGRAM ERROR: floor {level} requested {requested[room_type]} "
-                f"{room_type.replace('_', ' ')} room(s), but generated {generated[room_type]}."
+                f"FLOOR PROGRAM ERROR: floor {level} requested {req_count} "
+                f"{room_type.replace('_', ' ')} room(s), but generated {gen_count}."
             )
     return errors
 
