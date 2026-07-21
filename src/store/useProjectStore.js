@@ -906,9 +906,28 @@ export const useProjectStore = create((set, get) => ({
     }
   },
 
-  generateWithAI: async (prompt, width, length, indianOptions = {}, colors = null, packageLevel = "Standard", country = "India", customMaterials = {}, floors = 1) => {
+  analysisResult: null,
+  isAnalyzing: false,
+
+  analyzePrompt: async (prompt, width, length, floors = 1) => {
+    set({ apiError: null, isAnalyzing: true, analysisResult: null });
+    try {
+      const res = await fetch(`${API_BASE_URL}/analyze-prompt`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ prompt, width, length, floors })
+      });
+      if (!res.ok) throw new Error("Failed to analyze prompt");
+      const data = await res.json();
+      set({ analysisResult: data, isAnalyzing: false });
+    } catch (err) {
+      set({ apiError: err.message, isAnalyzing: false });
+    }
+  },
+
+  generateWithAI: async (prompt, width, length, indianOptions = {}, colors = null, packageLevel = "Standard", country = "India", customMaterials = {}, floors = 1, analysisId = null, clarifications = null) => {
     const requestEpoch = get().generationEpoch + 1;
-    set({ apiError: null, generationEpoch: requestEpoch });
+    set({ apiError: null, generationEpoch: requestEpoch, analysisResult: null });
     const features = Object.entries(indianOptions || {}).filter(([, v]) => v).map(([k]) => k.replace(/_/g, ' '));
     get()._startProgress({
       title: null,
