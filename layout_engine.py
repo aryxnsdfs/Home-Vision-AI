@@ -2051,14 +2051,56 @@ class AdjacencyResolver:
                 placed_doors_between.add(pair)
                 logger.info(f"    Placed door between '{r1.name}' and '{r2.name}'")
 
+ACCESS_POLICIES = {
+    "bedroom": {
+        "allowed_from": {"corridor", "hallway", "passage", "lobby", "foyer", "family_lounge", "staircase", "landing"},
+        "forbidden_from": {"bathroom", "toilet", "kitchen", "bedroom", "master_bedroom", "dining_room", "utility_area", "store_room"},
+    },
+    "master_bedroom": {
+        "allowed_from": {"corridor", "hallway", "passage", "lobby", "foyer", "family_lounge", "staircase", "landing"},
+        "forbidden_from": {"bathroom", "toilet", "kitchen", "bedroom", "dining_room", "utility_area", "store_room"},
+    },
+    "bathroom": {
+        "allowed_from": {"corridor", "hallway", "passage", "lobby", "foyer", "bedroom", "master_bedroom"},
+        "forbidden_from": {"kitchen", "dining_room"},
+    },
+    "kitchen": {
+        "allowed_from": {"dining_room", "corridor", "hallway", "passage", "utility_area", "store_room", "living_room", "family_lounge"},
+        "forbidden_from": {"bathroom", "toilet", "bedroom", "master_bedroom"},
+    },
+}
+
+def is_legal_door_pair(r1, r2) -> bool:
+    from room_planner import _canon
+    t1, t2 = _canon(r1.type), _canon(r2.type)
+    if t1 in ACCESS_POLICIES:
+        pol1 = ACCESS_POLICIES[t1]
+        if t2 in pol1.get("forbidden_from", set()):
+            if t1 in {"bathroom", "toilet"} and getattr(r1, "bathroom_role", "") == "attached":
+                if getattr(r1, "assigned_to", "") in {r2.id, r2.name, r2.type}:
+                    return True
+            return False
+    if t2 in ACCESS_POLICIES:
+        pol2 = ACCESS_POLICIES[t2]
+        if t1 in pol2.get("forbidden_from", set()):
+            if t2 in {"bathroom", "toilet"} and getattr(r2, "bathroom_role", "") == "attached":
+                if getattr(r2, "assigned_to", "") in {r1.id, r1.name, r1.type}:
+                    return True
+            return False
+    return True
+
         # --- PASS 2: RESCUE STRANDED ROOMS ---
         # If strict topological checks blocked a room from getting ANY doors, 
-        # force a door on its longest shared wall to prevent a pipeline crash.
+        # force a door on its longest shared wall ONLY if it respects architectural access policies.
         for r in self.rooms:
             if len(r.doors) == 0:
-                available_walls = [w for w in walls if w.get("is_shared") and r.id in w["room_ids"]]
+                available_walls = [
+                    w for w in walls if w.get("is_shared") and r.id in w["room_ids"]
+                    and is_legal_door_pair(room_by_id[w["room_ids"][0]], room_by_id[w["room_ids"][1]])
+                ]
                 if not available_walls:
-                    continue # Truly isolated geometry 
+                    logger.warning(f"[DOOR PLANNER] Room '{r.name}' ({r.id}) has no legal wall for door recovery.")
+                    continue
 
                 connected_walls = []
                 for wall in available_walls:
@@ -2067,7 +2109,7 @@ class AdjacencyResolver:
                     if other and (has_connection(r, other) or has_connection(other, r)):
                         connected_walls.append(wall)
                 if not connected_walls:
-                    # Rescue fallback: use shared wall with circulation/living space or any adjacent wall
+                    # Rescue fallback: use shared wall with circulation/living space
                     connected_walls = [
                         w for w in available_walls
                         if any(room_by_id.get(rid) and (room_by_id[rid].type in {"corridor", "hallway", "foyer", "living_room", "passage"} or "corridor" in room_by_id[rid].type) for rid in w["room_ids"] if rid != r.id)
@@ -2078,7 +2120,7 @@ class AdjacencyResolver:
                 def wall_len(w):
                     return abs(w["z2"]-w["z1"]) if w["orientation"]=="vertical" else abs(w["x2"]-w["x1"])
                 
-                best_wall = max(available_walls, key=wall_len)
+                best_wall = max(connected_walls, key=wall_len)
                 r1_id, r2_id = best_wall["room_ids"][:2]
                 pair = tuple(sorted([r1_id, r2_id]))
                 
@@ -2150,7 +2192,7 @@ class AdjacencyResolver:
                     continue
                 other_id = next((rid for rid in wall.get("room_ids", []) if rid != target.id), None)
                 other = room_by_id.get(other_id)
-                if other_id in visited and other and (has_connection(target, other) or has_connection(other, target)):
+                if other_id in visited and other and (has_connection(target, other) or has_connection(other, target)) and is_legal_door_pair(target, other):
                     candidate_walls.append(wall)
             if not candidate_walls:
                 break
