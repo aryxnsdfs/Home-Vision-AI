@@ -556,6 +556,11 @@ def inject_main_entrance(
             break
     if candidate is None:
         for r in rooms:
+            if r.type in ("entrance_lobby", "lobby"):
+                candidate = r
+                break
+    if candidate is None:
+        for r in rooms:
             if r.type == "living_room":
                 candidate = r
                 break
