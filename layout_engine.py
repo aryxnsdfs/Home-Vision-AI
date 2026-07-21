@@ -76,7 +76,8 @@ class RoomNode:
     is_outdoor: bool = False
     furnitureColor: str = ""
     furniture: List[Any] = field(default_factory=list)
-    mep_nodes: List[Dict[str, Any]] = field(default_factory=list)
+    bathroom_role: str = ""
+    assigned_to: str = ""
     # Faces where this room should NOT render walls because an adjacent room
     # already renders the shared wall.  Populated by compute_shared_walls for
     # circulation rooms (corridor, hallway, staircase) to prevent double-thick
@@ -102,6 +103,8 @@ class RoomNode:
             "is_double_height": self.is_double_height,
             "roof_type": self.roof_type,
             "is_outdoor": self.is_outdoor,
+            "bathroom_role": self.bathroom_role,
+            "assigned_to": self.assigned_to,
             "furnitureColor": self.furnitureColor,
             "furniture": getattr(self, 'furniture', []),
             "mep_nodes": self.mep_nodes,
@@ -2205,8 +2208,8 @@ class AdjacencyResolver:
             width = max(2.0, min(3.0, round(wall_length - 0.2, 1)))
             sx, sz = cx - stair.rect.x, cz - stair.rect.z
             px, pz = cx - public.rect.x, cz - public.rect.z
-            stair.doors.append(Door(x=sx, z=sz, width=width, wall_orientation=get_face(sx, sz, stair, is_vertical)))
-            public.doors.append(Door(x=px, z=pz, width=width, wall_orientation=get_face(px, pz, public, is_vertical)))
+            stair.doors.append(Door(x=sx, z=sz, width=width, wall_orientation=get_face(sx, sz, stair, is_vertical), target_room_id=public.id))
+            public.doors.append(Door(x=px, z=pz, width=width, wall_orientation=get_face(px, pz, public, is_vertical), target_room_id=stair.id))
             logger.info(f"[STAIR ACCESS] Connected {stair.name} directly to {public.name}")
 # ---------------------------------------------------------------------------
 # Window Generation

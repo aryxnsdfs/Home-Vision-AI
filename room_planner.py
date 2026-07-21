@@ -170,24 +170,63 @@ FORBIDDEN_TRANSIT_TYPES = {
 }
 
 
+import re
+
+
+def normalize_room_reference(value: str) -> str:
+    value = str(value or "").strip().lower()
+    value = value.replace("-", "_")
+    value = re.sub(r"\s+", "_", value)
+    value = re.sub(r"_\d+$", "", value)
+    return value
+
+
 def validate_circulation_access(nodes: List[RoomNode]) -> Dict[str, Any]:
-    """Validate walking routes from main entrance to all destination rooms."""
+    """Validate walking routes from main entrance to all destination rooms using canonical door graph."""
     import collections
+    import logging
+    logger = logging.getLogger(__name__)
+
     node_by_id = {n.id: n for n in nodes}
+
+    # Build Canonical Room Alias Registry
+    room_alias_to_id: Dict[str, str] = {}
+    for n in nodes:
+        aliases = {
+            n.id,
+            getattr(n, "name", ""),
+            getattr(n, "display_name", ""),
+            getattr(n, "type", ""),
+        }
+        for alias in aliases:
+            norm = normalize_room_reference(alias)
+            if norm and norm not in room_alias_to_id:
+                room_alias_to_id[norm] = n.id
+
+    def resolve_room_id(ref: Any) -> Optional[str]:
+        if not ref:
+            return None
+        ref_str = str(ref).strip()
+        if ref_str in node_by_id:
+            return ref_str
+        norm = normalize_room_reference(ref_str)
+        return room_alias_to_id.get(norm)
+
     adj: Dict[str, set] = {n.id: set() for n in nodes}
-    
-    # 1. Build Access Graph using materialized doors
+
+    # 1. Build Access Graph using materialized doors and canonical endpoints
     for n in nodes:
         for door in getattr(n, "doors", []):
-            target_id = None
+            target_ref = None
             if hasattr(door, "target_room_id"):
-                target_id = door.target_room_id
+                target_ref = door.target_room_id
             elif isinstance(door, dict):
-                target_id = door.get("target_room_id")
-                
-            if target_id and target_id in node_by_id and target_id != n.id:
-                adj[n.id].add(target_id)
-                adj[target_id].add(n.id)
+                target_ref = door.get("target_room_id")
+
+            resolved_target = resolve_room_id(target_ref)
+            if resolved_target and resolved_target in node_by_id and resolved_target != n.id:
+                adj[n.id].add(resolved_target)
+                adj[resolved_target].add(n.id)
 
     entrance_node = None
     for n in nodes:
@@ -198,7 +237,7 @@ def validate_circulation_access(nodes: List[RoomNode]) -> Dict[str, Any]:
                 break
         if entrance_node:
             break
-            
+
     if not entrance_node:
         entrance_node = next(
             (n for n in nodes if _canon(n.type) in {"foyer", "entrance", "living_room", "corridor"}),
@@ -208,15 +247,41 @@ def validate_circulation_access(nodes: List[RoomNode]) -> Dict[str, Any]:
     if not entrance_node:
         return {"passed": True, "errors": []}
 
+    # Graph Diagnostics Logging
+    logger.info("[ACCESS GRAPH] Entrance room=%s", entrance_node.id)
+    for room_id, neighbours in adj.items():
+        logger.info("[ACCESS GRAPH] %s -> %s", room_id, sorted(neighbours))
+
     errors = []
+
+    # 2. Attached Bathroom Ownership Check
+    for n in nodes:
+        if _canon(n.type) in {"bathroom", "toilet"}:
+            is_attached = getattr(n, "bathroom_role", "") == "attached" or getattr(n, "is_attached", False)
+            assigned_ref = getattr(n, "assigned_to", None) or getattr(n, "attached_to_id", None)
+            if is_attached and assigned_ref:
+                canonical_assigned = resolve_room_id(assigned_ref)
+                if canonical_assigned:
+                    neighbours = adj.get(n.id, set())
+                    public_leaks = [
+                        nid for nid in neighbours
+                        if nid != canonical_assigned and _canon(node_by_id[nid].type) in {"corridor", "hallway", "passage", "foyer", "living_room"}
+                    ]
+                    if public_leaks:
+                        errors.append({
+                            "code": "INVALID_BATHROOM_OWNERSHIP",
+                            "message": f"Attached bathroom '{n.name}' ({n.id}) connects to public space '{node_by_id[public_leaks[0]].name}' ({public_leaks[0]}), but must connect only to its assigned bedroom '{node_by_id[canonical_assigned].name}' ({canonical_assigned})."
+                        })
+
+    # 3. Path reachability and Transit Policy Check
     for n in nodes:
         if n.id == entrance_node.id or _canon(n.type) in {"corridor", "hallway", "staircase", "void"}:
             continue
-        
+
         queue = collections.deque([[entrance_node.id]])
         visited = {entrance_node.id}
         found_path = None
-        
+
         while queue:
             path = queue.popleft()
             curr = path[-1]
