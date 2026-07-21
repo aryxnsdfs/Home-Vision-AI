@@ -75,7 +75,7 @@ class RoomNode:
     roof_type: str = "flat"  # flat, open, pitched
     is_outdoor: bool = False
     furnitureColor: str = ""
-    furniture: List[Any] = field(default_factory=list)
+    mep_nodes: List[Dict[str, Any]] = field(default_factory=list)
     bathroom_role: str = ""
     assigned_to: str = ""
     # Faces where this room should NOT render walls because an adjacent room
@@ -107,7 +107,7 @@ class RoomNode:
             "assigned_to": self.assigned_to,
             "furnitureColor": self.furnitureColor,
             "furniture": getattr(self, 'furniture', []),
-            "mep_nodes": self.mep_nodes,
+            "mep_nodes": getattr(self, 'mep_nodes', []),
             "doors": [{"x": round(d.x, 2), "z": round(d.z, 2), "wall_orientation": d.wall_orientation, "width": d.width, "height": getattr(d, 'height', 7.0), "is_main": bool(getattr(d, 'is_main', False)), "target_room_id": getattr(d, 'target_room_id', None)} for d in getattr(self, 'doors', [])],
             "windows": [{"x": round(w.x, 2), "z": round(w.z, 2), "wall_orientation": w.wall_orientation, "width": w.width, "height": getattr(w, 'height', 4.0), "sill_height": getattr(w, 'sill_height', 3.0)} for w in getattr(self, 'windows', [])],
         }
