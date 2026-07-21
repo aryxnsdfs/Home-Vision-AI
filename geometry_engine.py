@@ -491,17 +491,24 @@ class CPSolver:
                     if 'resolved_rooms' in result:
                         return result
                 
-                # Hard abort if relaxation also failed or was not possible
+                # Accurately diagnose why the upper floor could not be packed
                 total_min = sum(ROOM_MINIMUMS.get(r.get('type', 'room'), _DEFAULT_MIN)['area'] 
                                 for r in rooms_spec if not r.get('is_outdoor'))
                 slab_w = max(0.1, float(allowed_bounds[2]) - float(allowed_bounds[0]))
                 slab_l = max(0.1, float(allowed_bounds[3]) - float(allowed_bounds[1]))
                 slab_area = slab_w * slab_l
-                raise RuntimeError(
-                    f"Your requested upper-floor layout requires a minimum of {int(total_min)} sq ft, "
-                    f"but the ground floor foundation only provides {int(slab_area)} sq ft. "
-                    f"Please reduce upper-floor rooms or increase the plot size."
-                )
+                if total_min > slab_area:
+                    raise RuntimeError(
+                        f"Your requested upper-floor layout requires a minimum of {int(total_min)} sq ft, "
+                        f"but the ground floor foundation only provides {int(slab_area)} sq ft. "
+                        f"Please reduce upper-floor rooms or increase the plot size."
+                    )
+                else:
+                    raise RuntimeError(
+                        f"The requested upper-floor rooms ({len(rooms_spec)} rooms, {int(total_min)} sq ft) "
+                        f"could not be packed into the ground floor footprint ({int(slab_area)} sq ft available) "
+                        f"due to strict spatial or door adjacency constraints. Please simplify upper-floor room count or relax layout rules."
+                    )
 
             max_attempts = max(1, int(os.getenv("CP_SOLVER_MAX_ATTEMPTS", "1")))
             if attempt + 1 < max_attempts:

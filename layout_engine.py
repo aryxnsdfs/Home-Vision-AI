@@ -2059,9 +2059,13 @@ class AdjacencyResolver:
                     if other and (has_connection(r, other) or has_connection(other, r)):
                         connected_walls.append(wall)
                 if not connected_walls:
-                    logger.warning("[DOOR PLANNER] No topology-authorized shared wall for %s", r.name)
-                    continue
-                available_walls = connected_walls
+                    # Rescue fallback: use shared wall with circulation/living space or any adjacent wall
+                    connected_walls = [
+                        w for w in available_walls
+                        if any(room_by_id.get(rid) and (room_by_id[rid].type in {"corridor", "hallway", "foyer", "living_room", "passage"} or "corridor" in room_by_id[rid].type) for rid in w["room_ids"] if rid != r.id)
+                    ]
+                if not connected_walls:
+                    connected_walls = available_walls
                 
                 def wall_len(w):
                     return abs(w["z2"]-w["z1"]) if w["orientation"]=="vertical" else abs(w["x2"]-w["x1"])

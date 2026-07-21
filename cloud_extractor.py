@@ -858,10 +858,18 @@ def auto_wire_topology(room_types: list, ai_categories: dict = None) -> list:
             room["connections"] = filtered_conns
 
     # Rule C: Ensure every DESTINATION room connects to at least one circulation space
+    # (Exempt attached bathrooms — they are private leaf nodes attached ONLY to their assigned bedroom)
     for i, room in enumerate(room_specs):
         r_passage = room.get("role", {}).get("can_be_passage", False)
         if r_passage:
             continue  # Only skip explicitly known circulation rooms
+        is_attached_bath = (
+            room.get("bathroom_role") == "attached"
+            or "attached" in room.get("type", "")
+            or "ensuite" in room.get("type", "")
+        )
+        if is_attached_bath:
+            continue  # Attached baths stay strictly degree-1 leaf nodes on their bedroom!
         if hub_idx is not None and i != hub_idx:
             has_circ = any(
                 id_to_spec.get(c.get("target_room_id", ""), {}).get("role", {}).get("can_be_passage", False)
