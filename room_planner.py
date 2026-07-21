@@ -174,20 +174,36 @@ def validate_circulation_access(nodes: List[RoomNode]) -> Dict[str, Any]:
     """Validate walking routes from main entrance to all destination rooms."""
     import collections
     node_by_id = {n.id: n for n in nodes}
-    adj: Dict[str, List[str]] = {n.id: [] for n in nodes}
+    adj: Dict[str, set] = {n.id: set() for n in nodes}
     
+    # 1. Build Access Graph using materialized doors
     for n in nodes:
-        for other in nodes:
-            if other.id == n.id:
-                continue
-            if _share_edge(n.rect, other.rect):
-                if other.id not in adj[n.id]:
-                    adj[n.id].append(other.id)
+        for door in getattr(n, "doors", []):
+            target_id = None
+            if hasattr(door, "target_room_id"):
+                target_id = door.target_room_id
+            elif isinstance(door, dict):
+                target_id = door.get("target_room_id")
+                
+            if target_id and target_id in node_by_id and target_id != n.id:
+                adj[n.id].add(target_id)
+                adj[target_id].add(n.id)
 
-    entrance_node = next(
-        (n for n in nodes if _canon(n.type) in {"foyer", "entrance", "living_room", "corridor"}),
-        nodes[0] if nodes else None
-    )
+    entrance_node = None
+    for n in nodes:
+        for d in getattr(n, "doors", []):
+            is_m = getattr(d, "is_main", False) if not isinstance(d, dict) else d.get("is_main")
+            if is_m:
+                entrance_node = n
+                break
+        if entrance_node:
+            break
+            
+    if not entrance_node:
+        entrance_node = next(
+            (n for n in nodes if _canon(n.type) in {"foyer", "entrance", "living_room", "corridor"}),
+            nodes[0] if nodes else None
+        )
 
     if not entrance_node:
         return {"passed": True, "errors": []}
