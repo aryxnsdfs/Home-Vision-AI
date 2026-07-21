@@ -193,19 +193,16 @@ Output NOTHING but valid JSON matching this schema. Do not include markdown code
         if not api_key:
             raise ValueError("GEMINI_API_KEY not found in environment")
             
-        genai.configure(api_key=api_key)
-        model = genai.GenerativeModel("gemini-2.5-flash")
+        client = genai.Client(api_key=api_key, http_options=genai.types.HttpOptions(timeout=20000))
         prompt = system_prompt + "\n\nUser Request: " + user_prompt
         
-        response = model.generate_content(
-            prompt,
-            generation_config=genai.types.GenerationConfig(
+        response = client.models.generate_content(
+            model="gemini-2.5-flash",
+            contents=prompt,
+            config=genai.types.GenerateContentConfig(
                 temperature=0.0,
                 response_mime_type="application/json",
-            ),
-            # Leave enough of the 30-second worker budget for deterministic
-            # two-floor geometry and accessibility validation.
-            request_options={"timeout": 20},
+            )
         )
         content = response.text
         logger.info(f"[GEMINI RAW OUTPUT]\n{content}")
