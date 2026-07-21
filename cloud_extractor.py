@@ -269,6 +269,7 @@ Output a strict JSON 'Program' listing the exact rooms to build, their minimum v
 5. WET ZONES: Ensure every bedroom connects to a bathroom. Do not connect bathrooms directly to living rooms or dining rooms (use a corridor).
 6. VERTICAL CIRCULATION: If the prompt implies multiple floors (e.g. "duplex", "stairs", "two-story"), you MUST include a 'staircase' room.
 7. For connections, use intent 'open_flow' for open-plan areas (e.g., living to dining), and 'standard' for doors.
+8. STRUCTURAL BALANCING RULE (NO INVERSE PYRAMIDS): Floor 0 (Ground Floor) is the foundation and MUST have an equal or greater total floor area than Floor 1. If the user's request creates a top-heavy house (e.g. 3 rooms downstairs, 8 rooms upstairs), automatically rebalance the program: (a) Semantically analyze requested rooms to determine flexible spaces (workspaces, entertainment rooms, play areas, secondary lounges). (b) Assign flexible rooms to Floor 0 instead of Floor 1 to balance footprint. (c) Do NOT move rooms with strict cultural/Vastu requirements (Prayer rooms, main kitchen).
 """
 
 def generate_cultural_program(prompt: str, emit_fn: Callable = None) -> dict:
@@ -552,6 +553,7 @@ When CURRENT SPATIAL STATE is supplied:
 - MOVE must set move_target_room and move_destination. Never silently reinterpret MOVE as ADD or COLOR.
 - Do not invent coordinates or claim success. A deterministic constraint solver will execute and verify the plan.
 - For every floor_program room set topology_role to HUB only when people may naturally pass through it; set SPOKE for private or destination rooms. Bedrooms, offices, theaters, prayer rooms and attached bathrooms are normally SPOKE. Corridors, halls and appropriate open living/dining circulation areas may be HUB.
+- STRUCTURAL BALANCING RULE (NO INVERSE PYRAMIDS): Floor 0 (Ground Floor) is the foundation and MUST have an equal or greater total floor area than Floor 1. If the user request creates a top-heavy house, automatically rebalance flexible rooms (workspaces, play areas, secondary lounges) to Floor 0. Do NOT move rooms with strict cultural/Vastu requirements (Prayer rooms, main kitchen).
 
 Room vocabulary is open-ended. Return only JSON matching the schema."""
             if current_floorplan:

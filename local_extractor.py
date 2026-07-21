@@ -114,6 +114,7 @@ Floor analysis rules:
 - Every occupied upper level must include aligned staircase access and a circulation space connected to its rooms. Include the matching staircase on the level below.
 - Preserve unfamiliar room names exactly as concise snake_case labels; never replace them with a hardcoded room.
 - Keep every bathroom type as "bathroom" and set bathroom_role="attached" for an ensuite/private bedroom bathroom or "common" for a general/shared bathroom. Preserve the requested count and floor.
+- STRUCTURAL BALANCING RULE (NO INVERSE PYRAMIDS): You are acting as an architect. You must ensure the physical viability of multi-floor layouts. Floor 0 (Ground Floor) is the foundation and MUST have an equal or greater total floor area than Floor 1. If the user's request creates a top-heavy house (e.g., 3 rooms downstairs, 8 rooms upstairs), you must automatically rebalance the program before generating the JSON: (1) Semantically analyze the requested rooms to determine which are "flexible" (e.g., workspaces, entertainment rooms, play areas, secondary lounges). (2) Automatically assign these flexible rooms to Floor 0 ("0") instead of Floor 1 ("1") to balance the footprint. (3) Do NOT move rooms that have strict cultural, functional, or Vastu requirements (e.g., Prayer rooms, main kitchens) purely for balancing. Use your architectural reasoning to move the right spaces.
 
 Indian feature detection rules (set to true if user mentions):
 - needs_pooja_room: "pooja room", "prayer room", "mandir", "temple", "puja", "devghar"
