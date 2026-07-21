@@ -5782,6 +5782,20 @@ def _stream_generate_work(req: "GenerateRequest", emit_fn: Callable) -> None:
                 r["attempt"] = attempt
             for r in first_spec:
                 r["attempt"] = attempt
+                
+            # --- APPLY ROOM SCALING ---
+            coverage_str = str(slm_result.get("coverage_preference", "")) if slm_result else ""
+            coverage_ratio = 0.65 # default
+            if "40" in coverage_str: coverage_ratio = 0.40
+            elif "50" in coverage_str: coverage_ratio = 0.50
+            elif "70" in coverage_str: coverage_ratio = 0.70
+            elif "85" in coverage_str: coverage_ratio = 0.85
+            
+            target_footprint = (plot_w * plot_l) * coverage_ratio
+            from room_planner import apply_room_scaling
+            floor_0_rooms = apply_room_scaling(floor_0_rooms, target_footprint)
+            if floors > 1 and first_spec:
+                first_spec = apply_room_scaling(first_spec, target_footprint)
 
             try:
                 # Calculate minimum foundation dimensions needed for Floor 1
