@@ -145,6 +145,11 @@ class HouseDesignRequest(BaseModel):
     public_rooms: List[str] = Field(default_factory=list, description="Shared communal spaces (e.g., living room, dining room, pooja room).")
     # ----------------------------------------------------
     
+    missing_keys: List[str] = Field(
+        default_factory=list,
+        description="List of clarification keys (road_side, coverage_preference, parking_count) that cannot be confidently inferred from the prompt."
+    )
+    
     global_color: str = ""
     room_colors: List[RoomColor] = Field(default_factory=list)
     bathroom_requirements: BathroomRequirements = Field(default_factory=BathroomRequirements)
@@ -590,6 +595,14 @@ Create an access graph before geometry:
 - A gym, office, library or home_theater must have direct access from a foyer, family_lounge, lobby or corridor (NOT solely through a bedroom or bathroom).
 - A kitchen should preferably connect directly to dining.
 - STRUCTURAL BALANCING RULE (NO INVERSE PYRAMIDS): Floor 0 (Ground Floor) is the foundation and MUST have an equal or greater total floor area than Floor 1. If the request creates a top-heavy house, automatically rebalance flexible rooms (workspaces, play areas, secondary lounges) to Floor 0.
+
+MISSING INFORMATION EXTRACTION:
+Evaluate if the prompt explicitly or implicitly provides answers for the following keys:
+- "road_side": Which side of the plot faces the main road? (e.g. North, South)
+- "coverage_preference": How much of the available building area should be used? (e.g. compact, spacious, maximum)
+- "parking_count": How many cars should the plan accommodate?
+
+If any of these cannot be confidently inferred from the prompt, add the key string to the `missing_keys` array. Do NOT add keys if the prompt implies the answer (e.g., "compact house with large garden" implies low coverage).
 
 Return strict JSON matching the schema only."""
             if current_floorplan:
