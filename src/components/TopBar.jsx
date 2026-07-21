@@ -22,7 +22,7 @@ export default function TopBar() {
               Home Vision AI
             </div>
             <button
-              onClick={() => useProjectStore.getState().openSetupModal()}
+              onClick={() => useProjectStore.getState().startNewTemplate()}
               className="rounded bg-slate-800 px-2 py-0.5 text-xs font-bold text-slate-300 hover:bg-slate-700 transition-colors"
             >
               New Template

@@ -350,31 +350,20 @@ function PlotBoundary({ plot, accent, offset = [0,0,0], label = null }) {
 
 /* ── First floor slab ── */
 function InterflorSlab({ rooms }) {
-  const bounds = useMemo(() => {
-    const points = rooms.flatMap((room) => {
-      const b = roomBounds(room);
-      return [
-        [b.x, b.z],
-        [b.x + b.width, b.z + b.length]
-      ];
-    });
-    const minX = Math.min(...points.map((point) => point[0])) - 1;
-    const maxX = Math.max(...points.map((point) => point[0])) + 1;
-    const minZ = Math.min(...points.map((point) => point[1])) - 1;
-    const maxZ = Math.max(...points.map((point) => point[1])) + 1;
-    return {
-      x: (minX + maxX) / 2,
-      z: (minZ + maxZ) / 2,
-      width: maxX - minX,
-      length: maxZ - minZ
-    };
-  }, [rooms]);
-
   return (
-    <mesh receiveShadow position={[bounds.x, -0.18, bounds.z]} userData={{ hideInBlueprint: true }}>
-      <boxGeometry args={[bounds.width, 0.2, bounds.length]} />
-      <meshPhysicalMaterial color="#e0e0e0" roughness={0.15} clearcoat={0.5} />
-    </mesh>
+    <group name="inter-floor-supported-slab" userData={{ hideInBlueprint: true }}>
+      {rooms
+        .filter(room => !room.is_outdoor && room.roof_type !== "open")
+        .map(room => {
+          const b = roomBounds(room);
+          return (
+            <mesh key={`slab-${room.id}`} receiveShadow position={[b.x + b.width / 2, -0.18, b.z + b.length / 2]}>
+              <boxGeometry args={[b.width + 0.04, 0.2, b.length + 0.04]} />
+              <meshPhysicalMaterial color="#e0e0e0" roughness={0.15} clearcoat={0.5} />
+            </mesh>
+          );
+        })}
+    </group>
   );
 }
 
@@ -1111,7 +1100,10 @@ function SceneContent() {
     Number.isFinite(r?.x) && Number.isFinite(r?.z) &&
     Number.isFinite(r?.width) && r.width > 0 &&
     Number.isFinite(r?.length) && r.length > 0;
-  const _safeRooms = ((project.floors ? project.floors[project.current_floor_index || 0].rooms : []) || []).filter(_finiteRoom);
+  const _safeRooms = (project.floors?.length
+    ? project.floors.flatMap(floor => floor?.rooms || [])
+    : (project.rooms || [])
+  ).filter(_finiteRoom);
   const groundFloorRooms = _safeRooms.filter(room => room.floorIndex === 0 || (room.floorIndex === undefined && !room.isFloor1));
   const firstFloorRooms = _safeRooms.filter(room => room.floorIndex === 1 || room.isFloor1);
   const floorWalls = project.walls?.length
@@ -1131,13 +1123,21 @@ function SceneContent() {
   // Exterior facade color is disabled while Vastu directional mode is active.
   // Otherwise fall back to a warm default facade so outer walls are NEVER left
   // white when the user hasn't explicitly picked an exterior colour.
-  const DEFAULT_FACADE = "#e6c873"; // warm sand — clearly a painted facade
+  const DEFAULT_FACADE = "#FDF5E6"; // ivory cream default facade
   const exteriorColor = project.style?.vastuColors
     ? null
     : (project.style?.exteriorColor || DEFAULT_FACADE);
 
   useEffect(() => {
-  }, [project.colors, project.style?.wallFinish, project.style?.exteriorColor, project.style?.floorMaterial, project.style?.furnitureColor, _safeRooms.length]);
+    if (import.meta.env.DEV) {
+      console.info("[SCENE FLOOR AUDIT]", {
+        plot: project.plot,
+        visibleFloor,
+        ground: { count: groundFloorRooms.length, bounds: groundBounds },
+        first: { count: firstFloorRooms.length, bounds: firstBounds },
+      });
+    }
+  }, [project.colors, project.style?.wallFinish, project.style?.exteriorColor, project.style?.floorMaterial, project.style?.furnitureColor, project.plot, visibleFloor, _safeRooms.length]);
 
   // Compare mode: lay both floors side-by-side at ground level (view-only,
   // no geometry regen). First floor is shifted +X beside the ground floor.
@@ -1148,7 +1148,6 @@ function SceneContent() {
     : 8;
   const groundVisible = isCompare || visibleFloor === "all" || visibleFloor === "floor_0";
   const firstVisible = isCompare || visibleFloor === "all" || visibleFloor === "floor_1";
-  const firstFloorPos = isCompare ? [compareOffsetX, 0, 0] : [0, WALL_HEIGHT + 0.2, 0];
 
   return (
     <>
@@ -1181,20 +1180,19 @@ function SceneContent() {
            
            const isVisible = isCompare || visibleFloor === "all" || visibleFloor === `floor_${floor}`;
            const isTopFloor = Math.max(..._safeRooms.map(getFloor)) === floor;
-           const isAllMode = visibleFloor === "all";
-           
-           const pos = isCompare 
-              ? [(compareOffsetX * (floor + 1)), 0, 0] 
-              : [0, floor * 3.5, 0];
+           const pos = isCompare
+              ? [compareOffsetX * Math.max(0, floor), 0, 0]
+              : [0, floor * (WALL_HEIGHT + 0.2), 0];
               
            const fw = floorWalls.filter(w => getFloor(w) === floor);
            const bnd = boundsOf(floorRooms);
+           const supportingRooms = _safeRooms.filter(room =>
+             getFloor(room) === floor - 1 && !room.is_outdoor && room.roof_type !== "open"
+           );
            
            return (
              <group key={`floor-${floor}`} position={pos} visible={isVisible}>
-               {floor > 0 && <InterflorSlab rooms={floorRooms} />}
-               <PlotBoundary plot={project.plot} accent={accentColor} offset={[0,0,0]} label={isCompare ? `FLOOR ${floor}` : null} />
-               
+               {floor > 0 && <InterflorSlab rooms={supportingRooms.length ? supportingRooms : floorRooms} />}
                {floorRooms.map(room => (
                  <HouseRoom
                    key={room.id}
@@ -1204,7 +1202,7 @@ function SceneContent() {
                    accent={accentColor}
                    showLabel={viewMode !== "walk"}
                    onSelect={selectRoom}
-                   transparent={showStructural || isAllMode}
+                   transparent={showStructural}
                    buildingBounds={bnd}
                    exteriorColor={exteriorColor}
                    globalProperties={project.globalProperties}

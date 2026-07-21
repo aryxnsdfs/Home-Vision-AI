@@ -14,6 +14,7 @@ import logging
 import math
 import random
 import uuid
+import copy
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 from layout_templates import get_template_for_bhk
@@ -71,6 +72,7 @@ class RoomNode:
     wallColor: str = ""
     is_double_height: bool = False
     roof_type: str = "flat"  # flat, open, pitched
+    is_outdoor: bool = False
     furnitureColor: str = ""
     furniture: List[Any] = field(default_factory=list)
     mep_nodes: List[Dict[str, Any]] = field(default_factory=list)
@@ -98,6 +100,7 @@ class RoomNode:
             "wallColor": self.wallColor,
             "is_double_height": self.is_double_height,
             "roof_type": self.roof_type,
+            "is_outdoor": self.is_outdoor,
             "furnitureColor": self.furnitureColor,
             "furniture": getattr(self, 'furniture', []),
             "mep_nodes": self.mep_nodes,
@@ -216,14 +219,18 @@ def place_furniture(nodes: List[RoomNode], indian_options: Dict[str, Any], user_
     # Gemini supplies the semantic manifest for arbitrary user-created rooms.
     # The local library remains a bounded fallback for offline/API failures.
     ai_manifest = {}
-    try:
-        from cloud_extractor import generate_furniture_manifest
-        ai_manifest = generate_furniture_manifest([
-            {"type": node.type, "width": node.rect.width, "length": node.rect.length}
-            for node in nodes
-        ], user_prompt=user_prompt)
-    except Exception as exc:
-        logger.info("[FURNITURE] Gemini manifest skipped: %s", exc)
+    # Network furniture generation used 20–30 seconds per floor and was
+    # repeated whenever geometry validation retried. Keep it opt-in; the local
+    # measured furniture library is immediate and keeps generation predictable.
+    if os.getenv("ENABLE_AI_FURNITURE", "0").strip().lower() in {"1", "true", "yes"}:
+        try:
+            from cloud_extractor import generate_furniture_manifest
+            ai_manifest = generate_furniture_manifest([
+                {"type": node.type, "width": node.rect.width, "length": node.rect.length}
+                for node in nodes
+            ], user_prompt=user_prompt)
+        except Exception as exc:
+            logger.info("[FURNITURE] Gemini manifest skipped: %s", exc)
 
     for node in nodes:
         # Furniture is a renderable asset manifest, not placeholder geometry.
@@ -430,6 +437,13 @@ def align_duplex_floors(
             floor1.append(RoomNode(id="staircase-f1", type="staircase", name="Staircase",
                                    rect=rect, wallThicknessIn=6.0, floorColor="#e5e7eb"))
 
+    # The upper-floor solver receives this staircase as a fixed rectangle, so
+    # its other rooms are already arranged around it.  Do not stretch a
+    # corridor or clip rooms after solving: doing so invalidates CP-SAT's
+    # non-overlap guarantees and was the source of intersecting first-floor
+    # walls.  Alignment is deliberately limited to the vertical stair lock and
+    # an explicitly requested double-height void.
+
     # 2. Double-height void over the living room — ONLY when requested.
     if make_void and living0:
         living0.is_double_height = True
@@ -443,8 +457,12 @@ def align_duplex_floors(
         # No void: drop the redundant upstairs living room but keep the floor solid.
         floor1[:] = [n for n in floor1 if n.type != "living_room"]
 
-    # 3. Clip remaining rooms out of the locked zones.
-    locked = [n.rect for n in floor1 if n.type in ("staircase", "void")]
+    if not make_void:
+        return floor1
+
+    # 3. Clip remaining rooms out of an explicitly requested void only.  The
+    # staircase itself was a fixed solver obstacle and needs no post-clipping.
+    locked = [n.rect for n in floor1 if n.type == "void"]
 
     def _overlap(a: Rect, b: Rect) -> Tuple[float, float]:
         ox = min(a.x + a.width, b.x + b.width) - max(a.x, b.x)
@@ -498,68 +516,6 @@ def align_duplex_floors(
             rect=new_rect, wallThicknessIn=6.0, floorColor="#f3f4f6",
         ))
 
-    # ── Post-clip corridor spine fix ──────────────────────────────────
-    # The corridor must span the full z-range of all habitable rooms on
-    # this floor so that every bedroom/bathroom shares a wall with it and
-    # the adjacency resolver can place doors. Also enforce minimum width
-    # of 5 ft so it isn't an unusably narrow slit.
-    corridor = next((n for n in kept if n.type in ("corridor", "hallway")), None)
-    if corridor:
-        habitable = [n for n in kept if n.type not in ("staircase", "void", "corridor", "hallway")]
-        if habitable:
-            min_z = min(n.rect.z for n in habitable)
-            max_z = max(n.rect.z + n.rect.length for n in habitable)
-            # Extend corridor to cover the full z-span of habitable rooms.
-            if corridor.rect.z > min_z:
-                old_z = corridor.rect.z
-                corridor.rect.z = min_z
-                corridor.rect.length += old_z - min_z
-            if corridor.rect.z + corridor.rect.length < max_z:
-                corridor.rect.length = max_z - corridor.rect.z
-        # Enforce minimum walkable width (5 ft).
-        if corridor.rect.width < 5.0:
-            corridor.rect.width = 5.0
-
-        # The corridor must physically meet the stair landing.  Alignment and
-        # clipping can otherwise leave both rectangles on the same floor but
-        # separated by a wall/room, which gives the upper floor no usable path.
-        stair = next((n for n in kept if n.type in ("staircase", "stairwell")), None)
-        if stair:
-            sr, cr = stair.rect, corridor.rect
-            shares_landing = (
-                (abs((sr.x + sr.width) - cr.x) <= 0.15 or abs((cr.x + cr.width) - sr.x) <= 0.15)
-                and min(sr.z + sr.length, cr.z + cr.length) - max(sr.z, cr.z) >= 3.0
-            ) or (
-                (abs((sr.z + sr.length) - cr.z) <= 0.15 or abs((cr.z + cr.length) - sr.z) <= 0.15)
-                and min(sr.x + sr.width, cr.x + cr.width) - max(sr.x, cr.x) >= 3.0
-            )
-            if not shares_landing:
-                min_x = min(n.rect.x for n in floor0)
-                max_x = max(n.rect.x + n.rect.width for n in floor0)
-                min_z = min(n.rect.z for n in floor0)
-                max_z = max(n.rect.z + n.rect.length for n in floor0)
-                span_z = max(5.0, cr.length)
-                candidates = [
-                    Rect(sr.x + sr.width, sr.z, cr.width, span_z),
-                    Rect(sr.x - cr.width, sr.z, cr.width, span_z),
-                    Rect(sr.x, sr.z + sr.length, max(5.0, sr.width), cr.length),
-                    Rect(sr.x, sr.z - cr.length, max(5.0, sr.width), cr.length),
-                ]
-
-                def within_floor(rect: Rect) -> bool:
-                    return rect.x >= min_x - 0.1 and rect.z >= min_z - 0.1 and rect.x + rect.width <= max_x + 0.1 and rect.z + rect.length <= max_z + 0.1
-
-                def overlap_cost(rect: Rect) -> float:
-                    return sum(
-                        max(0.0, min(rect.x + rect.width, n.rect.x + n.rect.width) - max(rect.x, n.rect.x))
-                        * max(0.0, min(rect.z + rect.length, n.rect.z + n.rect.length) - max(rect.z, n.rect.z))
-                        for n in habitable
-                    )
-
-                valid = [rect for rect in candidates if within_floor(rect)]
-                if valid:
-                    corridor.rect = min(valid, key=overlap_cost)
-
     floor1[:] = kept
     return floor1
 
@@ -596,11 +552,18 @@ def inject_main_entrance(
     r = candidate
     tolerance = 1.5
 
-    # Compute distances to each boundary face
-    dist_south = abs((r.rect.z + r.rect.length) - (setback_z + buildable_length))
-    dist_north = abs(r.rect.z - setback_z)
-    dist_west  = abs(r.rect.x - setback_x)
-    dist_east  = abs((r.rect.x + r.rect.width) - (setback_x + buildable_width))
+    # Compare against the ACTUAL generated house envelope. The CP layout may
+    # intentionally occupy only part of the legal buildable rectangle; using
+    # theoretical setback edges made the living room appear closer to a side
+    # wall and put the entrance at the rear/side of the house.
+    house_min_x = min(room.rect.x for room in rooms)
+    house_max_x = max(room.rect.x + room.rect.width for room in rooms)
+    house_min_z = min(room.rect.z for room in rooms)
+    house_max_z = max(room.rect.z + room.rect.length for room in rooms)
+    dist_south = abs((r.rect.z + r.rect.length) - house_max_z)
+    dist_north = abs(r.rect.z - house_min_z)
+    dist_west  = abs(r.rect.x - house_min_x)
+    dist_east  = abs((r.rect.x + r.rect.width) - house_max_x)
 
     # Prefer south (front-facing), then north, east, west
     face_order = sorted(
@@ -661,7 +624,7 @@ PALETTE_HEX: Dict[str, str] = {
     "off_white": "#F8F8FF", "warm_beige": "#F5F5DC", "light_grey": "#D3D3D3",
     "beige": "#F5F5DC", "sage": "#9CA986", "terracotta": "#E2725B", "charcoal": "#36454F",
     # Exteriors
-    "mustard": "#E4A010", "cream": "#FDF5E6", "peach": "#FFDAB9", "sea_green": "#2E8B57",
+    "mustard": "#E4A010", "cream": "#FDF5E6", "ivory": "#FDF5E6", "peach": "#FFDAB9", "sea_green": "#2E8B57",
     "indigo": "#4B0082", "white": "#FFFFFF", "concrete": "#808080", "brick": "#B22222",
     "wood": "#DEB887",
     # Common color words (fallbacks)
@@ -914,11 +877,15 @@ class LayoutEngine:
         self.colors = colors or {}
         self.theme = resolve_theme(self.colors)
 
-        # Legal setbacks: 85% buildable area centred on plot
-        self.buildable_width = plot_width * 0.85
-        self.buildable_length = plot_length * 0.85
-        self.setback_x = (plot_width - self.buildable_width) / 2
-        self.setback_z = (plot_length - self.buildable_length) / 2
+        # Keep a site margin while allowing the requested building footprint to
+        # use at least 80% of the plot. A 95% buildable span on each axis leaves
+        # a 90.25% maximum footprint, giving the solver enough room to reach the
+        # 80% target without crossing the plot boundary.
+        self.target_coverage = 0.80
+        self.buildable_width = self.plot_width * 0.95
+        self.buildable_length = self.plot_length * 0.95
+        self.setback_x = (self.plot_width - self.buildable_width) / 2
+        self.setback_z = (self.plot_length - self.buildable_length) / 2
 
         self.last_walls: List[Dict] = []
 
@@ -926,11 +893,437 @@ class LayoutEngine:
     def walls(self) -> List[Dict]:
         return self.last_walls
 
+    @staticmethod
+    def _shared_wall_length(a: RoomNode, b: RoomNode) -> float:
+        """Return the usable shared boundary between two room rectangles."""
+        tolerance = 0.12
+        if abs((a.rect.x + a.rect.width) - b.rect.x) <= tolerance or abs((b.rect.x + b.rect.width) - a.rect.x) <= tolerance:
+            return max(0.0, min(a.rect.z + a.rect.length, b.rect.z + b.rect.length) - max(a.rect.z, b.rect.z))
+        if abs((a.rect.z + a.rect.length) - b.rect.z) <= tolerance or abs((b.rect.z + b.rect.length) - a.rect.z) <= tolerance:
+            return max(0.0, min(a.rect.x + a.rect.width, b.rect.x + b.rect.width) - max(a.rect.x, b.rect.x))
+        return 0.0
+
+    @staticmethod
+    def _overlaps_after_translation(room: RoomNode, dx: float, dz: float, other: RoomNode) -> bool:
+        rx1, rz1 = room.rect.x + dx, room.rect.z + dz
+        rx2, rz2 = rx1 + room.rect.width, rz1 + room.rect.length
+        ox1, oz1 = other.rect.x, other.rect.z
+        ox2, oz2 = ox1 + other.rect.width, oz1 + other.rect.length
+        return min(rx2, ox2) - max(rx1, ox1) > 0.05 and min(rz2, oz2) - max(rz1, oz1) > 0.05
+
+    def _repair_disconnected_components(self, nodes: List[RoomNode]) -> None:
+        """Join separated indoor room islands before walls and doors are built.
+
+        A valid room graph can still become visually disconnected after a
+        footprint transform or a fallback pack. Move only the isolated island
+        as a rigid group until it shares a real wall with the main island; this
+        preserves all room sizes, furniture semantics, and internal topology.
+        """
+        interior = [
+            node for node in nodes
+            if not getattr(node, "is_outdoor", False)
+            and node.roof_type != "open"
+            and node.type not in {"parking", "garden", "courtyard", "terrace", "balcony"}
+        ]
+        if len(interior) < 2:
+            return
+
+        def components() -> List[List[RoomNode]]:
+            remaining = list(interior)
+            result = []
+            while remaining:
+                seed = remaining.pop()
+                component = [seed]
+                queue = [seed]
+                while queue:
+                    current = queue.pop()
+                    neighbours = [other for other in list(remaining) if self._shared_wall_length(current, other) >= 0.05]
+                    for other in neighbours:
+                        remaining.remove(other)
+                        component.append(other)
+                        queue.append(other)
+                result.append(component)
+            return result
+
+        # Use the living-room island as the navigation/building anchor.
+        groups = components()
+        if len(groups) <= 1:
+            return
+        main = next((group for group in groups if any(room.type == "living_room" for room in group)), max(groups, key=len))
+        logger.warning("[GEOMETRY] Repairing %d disconnected indoor room component(s)", len(groups) - 1)
+
+        for group in groups:
+            if group is main:
+                continue
+            candidates = []
+            for moving in group:
+                for anchor in main:
+                    ax, az = moving.rect.x, moving.rect.z
+                    aw, al = moving.rect.width, moving.rect.length
+                    bx, bz = anchor.rect.x, anchor.rect.z
+                    bw, bl = anchor.rect.width, anchor.rect.length
+                    align_z = [bz - az, bz + bl - (az + al), bz + bl / 2.0 - (az + al / 2.0)]
+                    align_x = [bx - ax, bx + bw - (ax + aw), bx + bw / 2.0 - (ax + aw / 2.0)]
+                    placements = (
+                        [(bx + bw - ax, dz) for dz in align_z]
+                        + [(bx - (ax + aw), dz) for dz in align_z]
+                        + [(dx, bz + bl - az) for dx in align_x]
+                        + [(dx, bz - (az + al)) for dx in align_x]
+                    )
+                    for dx, dz in placements:
+                        translated = {room.id: (room.rect.x + dx, room.rect.z + dz) for room in group}
+                        if any(
+                            x < -0.05 or z < -0.05
+                            or x + room.rect.width > self.plot_width + 0.05
+                            or z + room.rect.length > self.plot_length + 0.05
+                            for room in group
+                            for x, z in [translated[room.id]]
+                        ):
+                            continue
+                        if any(
+                            self._overlaps_after_translation(room, dx, dz, other)
+                            for room in group for other in interior if other not in group
+                        ):
+                            continue
+                        shared = max(
+                            max(0.0, min(room.rect.x + dx + room.rect.width, other.rect.x + other.rect.width) - max(room.rect.x + dx, other.rect.x))
+                            for room in group for other in main
+                        )
+                        candidates.append((abs(dx) + abs(dz), -shared, dx, dz))
+            if not candidates:
+                logger.error("[GEOMETRY] Could not close disconnected component; keeping validated coordinates")
+                continue
+            _, _, dx, dz = min(candidates)
+            for room in group:
+                room.rect.x += dx
+                room.rect.z += dz
+            main.extend(group)
+            logger.info("[GEOMETRY] Joined room component with rigid translation dx=%.2f dz=%.2f", dx, dz)
+
+    def _close_nearby_wall_seams(self, nodes: List[RoomNode]) -> None:
+        """Snap near-coincident room edges together so wall meshes cannot slit."""
+        interior = [
+            node for node in nodes
+            if not getattr(node, "is_outdoor", False)
+            and node.roof_type != "open"
+            and node.type not in {"parking", "garden", "courtyard", "terrace", "balcony"}
+        ]
+        seam_tolerance = 0.35
+        overlap_tolerance = 0.05
+        for index, first in enumerate(interior):
+            for second in interior[index + 1:]:
+                a, b = first.rect, second.rect
+                z_overlap = min(a.z + a.length, b.z + b.length) - max(a.z, b.z)
+                x_overlap = min(a.x + a.width, b.x + b.width) - max(a.x, b.x)
+                if z_overlap > overlap_tolerance:
+                    if abs((a.x + a.width) - b.x) <= seam_tolerance:
+                        seam = ((a.x + a.width) + b.x) / 2.0
+                        a.width = seam - a.x
+                        b.x, b.width = seam, b.x + b.width - seam
+                    elif abs((b.x + b.width) - a.x) <= seam_tolerance:
+                        seam = ((b.x + b.width) + a.x) / 2.0
+                        b.width = seam - b.x
+                        a.x, a.width = seam, a.x + a.width - seam
+                if x_overlap > overlap_tolerance:
+                    if abs((a.z + a.length) - b.z) <= seam_tolerance:
+                        seam = ((a.z + a.length) + b.z) / 2.0
+                        a.length = seam - a.z
+                        b.z, b.length = seam, b.z + b.length - seam
+                    elif abs((b.z + b.length) - a.z) <= seam_tolerance:
+                        seam = ((b.z + b.length) + a.z) / 2.0
+                        b.length = seam - b.z
+                        a.z, a.length = seam, a.z + a.length - seam
+
+    def _expand_to_target_coverage(
+        self,
+        nodes: List[RoomNode],
+        additional_nodes: Optional[List[RoomNode]] = None,
+    ) -> None:
+        """Center a solved footprint without changing its internal geometry.
+
+        Unused plot area is legitimate yard/setback space. Earlier versions
+        stretched every coordinate to an arbitrary 80% coverage target; that
+        magnified solver dead zones, distorted room proportions, and made a
+        compact upper storey look detached from the ground-floor composition.
+        """
+        if not nodes:
+            return
+        min_x = min(node.rect.x for node in nodes)
+        max_x = max(node.rect.x + node.rect.width for node in nodes)
+        min_z = min(node.rect.z for node in nodes)
+        max_z = max(node.rect.z + node.rect.length for node in nodes)
+        house_width = max(0.1, max_x - min_x)
+        house_length = max(0.1, max_z - min_z)
+        scale_x = 1.0
+        scale_z = 1.0
+        scaled_width = house_width * scale_x
+        scaled_length = house_length * scale_z
+        offset_x = (self.plot_width - scaled_width) / 2.0
+        offset_z = (self.plot_length - scaled_length) / 2.0
+        transform_nodes = list(nodes)
+        transform_nodes.extend(node for node in (additional_nodes or []) if node not in transform_nodes)
+        for node in transform_nodes:
+            node.rect.x = offset_x + (node.rect.x - min_x) * scale_x
+            node.rect.z = offset_z + (node.rect.z - min_z) * scale_z
+            node.rect.width *= scale_x
+            node.rect.length *= scale_z
+
+        coverage = (scaled_width * scaled_length) / max(1.0, self.plot_width * self.plot_length)
+        logger.info(
+            "[COMPACT FOOTPRINT] Preserved solved footprint at %.1fx%.1f (%.1f%% of plot); remainder kept as site space",
+            house_width, house_length, coverage * 100.0,
+        )
+
+    def _recover_missing_requested_rooms(
+        self,
+        nodes: List[RoomNode],
+        requested_rooms: List[Tuple[str, str]],
+        rooms_spec: List[Dict[str, Any]],
+        allowed_bounds: Optional[Tuple[float, float, float, float]] = None,
+        blocked_zones: Optional[List[Rect]] = None,
+    ) -> None:
+        """Materialize rooms skipped by the legacy template/carve fallback.
+
+        CP-SAT may time out on a dense arbitrary program. The legacy template
+        handles its core slots first and historically dropped a custom room if
+        one preferred donor could not be carved. This guillotine partitioner
+        tries every feasible donor, retains the complete footprint, and copies
+        the request's identity/topology metadata into the recovered room.
+        """
+        present_ids = {str(node.id) for node in nodes}
+        source_by_id = {
+            str(spec.get("id")): spec for spec in rooms_spec
+            if isinstance(spec, dict) and spec.get("id")
+        }
+        protected = {"corridor", "hallway", "staircase", "courtyard", "balcony", "parking", "void"}
+        indoor_bounds = allowed_bounds or (
+            self.setback_x,
+            self.setback_z,
+            self.setback_x + self.buildable_width,
+            self.setback_z + self.buildable_length,
+        )
+        plot_bounds = (
+            self.setback_x,
+            self.setback_z,
+            self.setback_x + self.buildable_width,
+            self.setback_z + self.buildable_length,
+        )
+        obstacles = list(blocked_zones or [])
+
+        def rect_overlaps(first: Rect, second: Rect, tolerance: float = 0.05) -> bool:
+            return (
+                min(first.x + first.width, second.x + second.width) - max(first.x, second.x) > tolerance
+                and min(first.z + first.length, second.z + second.length) - max(first.z, second.z) > tolerance
+            )
+
+        def free_rect(candidate: Rect, bounds: Tuple[float, float, float, float]) -> bool:
+            bx0, bz0, bx1, bz1 = bounds
+            if (
+                candidate.x < bx0 - 0.05 or candidate.z < bz0 - 0.05
+                or candidate.x + candidate.width > bx1 + 0.05
+                or candidate.z + candidate.length > bz1 + 0.05
+            ):
+                return False
+            return not any(rect_overlaps(candidate, occupied.rect) for occupied in nodes) and not any(
+                rect_overlaps(candidate, obstacle) for obstacle in obstacles
+            )
+
+        recovery_order = sorted(
+            requested_rooms,
+            key=lambda item: (
+                0 if ("balcony" in item[1] or bool(source_by_id.get(item[0], {}).get("is_outdoor")))
+                else 2 if item[1] == "bathroom"
+                else 1
+            ),
+        )
+        for room_id, room_type in recovery_order:
+            if room_id in present_ids:
+                continue
+            source = source_by_id.get(room_id, {})
+            minimum_type = "balcony" if "balcony" in room_type else room_type
+            new_min = ROOM_MINIMUMS.get(minimum_type, _DEFAULT_MIN)
+            new_min_dim = float(new_min.get("min_dim", 6.0))
+            new_min_area = float(new_min.get("area", 36.0))
+
+            requested_targets = [
+                str(edge.get("target_room_id"))
+                for edge in source.get("connections", []) or []
+                if isinstance(edge, dict) and edge.get("intent") != "proximity" and edge.get("target_room_id")
+            ]
+            # Some relationships are intentionally stored on the owning room
+            # (bedroom -> private balcony). Include reverse instance edges so
+            # recovery still knows which existing room must be touched.
+            requested_targets.extend(
+                str(spec.get("id"))
+                for spec in rooms_spec
+                if isinstance(spec, dict) and spec.get("id") and any(
+                    isinstance(edge, dict)
+                    and str(edge.get("target_room_id")) == room_id
+                    and edge.get("intent") != "proximity"
+                    for edge in spec.get("connections", []) or []
+                )
+            )
+            requested_targets = list(dict.fromkeys(requested_targets))
+            target_rank = {target_id: rank for rank, target_id in enumerate(requested_targets)}
+            target_types = {
+                node.type for node in nodes if str(node.id) in requested_targets
+            }
+            owner_bound = "balcony" in room_type or (
+                room_type == "bathroom" and any("bedroom" in target_type for target_type in target_types)
+            )
+
+            # First use genuinely empty slab/plot space adjacent to a required
+            # target. Upper-floor templates often occupy only one end of the
+            # supporting slab, so splitting already-small rooms is unnecessary.
+            placement_bounds = plot_bounds if (source.get("is_outdoor") or "balcony" in room_type) else indoor_bounds
+            target_nodes = [node for target_id in requested_targets for node in nodes if str(node.id) == target_id]
+            base_shapes = [
+                (new_min_dim, max(new_min_dim, new_min_area / max(new_min_dim, 0.1))),
+                (max(new_min_dim, new_min_area / max(new_min_dim, 0.1)), new_min_dim),
+            ]
+            placed_rect: Optional[Rect] = None
+            for target in target_nodes:
+                for width, length in base_shapes:
+                    candidates = [
+                        Rect(target.rect.x + target.rect.width, target.rect.z, width, min(length, target.rect.length)),
+                        Rect(target.rect.x - width, target.rect.z, width, min(length, target.rect.length)),
+                        Rect(target.rect.x, target.rect.z + target.rect.length, min(width, target.rect.width), length),
+                        Rect(target.rect.x, target.rect.z - length, min(width, target.rect.width), length),
+                    ]
+                    placed_rect = next((candidate for candidate in candidates if candidate.area >= new_min_area and free_rect(candidate, placement_bounds)), None)
+                    if placed_rect:
+                        break
+                if placed_rect:
+                    break
+
+            # If no requested anchor is available, pack into any unused
+            # rectangle whose edges align with the existing finite-wall grid.
+            if placed_rect is None and not owner_bound:
+                bx0, bz0, bx1, bz1 = placement_bounds
+                for width, length in base_shapes:
+                    x_values = sorted({bx0, *(node.rect.x + node.rect.width for node in nodes), *(node.rect.x - width for node in nodes)})
+                    z_values = sorted({bz0, *(node.rect.z + node.rect.length for node in nodes), *(node.rect.z - length for node in nodes)})
+                    placed_rect = next((
+                        Rect(x, z, width, length)
+                        for z in z_values for x in x_values
+                        if free_rect(Rect(x, z, width, length), placement_bounds)
+                    ), None)
+                    if placed_rect:
+                        break
+
+            if placed_rect is not None:
+                is_wet = room_type == "bathroom" or any(token in room_type for token in ("toilet", "washroom", "laundry"))
+                nodes.append(RoomNode(
+                    id=room_id,
+                    type=room_type,
+                    name=str(source.get("name") or room_type.replace("_", " ").title()),
+                    rect=placed_rect,
+                    wallThicknessIn=8.0 if is_wet else 6.0,
+                    is_wet=is_wet,
+                    connections=copy.deepcopy(source.get("connections", []) or []),
+                    roof_type=str(source.get("roof_type") or ("open" if source.get("is_outdoor") else "flat")),
+                    is_outdoor=bool(source.get("is_outdoor")),
+                    floorColor=self.theme.get("floor") or ("#dcfce7" if is_wet else "#ffffff"),
+                    wallColor=self.theme.get("wall") or "",
+                    furnitureColor=self.theme.get("furniture") or "",
+                ))
+                present_ids.add(room_id)
+                logger.info(
+                    "[FALLBACK RECOVERY] Materialized requested %s (%s) in unused footprint space",
+                    room_id, room_type,
+                )
+                continue
+
+            def donor_rank(node: RoomNode) -> Tuple[int, int, float]:
+                if str(node.id) in target_rank:
+                    relation_rank = target_rank[str(node.id)]
+                elif room_type == "bathroom" and "bedroom" in node.type:
+                    relation_rank = len(target_rank) + 1
+                elif room_type in {"home_theater", "prayer_room", "pooja_room"} and node.type in {"living_room", "dining_room"}:
+                    relation_rank = len(target_rank) + 1
+                else:
+                    relation_rank = len(target_rank) + 2
+                return (relation_rank, node.type in protected, -node.rect.area)
+
+            recovered = False
+            for donor in sorted(nodes, key=donor_rank):
+                if donor.type in protected or donor.roof_type == "open" or getattr(donor, "is_outdoor", False):
+                    continue
+                donor_min = ROOM_MINIMUMS.get(donor.type, _DEFAULT_MIN)
+                donor_min_dim = float(donor_min.get("min_dim", 6.0))
+                donor_min_area = float(donor_min.get("area", 36.0))
+                rect = donor.rect
+
+                # Prefer the cut that removes the least area while leaving the
+                # donor above both its dimension and usable-area minimum.
+                cuts: List[Tuple[float, str, float]] = []
+                cut_w = max(new_min_dim, new_min_area / max(rect.length, 0.1))
+                if (
+                    rect.width - cut_w >= donor_min_dim
+                    and (rect.width - cut_w) * rect.length >= donor_min_area
+                    and cut_w * rect.length >= new_min_area
+                ):
+                    cuts.append((cut_w * rect.length, "vertical", cut_w))
+                cut_l = max(new_min_dim, new_min_area / max(rect.width, 0.1))
+                if (
+                    rect.length - cut_l >= donor_min_dim
+                    and rect.width * (rect.length - cut_l) >= donor_min_area
+                    and rect.width * cut_l >= new_min_area
+                ):
+                    cuts.append((rect.width * cut_l, "horizontal", cut_l))
+                if not cuts:
+                    continue
+
+                _, orientation, amount = min(cuts, key=lambda item: item[0])
+                if orientation == "vertical":
+                    recovered_rect = Rect(rect.x + rect.width - amount, rect.z, amount, rect.length)
+                    rect.width -= amount
+                else:
+                    recovered_rect = Rect(rect.x, rect.z + rect.length - amount, rect.width, amount)
+                    rect.length -= amount
+
+                is_wet = room_type == "bathroom" or any(token in room_type for token in ("toilet", "washroom", "laundry"))
+                recovered_node = RoomNode(
+                    id=room_id,
+                    type=room_type,
+                    name=str(source.get("name") or room_type.replace("_", " ").title()),
+                    rect=recovered_rect,
+                    wallThicknessIn=8.0 if is_wet else 6.0,
+                    is_wet=is_wet,
+                    connections=copy.deepcopy(source.get("connections", []) or []),
+                    roof_type=str(source.get("roof_type") or "flat"),
+                    is_outdoor=bool(source.get("is_outdoor")),
+                    floorColor=self.theme.get("floor") or ("#dcfce7" if is_wet else "#ffffff"),
+                    wallColor=self.theme.get("wall") or "",
+                    furnitureColor=self.theme.get("furniture") or "",
+                )
+                nodes.append(recovered_node)
+                present_ids.add(room_id)
+                logger.info(
+                    "[FALLBACK RECOVERY] Materialized requested %s (%s) by partitioning %s",
+                    room_id, room_type, donor.id,
+                )
+                recovered = True
+                break
+
+            if not recovered:
+                logger.warning(
+                    "[FALLBACK RECOVERY] No dimension-safe partition could materialize %s (%s)",
+                    room_id, room_type,
+                )
+
     def generate(self, rooms_spec: List[Dict[str, Any]], blocked_zones: Optional[List[Rect]] = None, indian_options: Optional[Dict[str, Any]] = None, layout_rules: Optional[List[Dict[str, str]]] = None, restrict_slots: bool = False, master_blueprint: Optional[List[Dict[str, Any]]] = None, plot_info: Optional[Dict[str, Any]] = None) -> List[RoomNode]:
         if indian_options is None:
             indian_options = {}
         if layout_rules is None:
             layout_rules = []
+        # A fixed rectangle is a cross-floor structural anchor (normally the
+        # staircase).  Any whole-floor scale/centering transform after solving
+        # would move that anchor and invalidate the adjacent-room solution.
+        has_fixed_anchor = bool((plot_info or {}).get("_preserve_fixed_anchor")) or any(
+            isinstance(spec, dict) and spec.get("fixed_rect") is not None
+            for spec in rooms_spec
+        )
             
         # --- ZERO HARDCODING: COLLECT AI OUTDOOR DESIGNATIONS ---
         # Collect AI-designated outdoor room types directly from the processed specification
@@ -948,7 +1341,7 @@ class LayoutEngine:
             for bp in master_blueprint:
                 rt = bp.get("room_type", "room").replace(" ", "_").lower()
                 type_counts[rt] = type_counts.get(rt, 0) + 1
-                room_id = f"{rt}-{type_counts[rt]}"
+                room_id = str(bp.get("id") or f"{rt}-{type_counts[rt]}")
 
                 rect = Rect(float(bp.get("position_x", 0)), float(bp.get("position_z", 0)),
                           float(bp.get("width", 0)), float(bp.get("length", 0)))
@@ -956,11 +1349,13 @@ class LayoutEngine:
                 node = RoomNode(
                     id=room_id,
                     type=rt,
-                    name=rt.replace("_", " ").title(),
+                    name=str(bp.get("name") or rt.replace("_", " ").title()),
                     rect=rect,
                     is_wet=is_wet,
                     wallThicknessIn=8.0 if is_wet else 6.0,
-                    connections=bp.get("connections", [])
+                    connections=bp.get("connections", []),
+                    roof_type=str(bp.get("roof_type") or ("open" if bp.get("is_outdoor") else "flat")),
+                    is_outdoor=bool(bp.get("is_outdoor")),
                 )
                 # Doors and Windows will be generated deterministically by the layout engine!
                 nodes.append(node)
@@ -969,8 +1364,15 @@ class LayoutEngine:
             # Snapping is now natively handled by CP-SAT Macro-Zone alignment.
             # Legacy snapping destroyed minimum dimension constraints by averaging coordinates.
 
+            # Expand a compact but valid solution before doors/furniture are
+            # generated, then anchor the resulting footprint to the plot.
+            if not has_fixed_anchor:
+                self._expand_to_target_coverage(nodes)
+            self._repair_disconnected_components(nodes)
+            self._close_nearby_wall_seams(nodes)
+
             # --- ORIGIN ANCHORING ---
-            if nodes:
+            if nodes and not has_fixed_anchor:
                 # 1. Find the absolute boundaries of the generated house
                 min_x = min(n.rect.x for n in nodes)
                 max_x = max(n.rect.x + n.rect.width for n in nodes)
@@ -1006,7 +1408,8 @@ class LayoutEngine:
             AdjacencyResolver(nodes).resolve()
             WindowPlacer(nodes, self.plot_width, self.plot_length).place_windows()
             
-            place_furniture(nodes, indian_options, getattr(self, "furniture_prompt", ""))
+            if not getattr(self, "skip_furniture_generation", False):
+                place_furniture(nodes, indian_options, getattr(self, "furniture_prompt", ""))
             
             logger.info(f"[ZERO-STATIC] Generated {len(nodes)} nodes, {len(self.last_walls)} shared finite walls")
             return nodes
@@ -1026,30 +1429,59 @@ class LayoutEngine:
                 # Extract attempt number if present (injected during retry loops)
                 attempt = next((r.get("attempt", 0) for r in rooms_spec if isinstance(r, dict)), 0)
 
+            # Fixed upper-floor anchors and allowed slab bounds are expressed
+            # in global plot coordinates. Solving them inside a 0-based
+            # buildable-width domain made an east/south staircase appear
+            # outside the model and returned INFEASIBLE immediately.
+            uses_global_coordinates = has_fixed_anchor or bool((plot_info or {}).get("allowed_bounds"))
             floor_data = {
-                'plot_width': self.buildable_width,
-                'plot_length': self.buildable_length,
+                'plot_width': self.plot_width if uses_global_coordinates else self.buildable_width,
+                'plot_length': self.plot_length if uses_global_coordinates else self.buildable_length,
                 'rooms': rooms_spec,
                 'attempt': attempt
             }
+            if isinstance(plot_info, dict) and plot_info.get("allowed_bounds"):
+                floor_data["allowed_bounds"] = tuple(plot_info["allowed_bounds"])
             solved_data = engine.solve_phase_2_csp(floor_data)
+
+            # Dense but valid schedules can spend the primary deadline proving
+            # a heavily optimized topology and return UNKNOWN. Before entering
+            # the slot-based legacy template, make one short feasibility pass:
+            # retain the AI door graph and architectural minimums, but remove
+            # soft optimization and hygiene gaps. This is both faster and
+            # complete—the fallback must not silently lose arbitrary rooms.
+            if 'resolved_rooms' not in solved_data and not has_fixed_anchor:
+                logger.info("[CP-SAT RECOVERY] Retrying complete room program without soft objectives")
+                recovery_data = dict(floor_data)
+                recovery_data['relaxed_recovery'] = True
+                solved_data = engine.solve_phase_2_csp(recovery_data)
             
             if 'resolved_rooms' in solved_data:
                 logger.info("CP Solver successfully packed the rooms! Re-routing through master_blueprint logic.")
                 cp_blueprint = []
+                source_by_id = {
+                    str(spec.get("id")): spec
+                    for spec in rooms_spec
+                    if isinstance(spec, dict) and spec.get("id")
+                }
                 for rr in solved_data['resolved_rooms']:
+                    source = source_by_id.get(str(rr.get("id")), {})
                     cp_blueprint.append({
+                        "id": rr.get("id"),
                         "room_type": rr["type"],
+                        "name": source.get("name"),
                         "position_x": rr["x"],
                         "position_z": rr["z"],
                         "width": rr["width"],
                         "length": rr["length"],
-                        "connections": rr["connections"]
+                        "connections": rr["connections"],
+                        "roof_type": source.get("roof_type"),
+                        "is_outdoor": bool(source.get("is_outdoor")),
                     })
                 return self.generate(
                     rooms_spec=[], 
                     master_blueprint=cp_blueprint,
-                    plot_info=plot_info, 
+                    plot_info={**(plot_info or {}), "_preserve_fixed_anchor": has_fixed_anchor},
                     indian_options=indian_options
                 )
         except Exception as e:
@@ -1066,8 +1498,19 @@ class LayoutEngine:
             if "master_bedroom" in rt or "bedroom" in rt:
                 bhk_count += 1
             type_counts[rt] = type_counts.get(rt, 0) + 1
-            room_id = f"{rt}-{type_counts[rt]}"
+            room_id = str(r.get("id") or f"{rt}-{type_counts[rt]}")
             ai_requested_rooms.append((room_id, rt))
+
+        requested_type_by_id = {room_id: room_type for room_id, room_type in ai_requested_rooms}
+        relationship_owned_spaces = {
+            str(edge.get("target_room_id"))
+            for spec in rooms_spec if isinstance(spec, dict) and "bedroom" in str(spec.get("type", ""))
+            for edge in spec.get("connections", []) or [] if isinstance(edge, dict) and edge.get("target_room_id")
+            if (
+                edge.get("intent") in {"open_flow", "private_access"}
+                or requested_type_by_id.get(str(edge.get("target_room_id"))) == "bathroom"
+            )
+        }
 
         # Determine if we should mirror the template for Vastu
         mirror_x = False
@@ -1077,7 +1520,6 @@ class LayoutEngine:
             mirror_x = True
 
         from layout_templates import get_template_for_bhk
-        import copy
         base_template = copy.deepcopy(get_template_for_bhk(bhk_count))
 
         # ---- Apply Dynamic Layout Rules (Workstream 2 & 7) ----
@@ -1125,6 +1567,8 @@ class LayoutEngine:
             matched_id = None
             matched_rt = slot_key
             for rid, rt in ai_requested_rooms:
+                if rid in relationship_owned_spaces:
+                    continue
                 if rid not in used_ai_rooms and (rt in slot_key or slot_key in rt or (slot_key.startswith("bedroom") and "bedroom" in rt)):
                     matched_id = rid
                     matched_rt = rt
@@ -1198,6 +1642,7 @@ class LayoutEngine:
             nodes.append(RoomNode(
                 id=matched_id, type=matched_rt, name=matched_rt.replace("_", " ").title(),
                 rect=Rect(x, z, w, l), wallThicknessIn=wall_thick, is_wet=is_wet,
+                connections=copy.deepcopy(next((spec.get("connections", []) for spec in rooms_spec if str(spec.get("id")) == matched_id), [])),
                 floorColor=floor_color, wallColor=wall_color, furnitureColor=furniture_color,
                 roof_type=roof_val  # Dynamic roof property assignment via AI
             ))
@@ -1205,9 +1650,17 @@ class LayoutEngine:
 
         # 2. Process Parasites (Mutators)
         parasites = [(rid, rt) for rid, rt in ai_requested_rooms if rid not in used_ai_rooms]
+        # Instance-owned outdoor spaces (for example bedroom-2 -> balcony-2)
+        # must be placed against their owner. The generic parasite carver only
+        # understands room types, so defer these to the relationship-aware
+        # recovery partitioner below.
         
         # Vastu Hard-Injected Parasites
-        if indian_options.get("pooja_room") and not any("pooja" in n.type for n in nodes) and not any("pooja" in rt for _, rt in parasites):
+        if indian_options.get("pooja_room") and not any(
+            token in n.type for n in nodes for token in ("pooja", "prayer")
+        ) and not any(
+            token in rt for _, rt in parasites for token in ("pooja", "prayer")
+        ):
             parasites.append(("pooja-1", "pooja_room"))
         if indian_options.get("powder_room") and not any("powder" in n.type for n in nodes) and not any("powder" in rt for _, rt in parasites):
             parasites.append(("powder-1", "powder_room"))
@@ -1215,6 +1668,8 @@ class LayoutEngine:
             parasites.append(("utility-1", "utility"))
             
         for rid, rt in parasites:
+            if rid in relationship_owned_spaces:
+                continue
             anchor_candidates = []
             if "bath" in rt: anchor_candidates = ["bedroom", "master_bedroom", "living"]
             elif "utility" in rt: anchor_candidates = ["kitchen"]
@@ -1247,8 +1702,9 @@ class LayoutEngine:
                 anchor_node = max(nodes, key=lambda n: n.rect.area)
                 
             if anchor_node:
-                p_area = ROOM_MINIMUMS.get(rt, {}).get("area", 30.0)
-                min_dim = ROOM_MINIMUMS.get(rt, {}).get("min_dim", 4.0)
+                room_minimum = ROOM_MINIMUMS.get(rt, _DEFAULT_MIN)
+                p_area = float(room_minimum.get("area", _DEFAULT_MIN["area"]))
+                min_dim = float(room_minimum.get("min_dim", _DEFAULT_MIN["min_dim"]))
                 
                 carve_w = max(min_dim, p_area / max(1.0, anchor_node.rect.length * 0.5))
                 carve_l = max(min_dim, p_area / carve_w)
@@ -1307,8 +1763,11 @@ class LayoutEngine:
 
                 # --- ZERO HARDCODING: AI-DRIVEN MAX DIMENSIONS ---
                 ai_spec = next((r for r in rooms_spec if r.get("type", "") == rt), {})
-                cmax_w = float(ai_spec.get("width", min_dim * 1.5))
-                cmax_l = float(ai_spec.get("length", min_dim * 1.5))
+                # A maximum exists only when the semantic program explicitly
+                # supplied one. The former synthetic 1.5× cap could shrink a
+                # valid 40-ft² bathroom to 37.5 ft² after carving.
+                cmax_w = float(ai_spec["width"]) if ai_spec.get("width") else math.inf
+                cmax_l = float(ai_spec["length"]) if ai_spec.get("length") else math.inf
 
                 if side in ("left", "right"):
                     if p_rect.length > cmax_l:
@@ -1336,12 +1795,24 @@ class LayoutEngine:
                     rect=p_rect, 
                     wallThicknessIn=8.0 if is_wet else 6.0, 
                     is_wet=is_wet,
+                    connections=copy.deepcopy(ai_spec.get("connections", []) or []),
                     floorColor=p_floor, 
                     wallColor=p_wall, 
                     furnitureColor=p_furn,
-                    roof_type=roof_val
+                    roof_type=roof_val,
+                    is_outdoor=is_open_sky,
                 ))
                 # ------------------------------------------------------
+
+        # A failed parasite carve must never silently delete a requested
+        # custom room or repeated bathroom from the floor program.
+        self._recover_missing_requested_rooms(
+            nodes,
+            ai_requested_rooms,
+            rooms_spec,
+            allowed_bounds=tuple((plot_info or {}).get("allowed_bounds")) if (plot_info or {}).get("allowed_bounds") else None,
+            blocked_zones=blocked_zones,
+        )
 
         # 3. Post-Processing & Special Vastu Rules
         living = next((n for n in nodes if n.type == "living_room"), None)
@@ -1368,6 +1839,20 @@ class LayoutEngine:
         if indian_options.get("double_height") and living:
             living.is_double_height = True
 
+        interior_nodes = [
+            node for node in nodes
+            if not getattr(node, "is_outdoor", False)
+            and node.roof_type != "open"
+            and node.type not in {"parking", "garden", "courtyard", "terrace", "balcony"}
+        ]
+        if not has_fixed_anchor:
+            self._expand_to_target_coverage(
+                interior_nodes,
+                additional_nodes=[node for node in nodes if node not in interior_nodes],
+            )
+        self._repair_disconnected_components(nodes)
+        self._close_nearby_wall_seams(nodes)
+
         inject_main_entrance(nodes, self.buildable_width, self.buildable_length,
                              self.setback_x, self.setback_z)
                              
@@ -1386,7 +1871,8 @@ class LayoutEngine:
                 for n in nodes if getattr(n, "main_entrance", False)
             ],
         )
-        place_furniture(nodes, indian_options, getattr(self, "furniture_prompt", ""))
+        if not getattr(self, "skip_furniture_generation", False):
+            place_furniture(nodes, indian_options, getattr(self, "furniture_prompt", ""))
 
         # Validation fix: the Master Bedroom must be the largest bedroom.
         masters = [n for n in nodes if n.type == "master_bedroom"]
@@ -1483,10 +1969,14 @@ class AdjacencyResolver:
                 is_r1_private = "bed" in r1.type or "bath" in r1.type or "toilet" in r1.type or "closet" in r1.type
                 is_r2_private = "bed" in r2.type or "bath" in r2.type or "toilet" in r2.type or "closet" in r2.type
                 
-                # If the AI topology forbids this connection, strictly skip it
-                if is_r1_private or is_r2_private:
-                    if not (has_connection(r1, r2) or has_connection(r2, r1)):
-                        continue
+                # Shared geometry is not permission to punch a door through a
+                # wall. Every interior opening must be authorized by the room
+                # graph, for public rooms as well as private ones. The former
+                # public-room exception produced accidental foyer→gym and
+                # lounge→office shortcuts whenever those rooms happened to
+                # touch.
+                if not (has_connection(r1, r2) or has_connection(r2, r1)):
+                    continue
                 
                 # Ensure bathrooms only get one primary door
                 is_r1_bath = "bath" in r1.type or "toilet" in r1.type
@@ -1555,8 +2045,10 @@ class AdjacencyResolver:
                     other = room_by_id.get(other_id)
                     if other and (has_connection(r, other) or has_connection(other, r)):
                         connected_walls.append(wall)
-                if connected_walls:
-                    available_walls = connected_walls
+                if not connected_walls:
+                    logger.warning("[DOOR PLANNER] No topology-authorized shared wall for %s", r.name)
+                    continue
+                available_walls = connected_walls
                 
                 def wall_len(w):
                     return abs(w["z2"]-w["z1"]) if w["orientation"]=="vertical" else abs(w["x2"]-w["x1"])
@@ -1627,7 +2119,14 @@ class AdjacencyResolver:
             if not disconnected:
                 break
             target = disconnected[0]
-            candidate_walls = [w for w in walls if w.get("is_shared") and target.id in w.get("room_ids", []) and any(rid in visited for rid in w.get("room_ids", []))]
+            candidate_walls = []
+            for wall in walls:
+                if not wall.get("is_shared") or target.id not in wall.get("room_ids", []):
+                    continue
+                other_id = next((rid for rid in wall.get("room_ids", []) if rid != target.id), None)
+                other = room_by_id.get(other_id)
+                if other_id in visited and other and (has_connection(target, other) or has_connection(other, target)):
+                    candidate_walls.append(wall)
             if not candidate_walls:
                 break
             best_wall = max(candidate_walls, key=lambda w: abs(w["z2"] - w["z1"]) if w["orientation"] == "vertical" else abs(w["x2"] - w["x1"]))
@@ -1649,22 +2148,21 @@ class AdjacencyResolver:
         # reachable only through a bedroom or behind a blocked doorway.
         public_types = ("corridor", "hallway", "foyer", "living_room")
         for stair in (r for r in self.rooms if r.type in ("staircase", "stairwell")):
-            public = next((r for r in self.rooms if r.type in public_types), None)
-            if public is None:
-                continue
+            public_ids = {r.id for r in self.rooms if r.type in public_types}
             common = [
                 w for w in walls
                 if w.get("is_shared")
                 and stair.id in w.get("room_ids", [])
-                and public.id in w.get("room_ids", [])
+                and any(room_id in public_ids for room_id in w.get("room_ids", []))
             ]
+            # If topology labels were degraded by an AI alias, still make the
+            # staircase usable through its actual adjacent room.
             if not common:
-                continue
-            if any(
-                abs((stair.rect.x + sd.x) - (public.rect.x + pd.x)) <= 0.35
-                and abs((stair.rect.z + sd.z) - (public.rect.z + pd.z)) <= 0.35
-                for sd in stair.doors for pd in public.doors
-            ):
+                common = [
+                    w for w in walls
+                    if w.get("is_shared") and stair.id in w.get("room_ids", [])
+                ]
+            if not common:
                 continue
             wall = max(
                 common,
@@ -1672,6 +2170,16 @@ class AdjacencyResolver:
                 if w["orientation"] == "vertical"
                 else abs(w["x2"] - w["x1"]),
             )
+            public_id = next((room_id for room_id in wall.get("room_ids", []) if room_id != stair.id), None)
+            public = room_by_id.get(public_id)
+            if public is None:
+                continue
+            if any(
+                abs((stair.rect.x + sd.x) - (public.rect.x + pd.x)) <= 0.35
+                and abs((stair.rect.z + sd.z) - (public.rect.z + pd.z)) <= 0.35
+                for sd in stair.doors for pd in public.doors
+            ):
+                continue
             cx = (wall["x1"] + wall["x2"]) / 2.0
             cz = (wall["z1"] + wall["z2"]) / 2.0
             is_vertical = wall["orientation"] == "vertical"

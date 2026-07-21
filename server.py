@@ -31,10 +31,11 @@ import threading as _threading
 import traceback
 import random
 import uuid
+from difflib import SequenceMatcher
 from datetime import datetime
 import time
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple, Sequence
 from blueprint_renderer import BlueprintRenderer
 
 import numpy as np
@@ -48,7 +49,7 @@ from cost_engine import CostEngine
 
 from layout_engine import (
     LayoutEngine, AdjacencyResolver, WindowPlacer, ArchitecturalRules,
-    Rect, RoomNode, compute_minimum_plot_area, ROOM_MINIMUMS, resolve_theme,
+    Door, Window, Rect, RoomNode, compute_minimum_plot_area, ROOM_MINIMUMS, resolve_theme,
     align_duplex_floors, compute_shared_walls, validate_layout
 )
 from room_planner import (
@@ -73,6 +74,7 @@ from geometry_engine import LayoutGeometryEngine
 from asset_library import (
     build_outdoor_areas,
     canonical_type,
+    furniture_for_room,
     is_basement_type,
     requested_custom_specs,
     requested_outdoor_specs,
@@ -217,6 +219,7 @@ def generate_additional_floors(
         WindowPlacer(nodes, engine.plot_width, engine.plot_length,
                      setback_x=engine.setback_x, setback_z=engine.setback_z).place_windows()
         for node in nodes:
+            node.doors = [door for door in node.doors if not getattr(door, "is_main", False)]
             node.floorIndex = level
         result[level] = nodes
     return result
@@ -227,14 +230,170 @@ def apply_requested_room_names(nodes: Iterable[RoomNode], specs: Iterable[Dict[s
     available = list(specs or [])
     used: set[int] = set()
     for node in nodes or []:
+        node_type = canonical_type(node.type)
+        if node_type in {"staircase", "stairwell"}:
+            node.name = "Staircase"
+            continue
+        if node_type in {"corridor", "circulation", "hallway", "passage", "lobby"}:
+            node.name = "Corridor"
+            continue
         for index, spec in enumerate(available):
             if index in used or canonical_type(spec.get("type")) != canonical_type(node.type):
                 continue
             requested_name = str(spec.get("name") or spec.get("label") or "").strip()
             if requested_name:
                 node.name = requested_name
+            if canonical_type(node.type) in {"courtyard", "angan", "open_to_sky"} or str(spec.get("roof_type", "")).lower() == "open":
+                node.roof_type = "open"
+                node.is_outdoor = True
             used.add(index)
             break
+
+
+_GENERIC_AI_ROOM_TYPES = {"room", "space", "area", "other", "custom_room", "custom_space"}
+_INTERNAL_OPEN_TYPES = {"courtyard", "angan", "aangan", "open_courtyard", "open_to_sky"}
+
+
+def is_instruction_like_room_label(value: Any) -> bool:
+    """Reject action clauses accidentally emitted as open-ended room names."""
+    label = re.sub(r"[_-]+", " ", str(value or "").lower()).strip()
+    has_floor_clause = bool(re.search(
+        r"\b(?:ground|first|second|third|fourth|fifth|\d+(?:st|nd|rd|th)?)\s+floor\b", label,
+    ))
+    has_action = bool(re.search(r"\b(?:add\d*|add|generate|create|build|make|put|floor)\b", label))
+    return has_floor_clause and has_action
+
+
+def normalize_ai_room_spec(raw_spec: Any) -> Optional[Dict[str, Any]]:
+    """Preserve a model-supplied room name when its coarse type is generic.
+
+    Gemini occasionally emits ``{"type": "room", "name": "dining_room"}``.
+    Treating that as a literal ``room`` loses furniture, minimum dimensions,
+    adjacency rules, labels, and edit targeting.  The name is the more precise
+    semantic signal in that case.
+    """
+    if isinstance(raw_spec, str):
+        item: Dict[str, Any] = {"type": raw_spec, "name": raw_spec.replace("_", " ")}
+    elif isinstance(raw_spec, dict):
+        item = dict(raw_spec)
+    else:
+        return None
+
+    raw_type_hint = canonical_type(item.get("type"))
+    if is_instruction_like_room_label(item.get("type")) or (
+        raw_type_hint in _GENERIC_AI_ROOM_TYPES and is_instruction_like_room_label(item.get("name"))
+    ):
+        logger.warning("[SEMANTIC GUARD] Rejected instruction-shaped room label: %s", item.get("name") or item.get("type"))
+        return None
+
+    raw_type = canonical_type(item.get("type"))
+    raw_name = canonical_type(item.get("name") or item.get("label"))
+    if raw_type in _GENERIC_AI_ROOM_TYPES and raw_name and raw_name not in _GENERIC_AI_ROOM_TYPES:
+        raw_type = raw_name
+    if not raw_type:
+        raw_type = raw_name
+    if not raw_type:
+        return None
+    if raw_type in {"angan", "aangan", "open_courtyard"}:
+        raw_type = "courtyard"
+    if raw_type in {"staircase_landing", "stair_landing", "stairwell_landing"}:
+        raw_type = "staircase"
+
+    bath_signal = f"{raw_type} {raw_name}".lower()
+    if any(token in bath_signal for token in ("bath", "toilet", "washroom", "ensuite")):
+        # Bathroom modifiers describe access/ownership; they are not distinct
+        # geometric room types. Canonicalise even unknown or misspelled labels
+        # such as ``genral_bathroom`` so edit identities remain stable.
+        bath_words = re.findall(r"[a-z]+", bath_signal.replace("_", " "))
+        is_common = any(
+            word in {"common", "shared", "guest", "general"}
+            or SequenceMatcher(None, word, "general").ratio() >= 0.82
+            for word in bath_words
+        )
+        raw_type = "bathroom"
+        if any(token in bath_signal for token in ("attached", "ensuite", "en_suite")):
+            item["bathroom_role"] = "attached"
+            if not item.get("name") or canonical_type(item.get("name")) in {"bathroom", "attached_bathroom"}:
+                item["name"] = "Attached Bathroom"
+        elif is_common:
+            item["bathroom_role"] = "common"
+            item["name"] = "Common Bathroom"
+
+    item["type"] = raw_type
+    item["name"] = str(item.get("name") or raw_type.replace("_", " ")).strip()
+    item["confidence"] = 100
+    if raw_type in _INTERNAL_OPEN_TYPES or raw_type == "courtyard":
+        item["placement"] = "internal"
+        item["roof_type"] = "open"
+        item["is_outdoor"] = True
+    return item
+
+
+def ensure_internal_open_spaces(
+    program: Dict[int, List[Dict[str, Any]]], extraction: Optional[Dict[str, Any]],
+) -> Dict[int, List[Dict[str, Any]]]:
+    """Materialize courtyards/angans that the extractor classified separately.
+
+    ``outdoor_rooms`` is classification metadata, not permission to omit the
+    space from the geometric program. Internal courtyards remain solver rooms
+    so surrounding rooms can be constrained against their real boundary.
+    """
+    extraction = extraction or {}
+    requested = [canonical_type(value) for value in extraction.get("outdoor_rooms", []) or []]
+    if extraction.get("angan"):
+        requested.append("courtyard")
+    internal = ["courtyard" if value in _INTERNAL_OPEN_TYPES else value for value in requested if value in _INTERNAL_OPEN_TYPES]
+    if not internal:
+        return program
+    ground = program.setdefault(0, [])
+    existing = {canonical_type(spec.get("type")) for specs in program.values() for spec in specs}
+    for room_type in dict.fromkeys(internal):
+        if room_type not in existing:
+            ground.append(normalize_ai_room_spec({"type": room_type, "name": room_type}) or {"type": room_type})
+            existing.add(room_type)
+    return program
+
+
+def apply_spatial_analysis_defaults(extraction: Dict[str, Any]) -> Dict[str, Any]:
+    """Promote the AI's explicit relationship plan into legacy edit fields."""
+    if not isinstance(extraction, dict):
+        return extraction
+    relationships = [
+        item for item in extraction.get("requested_relationships", []) or []
+        if isinstance(item, dict) and item.get("subject_room") and item.get("target_room")
+    ]
+    if not relationships:
+        return extraction
+    primary = next((item for item in relationships if item.get("required", True)), relationships[0])
+    subject = str(primary.get("subject_room", "")).strip()
+    target = str(primary.get("target_room", "")).strip()
+    intent = str(extraction.get("intent", "")).upper()
+    if intent == "MOVE":
+        extraction["move_target_room"] = extraction.get("move_target_room") or subject
+        extraction["move_destination"] = extraction.get("move_destination") or target
+    elif intent == "ADD" and subject:
+        clean_subject = re.sub(r"[-_]\d+$", "", canonical_type(subject))
+        if clean_subject and clean_subject not in [canonical_type(value) for value in extraction.get("target_rooms", []) or []]:
+            extraction.setdefault("target_rooms", []).insert(0, clean_subject)
+        extraction["move_destination"] = extraction.get("move_destination") or target
+    return extraction
+
+
+def spatial_analysis_messages(extraction: Optional[Dict[str, Any]]) -> Tuple[List[str], List[str]]:
+    extraction = extraction or {}
+    understood: List[str] = []
+    warnings: List[str] = []
+    summary = str(extraction.get("analysis_summary") or "").strip()
+    strategy = str(extraction.get("spatial_strategy") or "").strip()
+    feasibility = str(extraction.get("feasibility") or "").strip()
+    if summary:
+        understood.append(f"Spatial analysis: {summary}")
+    if strategy and strategy != "preserve":
+        understood.append(f"Placement strategy: {strategy.replace('_', ' ')}")
+    blockers = [str(item).strip() for item in extraction.get("blocking_constraints", []) or [] if str(item).strip()]
+    if feasibility == "impossible_without_scope_change" and blockers:
+        warnings.append("AI feasibility concern: " + "; ".join(blockers[:3]))
+    return understood, warnings
 
 
 def extract_explicit_floor_program(prompt: str, candidates: Iterable[Dict[str, Any]]) -> Dict[int, List[Dict[str, Any]]]:
@@ -244,36 +403,240 @@ def extract_explicit_floor_program(prompt: str, candidates: Iterable[Dict[str, A
     they occur in the text, while unfamiliar user terms remain valid canonical
     labels instead of being discarded or substituted.
     """
-    marker = re.compile(r"(?im)^\s*(ground|first|second|third|fourth|fifth)\s+floor\s*:\s*")
+    # Accept ordinary prose headings as well as Markdown (``**Ground Floor**``
+    # and ``### First Floor``).  Requiring a trailing colon caused detailed
+    # prompts to disappear whenever the semantic model timed out.
+    marker = re.compile(
+        r"(?im)^\s*(?:#{1,6}\s*)?(?:\*\*|__)?\s*"
+        r"(ground|first|second|third|fourth|fifth)\s+floor"
+        r"\s*(?:\*\*|__)?\s*:?\s*$"
+    )
     levels = {"ground": 0, "first": 1, "second": 2, "third": 3, "fourth": 4, "fifth": 5}
     matches = list(marker.finditer(prompt or ""))
     if not matches:
         return {}
-    known_types = [canonical_type(item.get("type")) for item in candidates or []]
     program: Dict[int, List[Dict[str, Any]]] = {}
-    count_words = {"one": 1, "two": 2, "three": 3, "four": 4, "five": 5}
+    count_words = {
+        "a": 1, "an": 1, "one": 1, "two": 2, "three": 3, "four": 4,
+        "five": 5, "six": 6, "seven": 7, "eight": 8, "nine": 9, "ten": 10,
+    }
+
+    # This is a grammar vocabulary, not a layout template: it identifies room
+    # nouns while all sizing, placement and adjacency remain solver/model work.
+    # Longer phrases must be checked first (``family lounge`` before ``lounge``).
+    room_phrases = {
+        "master bedrooms": "master_bedroom", "master bedroom": "master_bedroom",
+        "primary bedrooms": "bedroom", "primary bedroom": "bedroom",
+        "attached bathrooms": "bathroom", "attached bathroom": "bathroom",
+        "common bathrooms": "bathroom", "common bathroom": "bathroom",
+        "guest bathrooms": "bathroom", "guest bathroom": "bathroom",
+        "general bathrooms": "bathroom", "general bathroom": "bathroom",
+        "powder rooms": "powder_room", "powder room": "powder_room",
+        "family lounges": "family_lounge", "family lounge": "family_lounge",
+        "sitting areas": "family_lounge", "sitting area": "family_lounge",
+        "living rooms": "living_room", "living room": "living_room",
+        "dining rooms": "dining_room", "dining room": "dining_room",
+        "dining areas": "dining_room", "dining area": "dining_room",
+        "study rooms": "study_room", "study room": "study_room",
+        "study areas": "study_room", "study area": "study_room",
+        "bedrooms": "bedroom", "bedroom": "bedroom",
+        "bathrooms": "bathroom", "bathroom": "bathroom",
+        "washrooms": "bathroom", "washroom": "bathroom",
+        "balconies": "balcony", "balcony": "balcony",
+        "kitchens": "kitchen", "kitchen": "kitchen",
+        "corridors": "corridor", "corridor": "corridor",
+        "hallways": "corridor", "hallway": "corridor",
+        "staircases": "staircase", "staircase": "staircase",
+        "stairs": "staircase", "foyers": "foyer", "foyer": "foyer",
+    }
+
+    def add_specs(specs: List[Dict[str, Any]], room_type: str, count: int = 1,
+                  role: str = "", name: str = "") -> None:
+        existing = sum(1 for item in specs if canonical_type(item.get("type")) == room_type)
+        if room_type in {"corridor", "staircase"} and existing:
+            return
+        for offset in range(max(0, count)):
+            display = name or room_type.replace("_", " ").title()
+            if count > 1:
+                display = f"{display} {existing + offset + 1}"
+            item: Dict[str, Any] = {"type": room_type, "name": display, "confidence": 100}
+            if role:
+                item["bathroom_role"] = role
+            if room_type == "balcony":
+                item.update({"is_outdoor": True, "roof_type": "open"})
+            specs.append(item)
+
     for index, match in enumerate(matches):
         level = levels[match.group(1).lower()]
         section = (prompt or "")[match.end(): matches[index + 1].start() if index + 1 < len(matches) else None]
-        labels = [part.strip(" -•\t\r") for part in re.split(r"[\r\n]+", section) if part.strip(" -•\t\r")]
+        labels = [
+            re.sub(r"^\s*(?:[-*•]+|\d+[.)])\s*", "", part).strip()
+            for part in re.split(r"[\r\n]+", section)
+            if re.sub(r"^\s*(?:[-*•]+|\d+[.)])\s*", "", part).strip()
+        ]
         specs: List[Dict[str, Any]] = []
         for label in labels:
-            for phrase in re.split(r"\s+(?:with|and)\s+", label, flags=re.I):
-                clean = re.sub(r"^(?:attached|common|one-car|one car)\s+", "", phrase.strip(), flags=re.I)
-                normalized = canonical_type(clean)
-                matching = [room_type for room_type in known_types if room_type and room_type.replace("_", " ") in clean.lower()]
-                room_type = max(matching, key=len) if matching else normalized
-                multiplier_match = re.match(r"^(one|two|three|four|five|\d+)\s+", clean, flags=re.I)
-                multiplier = 1
-                if multiplier_match:
-                    token = multiplier_match.group(1).lower()
-                    multiplier = count_words.get(token, int(token) if token.isdigit() else 1)
-                for ordinal in range(multiplier):
-                    display_name = clean if multiplier == 1 else f"{clean} {ordinal + 1}"
-                    specs.append({"type": room_type, "name": display_name, "confidence": 100})
+            lower = re.sub(r"[*_]", "", label.lower()).strip(" .")
+            # Quality/relationship statements constrain existing rooms; they
+            # are not additional rooms.  Balcony access is the one relationship
+            # that also materializes one outdoor space per bedroom.
+            if re.match(r"^(?:each|every)\s+bedroom\b", lower):
+                if "balcon" in lower:
+                    bedroom_count = sum(1 for item in specs if "bedroom" in canonical_type(item.get("type")))
+                    current = sum(1 for item in specs if canonical_type(item.get("type")) == "balcony")
+                    # “Each bedroom has access to a private balcony” uses one
+                    # singular balcony shared by both rooms unless the user
+                    # explicitly asks for separate/individual balconies or
+                    # plural balconies.
+                    separate = bool(re.search(
+                        r"\b(?:separate|individual|one\s+for\s+each|balconies)\b", lower,
+                    ))
+                    wanted = bedroom_count if separate else 1
+                    add_specs(specs, "balcony", max(0, wanted - current), name="Private Balcony")
+                continue
+            if lower.startswith(("adequate ", "proper ")):
+                if "corridor" in lower or "circulation" in lower:
+                    if not any(canonical_type(item.get("type")) == "corridor" for item in specs):
+                        add_specs(specs, "corridor")
+                continue
+            # Everything after these clauses describes adjacency/access for
+            # the room already named at the start of the bullet.  Without this
+            # cut, “2 attached bathrooms ... two primary bedrooms” incorrectly
+            # created two additional bedrooms.
+            lower = re.split(
+                r",\s*(?:each|which|with\s+each)\b|\s+(?:connected|connecting|allowing)\s+to\b",
+                lower,
+                maxsplit=1,
+            )[0]
+            if re.search(r"\bshould\s+connect\b", lower):
+                lower = re.split(r"\bshould\s+connect\b", lower, maxsplit=1)[0]
+            # Optional alternatives use the first stated room unless capacity
+            # later allows an upgrade; they must not be counted twice.
+            lower = re.split(r"\s*(?:\(\s*)?\bor\b\s+", lower, maxsplit=1)[0]
+            occupied: List[Tuple[int, int]] = []
+            for phrase, room_type in sorted(room_phrases.items(), key=lambda item: len(item[0]), reverse=True):
+                for found in re.finditer(rf"\b{re.escape(phrase)}\b", lower):
+                    if any(found.start() < end and found.end() > start for start, end in occupied):
+                        continue
+                    prefix = lower[max(0, found.start() - 28):found.start()]
+                    count_match = re.search(
+                        r"\b(a|an|one|two|three|four|five|six|seven|eight|nine|ten|\d+)"
+                        r"(?:\s+(?:spacious|private|primary|attached|common|general|guest|open|well[- ]planned)){0,3}\s*$",
+                        prefix,
+                    )
+                    token = count_match.group(1) if count_match else "one"
+                    count = int(token) if token.isdigit() else count_words.get(token, 1)
+                    role = ""
+                    context = lower[max(0, found.start() - 18):found.end()]
+                    if room_type == "bathroom":
+                        if "attached" in context or "ensuite" in context:
+                            role = "attached"
+                        elif any(word in context for word in ("common", "general", "guest", "shared")):
+                            role = "common"
+                    add_specs(specs, room_type, count, role=role)
+                    occupied.append((found.start(), found.end()))
         if specs:
             program[level] = specs
     return program
+
+
+def _program_room_class(value: Any) -> str:
+    """Normalize only equivalences that do not change a room's meaning."""
+    room_type = canonical_type(value)
+    if "bedroom" in room_type:
+        return "bedroom"
+    if room_type in {"bathroom", "toilet", "washroom", "ensuite", "attached_bathroom", "common_bathroom"}:
+        return "bathroom"
+    if room_type in {"hallway", "circulation", "passage", "lobby"}:
+        return "corridor"
+    if room_type in {"stairwell", "stairs"}:
+        return "staircase"
+    return room_type
+
+
+def floor_program_fidelity_errors(nodes: Iterable[RoomNode], specs: Iterable[Dict[str, Any]], level: int) -> List[str]:
+    """Require the realized floor to match the accepted semantic contract."""
+    from collections import Counter
+    requested = Counter(
+        _program_room_class(spec.get("type")) for spec in specs or []
+        if isinstance(spec, dict) and _program_room_class(spec.get("type"))
+    )
+    generated = Counter(_program_room_class(node.type) for node in nodes or [] if _program_room_class(node.type))
+    errors: List[str] = []
+    for room_type in sorted(set(requested) | set(generated)):
+        if requested[room_type] != generated[room_type]:
+            errors.append(
+                f"FLOOR PROGRAM ERROR: floor {level} requested {requested[room_type]} "
+                f"{room_type.replace('_', ' ')} room(s), but generated {generated[room_type]}."
+            )
+    return errors
+
+
+def upper_floor_containment_errors(ground: Iterable[RoomNode], upper: Iterable[RoomNode], level: int = 1) -> List[str]:
+    """Ensure upper indoor rooms sit on the ground-floor structural footprint."""
+    base = [node for node in ground or [] if not getattr(node, "is_outdoor", False) and node.roof_type != "open"]
+    if not base:
+        return [f"SLAB ERROR: floor {level} has no ground-floor support footprint."]
+    min_x = min(node.rect.x for node in base)
+    max_x = max(node.rect.x + node.rect.width for node in base)
+    min_z = min(node.rect.z for node in base)
+    max_z = max(node.rect.z + node.rect.length for node in base)
+    errors = []
+    for node in upper or []:
+        if getattr(node, "is_outdoor", False) or node.roof_type == "open" or _program_room_class(node.type) == "balcony":
+            continue
+        if (node.rect.x < min_x - 0.1 or node.rect.z < min_z - 0.1 or
+                node.rect.x + node.rect.width > max_x + 0.1 or
+                node.rect.z + node.rect.length > max_z + 0.1):
+            errors.append(
+                f"SLAB ERROR: {node.id} on floor {level} extends outside the ground-floor footprint."
+            )
+    return errors
+
+
+def bridge_staircase_grid_seam(nodes: Iterable[RoomNode]) -> bool:
+    """Place a paired landing door across a sub-wall-thickness CP grid seam.
+
+    The upstairs solver reserves a half-foot enclosing cell around the exact
+    lower stair. Restoring the true stair can leave <= 0.5 ft between it and
+    its corridor. Mutating either rectangle creates overlaps, so bridge only
+    this numerical seam with one shared doorway at the common wall centre.
+    """
+    rooms = list(nodes or [])
+    stair = next((node for node in rooms if _program_room_class(node.type) == "staircase"), None)
+    if not stair or stair.doors:
+        return False
+    hubs = [node for node in rooms if _program_room_class(node.type) == "corridor" or node.type in {"foyer", "family_lounge"}]
+    candidates = []
+    s = stair.rect
+    for hub in hubs:
+        h = hub.rect
+        overlap_z = min(s.z + s.length, h.z + h.length) - max(s.z, h.z)
+        overlap_x = min(s.x + s.width, h.x + h.width) - max(s.x, h.x)
+        if overlap_z >= 2.5:
+            if s.x + s.width <= h.x:
+                candidates.append((h.x - (s.x + s.width), "vertical", "east", "west", hub, (max(s.z, h.z) + min(s.z + s.length, h.z + h.length)) / 2))
+            elif h.x + h.width <= s.x:
+                candidates.append((s.x - (h.x + h.width), "vertical", "west", "east", hub, (max(s.z, h.z) + min(s.z + s.length, h.z + h.length)) / 2))
+        if overlap_x >= 2.5:
+            if s.z + s.length <= h.z:
+                candidates.append((h.z - (s.z + s.length), "horizontal", "south", "north", hub, (max(s.x, h.x) + min(s.x + s.width, h.x + h.width)) / 2))
+            elif h.z + h.length <= s.z:
+                candidates.append((s.z - (h.z + h.length), "horizontal", "north", "south", hub, (max(s.x, h.x) + min(s.x + s.width, h.x + h.width)) / 2))
+    candidates = [candidate for candidate in candidates if -0.01 <= candidate[0] <= 0.55]
+    if not candidates:
+        return False
+    _, orientation, stair_face, hub_face, hub, axis_mid = min(candidates, key=lambda item: item[0])
+    if orientation == "vertical":
+        global_x = ((s.x + s.width) + hub.rect.x) / 2 if stair_face == "east" else ((hub.rect.x + hub.rect.width) + s.x) / 2
+        global_z = axis_mid
+    else:
+        global_x = axis_mid
+        global_z = ((s.z + s.length) + hub.rect.z) / 2 if stair_face == "south" else ((hub.rect.z + hub.rect.length) + s.z) / 2
+    stair.doors.append(Door(global_x - s.x, global_z - s.z, stair_face, width=3.0))
+    hub.doors.append(Door(global_x - hub.rect.x, global_z - hub.rect.z, hub_face, width=3.0))
+    logger.info("[DUPLEX] Bridged %.2fft staircase grid seam to %s", min(candidates)[0], hub.id)
+    return True
 
 USE_SLM_ENGINE = True
 # Frontend palette IDs are normalized here so template and AI generation use
@@ -282,7 +645,7 @@ PALETTE_HEX = {
     "off_white": "#F8F8FF", "warm_beige": "#F5F5DC", "light_grey": "#D3D3D3",
     "red": "#E2725B", "sage": "#9CA986", "charcoal": "#36454F", "beige": "#F5F5DC",
     "mustard": "#E4A010", "yellow": "#E4A010", "terracotta": "#E2725B",
-    "cream": "#FDF5E6", "peach": "#FFDAB9", "sea_green": "#2E8B57",
+    "cream": "#FDF5E6", "ivory": "#FDF5E6", "peach": "#FFDAB9", "sea_green": "#2E8B57",
     "indigo": "#4B0082", "white": "#FFFFFF", "concrete": "#808080",
     "brick": "#B22222", "wood": "#DEB887",
     "light_wood": "#C8A878", "dark_wood": "#5A3A22", "walnut": "#4B3621",
@@ -382,17 +745,86 @@ def smart_layout_validation(
     if buildable_area >= min_needed:
         return rooms_spec, warnings, float(plot_width), float(plot_length)
 
-    # Plot scale fallback loop if boundaries are too compact
+    # Never enlarge the user's legal plot silently.  That made upper floors
+    # appear outside the boundary drawn by the frontend.  Keep the requested
+    # boundary and let the hard solver either find a compliant plan or return a
+    # concise size recommendation.
     multiplier = (min_needed / buildable_area) ** 0.5
-    new_plot_width = round(plot_width * multiplier + 1)
-    new_plot_length = round(plot_length * multiplier + 1)
-    
+    recommended_width = round(plot_width * multiplier + 1)
+    recommended_length = round(plot_length * multiplier + 1)
     warnings.append(
         f"The provided plot size ({plot_width}'x{plot_length}') was too small for the requested layout. "
-        f"Automatically expanded the plot to {new_plot_width}'x{new_plot_length}' to keep all rooms spacious."
+        f"A plot near {recommended_width}'x{recommended_length}' is recommended; the plot boundary was not changed."
     )
-    
-    return rooms_spec, warnings, float(new_plot_width), float(new_plot_length)
+    return rooms_spec, warnings, float(plot_width), float(plot_length)
+
+
+def space_recommendations(room_specs: Sequence[Dict[str, Any]], plot_width: float, plot_length: float) -> List[str]:
+    """Return short, user-facing guidance without blocking feasible layouts."""
+    specs = [item for item in (room_specs or []) if isinstance(item, dict)]
+    types = [canonical_type(item.get("type")) for item in specs]
+    plot_area = max(0.0, float(plot_width or 0)) * max(0.0, float(plot_length or 0))
+    buildable_area = plot_area * 0.85
+    required_area = sum(float(ROOM_MINIMUMS.get(room_type, {"area": 40.0}).get("area", 40.0)) for room_type in types) * 1.2
+    bedrooms = sum(1 for room_type in types if "bedroom" in room_type)
+    recommendations: List[str] = []
+    if required_area > buildable_area:
+        recommended_area = math.ceil(required_area / 0.85)
+        recommendations.append(
+            f"Space recommendation: this program needs about {math.ceil(required_area):,} sq ft including circulation; "
+            f"a plot near {recommended_area:,} sq ft is more comfortable than {math.ceil(plot_area):,} sq ft. "
+            "Reduce room count, reduce sizes, or allow a broader re-layout if the current plot must remain fixed."
+        )
+    elif bedrooms >= 4:
+        recommendations.append(
+            "Space recommendation: keep each bedroom at least 10×14 ft, with a 3–4 ft clear circulation path. "
+            "Adding more bedrooms may require reducing living/dining space."
+        )
+    else:
+        recommendations.append(
+            "Planning note: rooms are kept above their minimum usable dimensions; the main door needs an exterior wall "
+            "opening of roughly 4 ft with a clear approach."
+        )
+    return recommendations
+
+
+def calculate_area_budget(
+    room_specs: Sequence[Dict[str, Any]], plot_width: float, plot_length: float, floors: int = 1,
+) -> Dict[str, Any]:
+    """Fast pre-solver capacity signal for UI feedback and recovery choices."""
+    specs = [item for item in (room_specs or []) if isinstance(item, dict)]
+    indoor = [
+        item for item in specs
+        if not item.get("is_outdoor") and canonical_type(item.get("type")) not in {
+            "balcony", "courtyard", "garden", "parking", "terrace", "veranda", "void"
+        }
+    ]
+    minimum_room_area = sum(
+        float(ROOM_MINIMUMS.get(canonical_type(item.get("type")), {"area": 40.0}).get("area", 40.0))
+        for item in indoor
+    )
+    required = int(math.ceil(minimum_room_area * 1.20))  # walls + circulation allowance
+    levels = max(1, int(floors or 1))
+    available = int(math.floor(max(0.0, float(plot_width)) * max(0.0, float(plot_length)) * 0.85 * levels))
+    ratio = required / max(1, available)
+    one_floor_needed = required / levels
+    aspect = max(0.25, float(plot_width) / max(float(plot_length), 1.0))
+    recommended_width = int(math.ceil(math.sqrt(one_floor_needed / 0.85 * aspect) / 5.0) * 5)
+    recommended_length = int(math.ceil((recommended_width / aspect) / 5.0) * 5)
+    return {
+        "required_sqft": required,
+        "available_sqft": available,
+        "usage_percent": round(ratio * 100.0, 1),
+        "fits": ratio <= 1.0,
+        "plot_sqft": int(float(plot_width) * float(plot_length)),
+        "floors": levels,
+        "recommended_plot": {"width": recommended_width, "length": recommended_length},
+        "actions": [
+            {"id": "add_floor", "label": "Add a Second Floor"},
+            {"id": "increase_plot", "label": "Increase Plot Size"},
+            {"id": "optimize", "label": "Optimize Layout"},
+        ],
+    }
 def get_base_rooms_for_bhk(bhk: int) -> list:
     """Return the standard set of rooms for a given BHK count.
 
@@ -517,8 +949,205 @@ def apply_bathroom_relationships(rooms: list, prompt: str = "") -> list:
     return non_bathrooms
 
 
+def apply_floor_bathroom_roles(
+    program: Dict[int, List[Dict[str, Any]]], prompt: str = "",
+) -> Dict[int, List[Dict[str, Any]]]:
+    """Preserve ensuite/common semantics in an explicit multi-floor program."""
+    result = {int(level): [normalize_ai_room_spec(spec) or dict(spec) for spec in specs]
+              for level, specs in (program or {}).items()}
+    text = (prompt or "").lower()
+    number_words = {"one": 1, "two": 2, "three": 3, "four": 4, "five": 5, "six": 6}
+    level_names = {"ground": 0, "first": 1, "second": 2, "third": 3, "fourth": 4, "fifth": 5}
+    markers = list(re.finditer(r"\b(ground|first|second|third|fourth|fifth)\s+floor\b", text))
+
+    def requested_count(segment: str, role: str) -> int:
+        # Parenthetical/``or`` clauses are fallbacks, not additional rooms.
+        # Count the primary alternative only, matching the floor-program
+        # compiler's feasibility semantics.
+        segment = re.sub(r"\(\s*or\b[^)]*\)", "", segment, flags=re.I)
+        segment = "\n".join(re.split(r"\bor\b[^.\n]*", line, maxsplit=1, flags=re.I)[0]
+                            for line in segment.splitlines())
+        qualifier = r"(?:attached|ensuite|en[- ]?suite)" if role == "attached" else r"(?:common|general|shared|guest)"
+        match = re.search(
+            rf"\b(?:(one|two|three|four|five|six|\d+)\s+)?{qualifier}\s+(?:bathrooms?|baths?|toilets?|washrooms?)\b",
+            segment,
+        )
+        if role == "attached":
+            # “Two bedrooms should have attached bathrooms” states the
+            # ensuite cardinality through the bedroom subject rather than
+            # immediately before “bathrooms”.
+            subject_match = re.search(
+                r"\b(one|two|three|four|five|six|\d+)\s+(?:primary\s+|master\s+)?bedrooms?"
+                r"[^.\n]{0,70}\b(?:have|with|include|including)\s+(?:their\s+own\s+)?"
+                r"(?:attached|ensuite|en[- ]?suite)\s+(?:bathrooms?|baths?|toilets?|washrooms?)\b",
+                segment,
+            )
+            if subject_match:
+                match = subject_match
+        if not match:
+            return 0
+        token = match.group(1)
+        return number_words.get(token, int(token) if token and token.isdigit() else 1)
+
+    requests: Dict[int, Dict[str, int]] = {}
+    if markers:
+        for index, marker in enumerate(markers):
+            level = level_names[marker.group(1)]
+            segment = text[marker.start(): markers[index + 1].start() if index + 1 < len(markers) else None]
+            counts = {
+                "attached": requested_count(segment, "attached"),
+                "common": requested_count(segment, "common"),
+            }
+            existing = requests.setdefault(level, {"attached": 0, "common": 0})
+            # Repeated mentions of the same floor refine one program; they do
+            # not erase an earlier explicit count or count it twice.
+            existing["attached"] = max(existing["attached"], counts["attached"])
+            existing["common"] = max(existing["common"], counts["common"])
+    else:
+        requests[0] = {
+            "attached": requested_count(text, "attached"),
+            "common": requested_count(text, "common"),
+        }
+
+    explicit_bath_total = sum(
+        counts.get("attached", 0) + counts.get("common", 0)
+        for counts in requests.values()
+    )
+    if explicit_bath_total:
+        # Explicit cardinality is a hard semantic constraint. Gemini may add
+        # plausible but unrequested ensuites on another floor; remove those
+        # before geometry rather than silently changing the user's program.
+        for level, specs in result.items():
+            allowed = requests.get(level, {}).get("attached", 0) + requests.get(level, {}).get("common", 0)
+            seen = 0
+            filtered = []
+            for spec in specs:
+                is_bath = "bath" in canonical_type(spec.get("type")) or canonical_type(spec.get("type")) in {"toilet", "washroom"}
+                if is_bath:
+                    seen += 1
+                    if seen > allowed:
+                        continue
+                filtered.append(spec)
+            result[level] = filtered
+
+    for level, specs in result.items():
+        baths = [spec for spec in specs if "bath" in canonical_type(spec.get("type")) or canonical_type(spec.get("type")) in {"toilet", "washroom"}]
+        requested = requests.get(level, {})
+        attached_needed = int(requested.get("attached", 0))
+        common_needed = int(requested.get("common", 0))
+        while len(baths) < attached_needed + common_needed:
+            new_bath = {"type": "bathroom", "name": "Bathroom", "confidence": 100}
+            specs.append(new_bath)
+            baths.append(new_bath)
+        for index, bath in enumerate(baths):
+            existing_role = str(bath.get("bathroom_role") or "").lower()
+            if existing_role:
+                continue
+            if index < attached_needed:
+                bath.update({"type": "bathroom", "bathroom_role": "attached", "name": f"Attached Bathroom {index + 1}"})
+            elif index < attached_needed + common_needed:
+                bath.update({"type": "bathroom", "bathroom_role": "common", "name": "Common Bathroom"})
+    return result
+
+
+def normalize_floor_program_payload(payload: Any) -> Dict[int, List[Any]]:
+    """Accept both legacy keyed maps and Gemini-compatible floor lists.
+
+    Room types remain entirely open-ended strings; this only normalizes the
+    container used to associate those rooms with absolute floor numbers.
+    """
+    normalized: Dict[int, List[Any]] = {}
+    if isinstance(payload, dict):
+        entries = payload.items()
+    elif isinstance(payload, list):
+        entries = (
+            (item.get("floor_number"), item.get("rooms"))
+            for item in payload if isinstance(item, dict)
+        )
+    else:
+        return normalized
+    for raw_level, raw_rooms in entries:
+        try:
+            level = int(raw_level)
+        except (TypeError, ValueError):
+            continue
+        if level >= 0 and isinstance(raw_rooms, list):
+            normalized[level] = raw_rooms
+    return normalized
+
+
+def parse_added_floor_request(
+    prompt: str, ai_program: Any = None,
+) -> Tuple[Optional[int], List[Dict[str, Any]]]:
+    """Compile an ADD-storey instruction into clean room specifications.
+
+    Gemini's structured floor_program is preferred. The clause parser is a
+    deterministic safety net for older workers/model responses and accepts
+    open-ended room names without accepting verbs or whole instructions.
+    """
+    text = (prompt or "").lower()
+    if not re.search(r"\b(?:add|create|make|convert|duplex)\b", text) or not re.search(
+        r"\b(?:floor|storey|story|level|duplex|upstairs)\b", text,
+    ):
+        return None, []
+    level_map = {
+        "first": 1, "1st": 1, "second": 2, "2nd": 2,
+        "third": 3, "3rd": 3, "fourth": 4, "4th": 4,
+    }
+    level_matches = list(re.finditer(
+        r"\b(first|1st|second|2nd|third|3rd|fourth|4th)\s+(?:floor|storey|story|level)\b",
+        text,
+    ))
+    target_level = level_map[level_matches[-1].group(1)] if level_matches else 1
+
+    structured: List[Dict[str, Any]] = []
+    normalized_program = normalize_floor_program_payload(ai_program)
+    raw_specs = normalized_program.get(target_level, [])
+    for raw in raw_specs:
+        normalized = normalize_ai_room_spec(raw)
+        if normalized:
+            structured.append(normalized)
+    if structured:
+        return target_level, apply_floor_bathroom_roles({target_level: structured}, prompt)[target_level]
+
+    clause = text[level_matches[-1].end():] if level_matches else text
+    clause = re.sub(r"^\s*(?:and\s+)?(?:in\s+the\s+)?(?:please\s+)?(?:add\s*|generate\s+|create\s+|make\s+|put\s+|include\s+|with\s+|consists?\s+of\s+|should\s+(?:contain|have)\s+)", "", clause)
+    pieces = [piece.strip(" .;:-") for piece in re.split(r"\s*(?:,|\band\b|\bwith\b)\s*", clause) if piece.strip(" .;:-")]
+    count_words = {"one": 1, "two": 2, "three": 3, "four": 4, "five": 5, "six": 6}
+    specs: List[Dict[str, Any]] = []
+    for piece in pieces:
+        piece = re.sub(r"^(?:add\s*|generate\s+|create\s+|make\s+|put\s+|include\s+)", "", piece).strip()
+        count_match = re.match(r"^(?:(a|an|one|two|three|four|five|six|\d+)\s+)?(.+)$", piece)
+        if not count_match:
+            continue
+        count_token, label = count_match.groups()
+        count = count_words.get(count_token, int(count_token) if count_token and count_token.isdigit() else 1)
+        role = ""
+        if re.match(r"^(?:general|common|shared|guest)\s+", label):
+            role = "common"
+        elif re.match(r"^(?:attached|ensuite|en[- ]?suite)\s+", label):
+            role = "attached"
+        label = re.sub(r"^(?:general|common|shared|guest|attached|ensuite|en[- ]?suite)\s+", "", label).strip()
+        room_type = canonical_type(label)
+        if not room_type or is_instruction_like_room_label(room_type) or room_type in {"floor", "storey", "story", "level"}:
+            continue
+        if room_type in {"bath", "toilet", "washroom"}:
+            room_type = "bathroom"
+        for ordinal in range(count):
+            name = room_type.replace("_", " ").title()
+            if room_type == "bathroom" and role == "common":
+                name = "Common Bathroom"
+            elif room_type == "bathroom" and role == "attached":
+                name = "Attached Bathroom"
+            specs.append({
+                "type": room_type, "name": name, "confidence": 100,
+                **({"bathroom_role": role} if role else {}),
+            })
+    return target_level, specs
+
+
 def apply_prompt_proximities(rooms: list, prompt: str = "") -> list:
-    """Add soft, instance-specific `A near B` constraints from open room names."""
+    """Turn explicit relationship language into instance-specific hard edges."""
     text = re.sub(r"[^a-z0-9]+", " ", (prompt or "").lower()).strip()
     for source in rooms:
         source_label = str(source.get("name") or source.get("type", "")).lower().replace("_", " ").strip()
@@ -528,7 +1157,7 @@ def apply_prompt_proximities(rooms: list, prompt: str = "") -> list:
             if target is source:
                 continue
             target_label = str(target.get("name") or target.get("type", "")).lower().replace("_", " ").strip()
-            pattern = rf"\b{re.escape(source_label)}\s+(?:should\s+be\s+|must\s+be\s+)?(?:near|beside|adjacent\s+to|next\s+to)\s+(?:the\s+)?{re.escape(target_label)}\b"
+            pattern = rf"\b{re.escape(source_label)}\s+(?:should\s+be\s+|must\s+be\s+)?(?:at|by|near|beside|alongside|adjacent\s+to|next\s+to)\s+(?:the\s+)?{re.escape(target_label)}\b"
             if not re.search(pattern, text):
                 continue
             connections = source.setdefault("connections", [])
@@ -536,10 +1165,152 @@ def apply_prompt_proximities(rooms: list, prompt: str = "") -> list:
                 connections.append({
                     "target_room": target.get("type"),
                     "target_room_id": target.get("id"),
-                    "intent": "proximity",
-                    "weight": 15,
+                    "intent": "requested_adjacency",
+                    "weight": 30,
+                })
+
+            # Explicit "A connected to B" language is a real access edge,
+            # unlike merely being near. Preserve open-plan intent without
+            # restoring the old automatic public-room chain.
+        for target in rooms:
+            if target is source:
+                continue
+            target_label = str(target.get("name") or target.get("type", "")).lower().replace("_", " ").strip()
+            connected_pattern = (
+                rf"\b(?:open\s+)?{re.escape(source_label)}\s+"
+                rf"(?:is\s+)?(?:directly\s+)?connected\s+to\s+(?:the\s+)?{re.escape(target_label)}\b"
+            )
+            if not re.search(connected_pattern, text):
+                continue
+            connections = source.setdefault("connections", [])
+            if not any(conn.get("target_room_id") == target.get("id") for conn in connections):
+                connections.append({
+                    "target_room": target.get("type"),
+                    "target_room_id": target.get("id"),
+                    "intent": "open_flow" if re.search(rf"\bopen\s+{re.escape(source_label)}\b", text) else "standard",
+                    "weight": 30,
                 })
     return rooms
+
+
+def apply_courtyard_and_suite_relationships(rooms: list, prompt: str = "") -> list:
+    """Compile courtyard views and suite ownership into instance-level edges."""
+    text = re.sub(r"[^a-z0-9]+", " ", (prompt or "").lower()).strip()
+    courtyard = next((room for room in rooms if canonical_type(room.get("type")) == "courtyard"), None)
+    if courtyard and re.search(r"\bcenter(?:ed|red)?\s+(?:around|on)\b[^.]{0,80}\bcourtyard\b", text):
+        # "Centered" is a design preference, not an exact coordinate.  An
+        # exact fixed rectangle can make three requested courtyard-facing
+        # adjacencies infeasible even though many nearby valid layouts exist.
+        courtyard["preferred_location"] = "center"
+        courtyard["location_weight"] = 12
+    if courtyard and re.search(r"\b(?:overlook|face|facing|open\s+onto|around|centered\s+around)\b", text):
+        # The three courtyard-facing rooms provide natural access. Remove the
+        # generic corridor→courtyard edge added by zone wiring; requiring it as
+        # a fourth shared side over-constrains narrow plots.
+        for room in rooms:
+            if canonical_type(room.get("type")) not in {"living_room", "dining_room", "kitchen"}:
+                room["connections"] = [
+                    edge for edge in room.get("connections", [])
+                    if edge.get("target_room_id") != courtyard.get("id")
+                ]
+        for room in rooms:
+            room_type = canonical_type(room.get("type"))
+            if room_type not in {"living_room", "dining_room", "kitchen"}:
+                continue
+            connections = room.setdefault("connections", [])
+            if not any(connection.get("target_room_id") == courtyard.get("id") for connection in connections):
+                connections.append({
+                    "target_room": "courtyard",
+                    "target_room_id": courtyard.get("id"),
+                    "intent": "courtyard_view",
+                    "weight": 40,
+                })
+
+    closets = [room for room in rooms if canonical_type(room.get("type")) in {"walk_in_closet", "walkin_closet", "dressing_room"}]
+    masters = [room for room in rooms if canonical_type(room.get("type")) == "master_bedroom"]
+    if closets and masters and re.search(r"\bmaster\s+bedroom\b[^.]{0,100}\b(?:walk[ -]?in\s+closet|dressing\s+room)\b", text):
+        master = masters[0]
+        closet = closets[0]
+        closet["connections"] = []
+        master.setdefault("connections", []).append({
+            "target_room": closet.get("type"),
+            "target_room_id": closet.get("id"),
+            "intent": "suite_access",
+            "weight": 40,
+        })
+    return rooms
+
+
+def place_courtyard_facing_windows(nodes: Iterable[RoomNode], prompt: str = "") -> int:
+    """Add windows on requested room/courtyard shared walls."""
+    text = (prompt or "").lower()
+    if "courtyard" not in text or not re.search(r"\b(?:overlook|face|facing|open\s+onto)\b", text):
+        return 0
+    rooms = list(nodes or [])
+    courtyard = next((node for node in rooms if canonical_type(node.type) == "courtyard"), None)
+    if not courtyard:
+        return 0
+    placed = 0
+    tolerance = 0.15
+    for room in rooms:
+        if canonical_type(room.type) not in {"living_room", "dining_room", "kitchen"}:
+            continue
+        a, c = room.rect, courtyard.rect
+        overlap_z = min(a.z + a.length, c.z + c.length) - max(a.z, c.z)
+        overlap_x = min(a.x + a.width, c.x + c.width) - max(a.x, c.x)
+        face = None
+        if overlap_z >= 3.0 and abs((a.x + a.width) - c.x) <= tolerance:
+            gx, gz, face = a.x + a.width, (max(a.z, c.z) + min(a.z + a.length, c.z + c.length)) / 2, "east"
+        elif overlap_z >= 3.0 and abs((c.x + c.width) - a.x) <= tolerance:
+            gx, gz, face = a.x, (max(a.z, c.z) + min(a.z + a.length, c.z + c.length)) / 2, "west"
+        elif overlap_x >= 3.0 and abs((a.z + a.length) - c.z) <= tolerance:
+            gx, gz, face = (max(a.x, c.x) + min(a.x + a.width, c.x + c.width)) / 2, a.z + a.length, "south"
+        elif overlap_x >= 3.0 and abs((c.z + c.length) - a.z) <= tolerance:
+            gx, gz, face = (max(a.x, c.x) + min(a.x + a.width, c.x + c.width)) / 2, a.z, "north"
+        if not face:
+            continue
+        if any(abs((room.rect.x + window.x) - gx) < 0.2 and abs((room.rect.z + window.z) - gz) < 0.2 for window in room.windows):
+            continue
+        room.windows.append(Window(gx - room.rect.x, gz - room.rect.z, face, width=4.0))
+        placed += 1
+        logger.info("[COURTYARD VIEW] Added %s-facing window for %s", face, room.id)
+    return placed
+
+
+def apply_floor_outdoor_connections(
+    room_specs: List[Dict[str, Any]], outdoor_types: set[str], prompt: str = "",
+) -> List[Dict[str, Any]]:
+    """Attach floor-level outdoor spaces to their requested rooms by instance."""
+    bedrooms = [spec for spec in room_specs if "bedroom" in canonical_type(spec.get("type"))]
+    outdoors = [spec for spec in room_specs if canonical_type(spec.get("type")) in outdoor_types]
+    explicit_pairing = bool(re.search(
+        r"\b(?:bedrooms?|rooms?)\b[^.]{0,100}(?:\bwith\b|\bdirect\s+access\b)[^.]{0,100}\b(?:balcon|outside|outdoor)",
+        (prompt or "").lower(),
+    )) or bool(re.search(
+        r"\beach\b[^.]{0,80}\b(?:bedroom|room)\b[^.]{0,80}\b(?:have|has|include|with)\b[^.]{0,80}\b(?:private\s+)?balcon",
+        (prompt or "").lower(),
+    ))
+    if not outdoors or not bedrooms or not explicit_pairing:
+        return room_specs
+    outdoor_ids = {str(spec.get("id")) for spec in outdoors}
+    for spec in room_specs:
+        spec["connections"] = [
+            connection for connection in spec.get("connections", []) or []
+            if str(connection.get("target_room_id")) not in outdoor_ids
+        ]
+    pairs = (
+        [(bedroom, outdoors[0]) for bedroom in bedrooms]
+        if len(outdoors) == 1
+        else list(zip(bedrooms, outdoors))
+    )
+    for bedroom, outdoor in pairs:
+        bedroom.setdefault("connections", []).append({
+            "target_room": outdoor.get("type"),
+            "target_room_id": outdoor.get("id"),
+            "intent": "open_flow",
+            "weight": 30,
+        })
+    return room_specs
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -590,6 +1361,10 @@ class GenerateRequest(BaseModel):
     state: Optional[str] = "Maharashtra"
     district: Optional[str] = "Mumbai"
     layoutRules: Optional[List[Dict[str, str]]] = None
+    # Explicit UI intent prevents a new design opened from the setup modal
+    # from being misrouted through modification logic merely because an older
+    # project is still present in browser state.
+    requestMode: Optional[str] = None  # "create" or "edit"
 
 
 class TemplateRequest(BaseModel):
@@ -1485,10 +2260,12 @@ def _resize_room_in_place(room: Dict[str, Any], rooms: List[Dict[str, Any]], del
 def _prompt_room_matches(prompt: str, rooms: List[Dict[str, Any]]) -> List[int]:
     """Resolve a room reference from existing room metadata, without a type table."""
     text = re.sub(r"[^a-z0-9]+", " ", (prompt or "").lower()).strip()
+    for word, digit in {"one": "1", "two": "2", "three": "3", "four": "4", "five": "5", "six": "6"}.items():
+        text = re.sub(rf"\b{word}\b", digit, text)
     matches = []
     for index, room in enumerate(rooms):
         aliases = set()
-        for value in (room.get("id"), room.get("name"), room.get("type")):
+        for value in (room.get("id"), room.get("legacy_id"), room.get("name"), room.get("type")):
             alias = re.sub(r"[^a-z0-9]+", " ", str(value or "").lower()).strip()
             if alias and alias != "room":
                 aliases.add(alias)
@@ -1501,6 +2278,431 @@ def _prompt_room_matches(prompt: str, rooms: List[Dict[str, Any]]) -> List[int]:
     best = max(matches)[:3]
     chosen_alias = max((match for match in matches if match[:3] == best), key=lambda match: match[1])[4]
     return sorted({match[3] for match in matches if match[4] == chosen_alias})
+
+
+def _all_prompt_room_matches(prompt: str, rooms: List[Dict[str, Any]]) -> List[int]:
+    """Return every existing room explicitly named in the prompt, in text order."""
+    text = re.sub(r"[^a-z0-9]+", " ", (prompt or "").lower()).strip()
+    for word, digit in {"one": "1", "two": "2", "three": "3", "four": "4", "five": "5", "six": "6"}.items():
+        text = re.sub(rf"\b{word}\b", digit, text)
+    found: List[Tuple[int, int, int]] = []
+    for index, room in enumerate(rooms):
+        aliases = []
+        for value in (room.get("id"), room.get("legacy_id"), room.get("name"), room.get("type")):
+            alias = re.sub(r"[^a-z0-9]+", " ", str(value or "").lower()).strip()
+            if alias and alias != "room":
+                aliases.append(alias)
+        positions = [match.start() for alias in aliases if (match := re.search(rf"\b{re.escape(alias)}\b", text))]
+        if positions:
+            found.append((min(positions), -max(len(alias) for alias in aliases), index))
+    return [index for _, _, index in sorted(found)]
+
+
+def _ensure_door_between_rooms(first: Dict[str, Any], second: Dict[str, Any]) -> bool:
+    """Cut a paired doorway into a real shared wall and clear its approach."""
+    tolerance = 0.2
+    ax, az = float(first.get("x", 0)), float(first.get("z", 0))
+    aw, al = float(first.get("width", 0)), float(first.get("length", 0))
+    bx, bz = float(second.get("x", 0)), float(second.get("z", 0))
+    bw, bl = float(second.get("width", 0)), float(second.get("length", 0))
+    door_data = None
+    z0, z1 = max(az, bz), min(az + al, bz + bl)
+    x0, x1 = max(ax, bx), min(ax + aw, bx + bw)
+    if z1 - z0 >= 2.2 and abs((ax + aw) - bx) <= tolerance:
+        wz = (z0 + z1) / 2.0
+        door_data = ((aw, wz - az, "east"), (0.0, wz - bz, "west"), z1 - z0)
+    elif z1 - z0 >= 2.2 and abs((bx + bw) - ax) <= tolerance:
+        wz = (z0 + z1) / 2.0
+        door_data = ((0.0, wz - az, "west"), (bw, wz - bz, "east"), z1 - z0)
+    elif x1 - x0 >= 2.2 and abs((az + al) - bz) <= tolerance:
+        wx = (x0 + x1) / 2.0
+        door_data = ((wx - ax, al, "south"), (wx - bx, 0.0, "north"), x1 - x0)
+    elif x1 - x0 >= 2.2 and abs((bz + bl) - az) <= tolerance:
+        wx = (x0 + x1) / 2.0
+        door_data = ((wx - ax, 0.0, "north"), (wx - bx, bl, "south"), x1 - x0)
+    if door_data is None:
+        return False
+
+    first_door, second_door, shared_length = door_data
+    width = max(2.2, min(3.5, shared_length - 0.4))
+
+    def add_door(room: Dict[str, Any], data: Tuple[float, float, str]) -> None:
+        x, z, orientation = data
+        doors = room.setdefault("doors", [])
+        if not any(
+            abs(float(door.get("x", -99)) - x) <= 0.25
+            and abs(float(door.get("z", -99)) - z) <= 0.25
+            for door in doors if isinstance(door, dict)
+        ):
+            doors.append({
+                "x": round(x, 2), "z": round(z, 2),
+                "wall_orientation": orientation,
+                "width": round(width, 2), "height": 7.0,
+            })
+
+        # Keep a natural clear approach around the doorway. Furniture records
+        # are room-local center points, so remove only items intersecting a
+        # compact door clearance zone rather than emptying the room.
+        clear_radius = width / 2.0 + 1.25
+        room["furniture"] = [
+            item for item in room.get("furniture", []) or []
+            if not isinstance(item, dict)
+            or math.hypot(float(item.get("x", -100)) - x, float(item.get("z", -100)) - z)
+            > clear_radius + max(float(item.get("width", 0)), float(item.get("length", 0))) / 2.0
+        ]
+
+    add_door(first, first_door)
+    add_door(second, second_door)
+    first.setdefault("connections", []).append({
+        "target_room": second.get("type"), "target_room_id": second.get("id"),
+        "intent": "standard", "weight": 40,
+    })
+    return True
+
+
+def _remove_door_between_rooms(first: Dict[str, Any], second: Dict[str, Any]) -> None:
+    """Remove only paired openings between two rooms, preserving other doors."""
+    first_doors = [door for door in first.get("doors", []) or [] if isinstance(door, dict)]
+    second_doors = [door for door in second.get("doors", []) or [] if isinstance(door, dict)]
+    paired_first, paired_second = set(), set()
+    for first_index, first_door in enumerate(first_doors):
+        fx = float(first.get("x", 0)) + float(first_door.get("x", 0))
+        fz = float(first.get("z", 0)) + float(first_door.get("z", 0))
+        for second_index, second_door in enumerate(second_doors):
+            sx = float(second.get("x", 0)) + float(second_door.get("x", 0))
+            sz = float(second.get("z", 0)) + float(second_door.get("z", 0))
+            if abs(fx - sx) <= 0.35 and abs(fz - sz) <= 0.35:
+                paired_first.add(first_index)
+                paired_second.add(second_index)
+    first["doors"] = [door for index, door in enumerate(first_doors) if index not in paired_first]
+    second["doors"] = [door for index, door in enumerate(second_doors) if index not in paired_second]
+
+
+def _absorb_removed_room_cell(rooms: List[Dict[str, Any]], removed: Dict[str, Any]) -> bool:
+    """Give a deleted rectangular cell to a compatible neighbour.
+
+    This preserves the building envelope and prevents an internal courtyard or
+    room deletion from becoming an accidental open notch. A merge is accepted
+    only when the exact union is still a rectangle.
+    """
+    tolerance = 0.2
+    rx, rz = float(removed.get("x", 0)), float(removed.get("z", 0))
+    rw, rl = float(removed.get("width", 0)), float(removed.get("length", 0))
+    candidates = []
+    preference = {
+        "corridor": 0, "hallway": 0, "living_room": 1,
+        "dining_room": 2, "foyer": 2, "kitchen": 3,
+    }
+    for room in rooms:
+        if _room_floor_key(room) != _room_floor_key(removed):
+            continue
+        x, z = float(room.get("x", 0)), float(room.get("z", 0))
+        width, length = float(room.get("width", 0)), float(room.get("length", 0))
+        merged = None
+        shared = 0.0
+        if abs(z - rz) <= tolerance and abs(length - rl) <= tolerance:
+            if abs((x + width) - rx) <= tolerance or abs((rx + rw) - x) <= tolerance:
+                merged = (min(x, rx), min(z, rz), width + rw, max(length, rl))
+                shared = min(length, rl)
+        elif abs(x - rx) <= tolerance and abs(width - rw) <= tolerance:
+            if abs((z + length) - rz) <= tolerance or abs((rz + rl) - z) <= tolerance:
+                merged = (min(x, rx), min(z, rz), max(width, rw), length + rl)
+                shared = min(width, rw)
+        if merged:
+            room_type = canonical_type(room.get("type"))
+            candidates.append((preference.get(room_type, 10), -shared, room, merged))
+    if not candidates:
+        return False
+
+    _, _, recipient, (new_x, new_z, new_width, new_length) = min(candidates, key=lambda item: item[:2])
+    old_x, old_z = float(recipient.get("x", 0)), float(recipient.get("z", 0))
+    local_dx, local_dz = old_x - new_x, old_z - new_z
+    for collection in ("doors", "windows", "furniture"):
+        for item in recipient.get(collection, []) or []:
+            if not isinstance(item, dict):
+                continue
+            if "x" in item:
+                item["x"] = round(float(item.get("x", 0)) + local_dx, 2)
+            if "z" in item:
+                item["z"] = round(float(item.get("z", 0)) + local_dz, 2)
+    recipient.update({
+        "x": round(new_x, 2), "z": round(new_z, 2),
+        "width": round(new_width, 2), "length": round(new_length, 2),
+    })
+    _clamp_room_contents(recipient)
+    logger.info("[EDIT HEAL] Absorbed deleted %s cell into %s", removed.get("id"), recipient.get("id"))
+    return True
+
+
+def reconcile_modified_rooms(
+    previous_rooms: List[Dict[str, Any]], modified_rooms: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """Reconcile topology after every structural edit.
+
+    Door openings are valid only on a current finite wall. Orphan doors are
+    removed, one-sided valid openings are paired, deleted-room connections are
+    discarded, and furniture is kept clear of all retained door approaches.
+    """
+    rooms = copy.deepcopy(modified_rooms or [])
+    if not rooms:
+        return rooms
+    from layout_engine import generate_walls_from_aabbs
+
+    # Normalize solver/grid residue before finite-wall classification. Door
+    # validation already treats seams up to 0.2 ft as coincident; using a
+    # stricter wall threshold here used to delete unrelated valid openings.
+    seam_tolerance = 0.2
+    by_floor: Dict[Any, List[Dict[str, Any]]] = {}
+    for room in rooms:
+        by_floor.setdefault(_room_floor_key(room), []).append(room)
+    for floor_rooms in by_floor.values():
+        for index, first in enumerate(floor_rooms):
+            ax, az = float(first.get("x", 0)), float(first.get("z", 0))
+            aw, al = float(first.get("width", 0)), float(first.get("length", 0))
+            for second in floor_rooms[index + 1:]:
+                bx, bz = float(second.get("x", 0)), float(second.get("z", 0))
+                bw, bl = float(second.get("width", 0)), float(second.get("length", 0))
+                overlap_z = min(az + al, bz + bl) - max(az, bz)
+                overlap_x = min(ax + aw, bx + bw) - max(ax, bx)
+                gap = bx - (ax + aw)
+                if overlap_z >= 2.0 and 0.0 < gap <= seam_tolerance:
+                    first["width"] = round(aw + gap, 2); aw += gap
+                gap = ax - (bx + bw)
+                if overlap_z >= 2.0 and 0.0 < gap <= seam_tolerance:
+                    second["width"] = round(bw + gap, 2); bw += gap
+                gap = bz - (az + al)
+                if overlap_x >= 2.0 and 0.0 < gap <= seam_tolerance:
+                    first["length"] = round(al + gap, 2); al += gap
+                gap = az - (bz + bl)
+                if overlap_x >= 2.0 and 0.0 < gap <= seam_tolerance:
+                    second["length"] = round(bl + gap, 2); bl += gap
+
+    node_by_id: Dict[str, RoomNode] = {}
+    nodes_by_floor: Dict[Any, List[RoomNode]] = {}
+    for room in rooms:
+        try:
+            node = RoomNode(
+                id=str(room.get("id")), type=str(room.get("type", "room")),
+                name=str(room.get("name") or room.get("type") or "Room"),
+                rect=Rect(float(room.get("x", 0)), float(room.get("z", 0)),
+                          float(room.get("width", 0)), float(room.get("length", 0))),
+            )
+            node_by_id[str(room.get("id"))] = node
+            nodes_by_floor.setdefault(_room_floor_key(room), []).append(node)
+        except (TypeError, ValueError):
+            continue
+    walls = [wall for floor_nodes in nodes_by_floor.values() for wall in generate_walls_from_aabbs(floor_nodes)]
+    room_by_id = {str(room.get("id")): room for room in rooms}
+    valid_ids = set(room_by_id)
+    valid_types = {canonical_type(room.get("type")) for room in rooms}
+
+    def wall_contains(wall: Dict[str, Any], wx: float, wz: float) -> bool:
+        return (
+            min(float(wall["x1"]), float(wall["x2"])) - 0.3 <= wx <= max(float(wall["x1"]), float(wall["x2"])) + 0.3
+            and min(float(wall["z1"]), float(wall["z2"])) - 0.3 <= wz <= max(float(wall["z1"]), float(wall["z2"])) + 0.3
+        )
+
+    paired_openings: List[Tuple[str, str, float, float, float]] = []
+    for room in rooms:
+        room_id = str(room.get("id"))
+        room_walls = [wall for wall in walls if room_id in wall.get("room_ids", [])]
+        surviving_doors = []
+        for door in room.get("doors", []) or []:
+            if not isinstance(door, dict):
+                continue
+            wx = float(room.get("x", 0)) + float(door.get("x", 0))
+            wz = float(room.get("z", 0)) + float(door.get("z", 0))
+            eligible = [
+                wall for wall in room_walls if wall_contains(wall, wx, wz)
+                and (bool(wall.get("is_exterior")) if door.get("is_main") else bool(wall.get("is_shared")))
+            ]
+            if not eligible:
+                logger.info("[EDIT HEAL] Closed orphan door in %s at %.2f, %.2f", room_id, wx, wz)
+                continue
+            surviving_doors.append(door)
+            if not door.get("is_main"):
+                wall = eligible[0]
+                other_id = next((value for value in wall.get("room_ids", []) if value != room_id), None)
+                if other_id:
+                    paired_openings.append((room_id, str(other_id), wx, wz, float(door.get("width", 3.0))))
+        room["doors"] = surviving_doors
+        room["connections"] = [
+            connection for connection in room.get("connections", []) or []
+            if isinstance(connection, dict)
+            and (
+                (connection.get("target_room_id") and str(connection.get("target_room_id")) in valid_ids)
+                or (not connection.get("target_room_id") and canonical_type(connection.get("target_room")) in valid_types)
+            )
+        ]
+        # Windows must still lie on an exterior wall, or face a genuine
+        # open-to-sky neighbour such as a courtyard. Resizing/deleting rooms
+        # otherwise leaves floating window cut-outs in newly solid walls.
+        surviving_windows = []
+        for window in room.get("windows", []) or []:
+            if not isinstance(window, dict):
+                continue
+            wx = float(room.get("x", 0)) + float(window.get("x", 0))
+            wz = float(room.get("z", 0)) + float(window.get("z", 0))
+            eligible = False
+            for wall in room_walls:
+                if not wall_contains(wall, wx, wz):
+                    continue
+                if wall.get("is_exterior"):
+                    eligible = True
+                    break
+                other_ids = [value for value in wall.get("room_ids", []) if value != room_id]
+                if any(canonical_type(room_by_id.get(str(value), {}).get("type")) in _INTERNAL_OPEN_TYPES for value in other_ids):
+                    eligible = True
+                    break
+            if eligible:
+                surviving_windows.append(window)
+            else:
+                logger.info("[EDIT HEAL] Closed orphan window in %s at %.2f, %.2f", room_id, wx, wz)
+        room["windows"] = surviving_windows
+
+        # Preserve a usable approach on both sides of every retained doorway.
+        # Furniture is local to the room, as are serialized door coordinates.
+        doors = [door for door in room.get("doors", []) or [] if isinstance(door, dict)]
+        room["furniture"] = [
+            item for item in room.get("furniture", []) or []
+            if not isinstance(item, dict) or not any(
+                math.hypot(
+                    float(item.get("x", -100)) - float(door.get("x", 0)),
+                    float(item.get("z", -100)) - float(door.get("z", 0)),
+                ) <= float(door.get("width", 3.0)) / 2.0
+                    + max(float(item.get("width", 0)), float(item.get("length", 0))) / 2.0 + 1.25
+                for door in doors
+            )
+        ]
+
+    # Restore the opposite half of each valid doorway when only one room kept it.
+    for source_id, other_id, wx, wz, width in paired_openings:
+        other = room_by_id.get(other_id)
+        if not other:
+            continue
+        if any(
+            abs(float(other.get("x", 0)) + float(door.get("x", 0)) - wx) <= 0.3
+            and abs(float(other.get("z", 0)) + float(door.get("z", 0)) - wz) <= 0.3
+            for door in other.get("doors", []) or [] if isinstance(door, dict)
+        ):
+            continue
+        ox, oz = float(other.get("x", 0)), float(other.get("z", 0))
+        ow, ol = float(other.get("width", 0)), float(other.get("length", 0))
+        distances = {
+            "west": abs(wx - ox), "east": abs(wx - (ox + ow)),
+            "north": abs(wz - oz), "south": abs(wz - (oz + ol)),
+        }
+        orientation = min(distances, key=distances.get)
+        other.setdefault("doors", []).append({
+            "x": round(wx - ox, 2), "z": round(wz - oz, 2),
+            "wall_orientation": orientation, "width": width, "height": 7.0,
+        })
+
+    # Final content clamp also keeps resized/absorbed rooms render-safe.
+    for room in rooms:
+        _clamp_room_contents(room)
+    return rooms
+
+
+def rebuild_modified_door_topology(rooms: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Produce a repaired edit candidate with a fresh, paired door graph.
+
+    Reconciliation intentionally closes openings invalidated by moved/absorbed
+    walls.  A removal can therefore be geometrically correct yet temporarily
+    disconnect rooms.  This second candidate regenerates doors from the new
+    finite walls on each floor; the transaction critic decides whether it is
+    safer than the preservation-first candidate.
+    """
+    repaired = copy.deepcopy(rooms or [])
+    floors: Dict[Any, List[Dict[str, Any]]] = {}
+    for room in repaired:
+        floors.setdefault(_room_floor_key(room), []).append(room)
+
+    for floor_rooms in floors.values():
+        nodes: List[RoomNode] = []
+        source_by_id: Dict[str, Dict[str, Any]] = {}
+        for room in floor_rooms:
+            room_id = str(room.get("id") or "")
+            if not room_id:
+                continue
+            source_by_id[room_id] = room
+            main_doors = []
+            for door in room.get("doors", []) or []:
+                if not isinstance(door, dict) or not door.get("is_main"):
+                    continue
+                main_doors.append(Door(
+                    x=float(door.get("x", 0)), z=float(door.get("z", 0)),
+                    wall_orientation=str(door.get("wall_orientation", "south")),
+                    width=float(door.get("width", 4.0)),
+                    height=float(door.get("height", 7.0)), is_main=True,
+                ))
+            nodes.append(RoomNode(
+                id=room_id,
+                type=canonical_type(room.get("type")) or "room",
+                name=str(room.get("name") or room.get("type") or "Room"),
+                rect=Rect(
+                    float(room.get("x", 0)), float(room.get("z", 0)),
+                    float(room.get("width", 0)), float(room.get("length", 0)),
+                ),
+                doors=main_doors,
+                connections=copy.deepcopy(room.get("connections", []) or []),
+            ))
+        if not nodes:
+            continue
+        AdjacencyResolver(nodes).resolve()
+        for node in nodes:
+            source = source_by_id[node.id]
+            source["doors"] = [
+                {
+                    "x": round(door.x, 2), "z": round(door.z, 2),
+                    "wall_orientation": door.wall_orientation,
+                    "width": door.width, "height": door.height,
+                    "is_main": bool(door.is_main),
+                }
+                for door in node.doors
+            ]
+            _clamp_room_contents(source)
+    return repaired
+
+
+def evaluate_modified_room_transaction(
+    prompt: str,
+    previous_rooms: List[Dict[str, Any]],
+    candidate_rooms: List[Dict[str, Any]],
+    plot_width: float,
+    plot_length: float,
+    ai_analysis: Optional[Dict[str, Any]] = None,
+) -> Tuple[Optional[List[Dict[str, Any]]], Any]:
+    """Accept an edit only after independently proving its postconditions."""
+    from edit_intelligence import compile_contract, select_best_candidate
+
+    reconciled = reconcile_modified_rooms(previous_rooms, candidate_rooms)
+    contract = compile_contract(prompt, previous_rooms, ai_analysis)
+    # Multi-critic transaction: first evaluate the minimally changed topology;
+    # if wall changes closed required openings, also evaluate a deterministic
+    # finite-wall door rebuild. No candidate is committed unless the independent
+    # contract/geometry/accessibility critic accepts it.
+    repaired_topology = rebuild_modified_door_topology(reconciled)
+    selected, report = select_best_candidate(
+        previous_rooms, [reconciled, repaired_topology], contract,
+        float(plot_width or 40), float(plot_length or 40),
+    )
+    if selected is None:
+        logger.warning("[EDIT TRANSACTION] Rejected candidate: %s", "; ".join(report.errors))
+    else:
+        logger.info("[EDIT TRANSACTION] Accepted candidate (preservation score %.2f)", report.score)
+    return selected, report
+
+
+def edit_rejection_message(report: Any) -> str:
+    errors = list(getattr(report, "errors", []) or [])
+    alternatives = list(getattr(report, "alternatives", []) or [])
+    message = "The layout was left unchanged because the requested edit failed validation."
+    if errors:
+        message += " Problems: " + "; ".join(errors[:5])
+    if alternatives:
+        message += " Options: " + " ".join(alternatives[:3])
+    return message
 
 
 def _place_room_next_to(rooms: List[Dict[str, Any]], target_index: int, anchor_index: int) -> bool:
@@ -1560,6 +2762,184 @@ def _swap_room_cells(rooms: List[Dict[str, Any]], first_index: int, second_index
     _clamp_room_contents(rooms[first_index])
     _clamp_room_contents(rooms[second_index])
 
+
+def _next_room_id(rooms: List[Dict[str, Any]], room_type: str) -> str:
+    prefix = canonical_type(room_type)
+    used = {str(room.get("id", "")) for room in rooms}
+    number = 1
+    while f"{prefix}-{number}" in used:
+        number += 1
+    return f"{prefix}-{number}"
+
+
+def _replan_floor_with_constraint(
+    rooms: List[Dict[str, Any]],
+    target_index: Optional[int],
+    anchor_index: int,
+    plot_width: float,
+    plot_length: float,
+    add_room_type: str = "",
+    add_room_role: str = "",
+    additional_anchor_indices: Optional[List[int]] = None,
+    doorway_anchor_indices: Optional[List[int]] = None,
+) -> Optional[List[Dict[str, Any]]]:
+    """Re-solve one floor while enforcing the requested room relationship.
+
+    A dense generated plan has no unused rectangular cell. Moving a room into
+    arbitrary coordinates creates a hole/overlap, while carving the largest
+    room ignores the requested neighbour. CP-SAT is the correct fallback: it
+    re-packs only the affected floor with a hard shared-wall constraint and
+    keeps every room's stable ID and visual metadata.
+    """
+    if anchor_index < 0 or anchor_index >= len(rooms):
+        return None
+    floor_key = _room_floor_key(rooms[anchor_index])
+    floor_rooms = [room for room in rooms if _room_floor_key(room) == floor_key]
+    if not floor_rooms:
+        return None
+
+    anchor_indices = list(dict.fromkeys(
+        [anchor_index] + [index for index in (additional_anchor_indices or []) if 0 <= index < len(rooms)]
+    ))
+    anchor_ids = [str(rooms[index].get("id") or "") for index in anchor_indices]
+    if not all(anchor_ids):
+        return None
+    target_id = ""
+    if add_room_type:
+        target_id = _next_room_id(rooms, add_room_type)
+    elif target_index is not None and 0 <= target_index < len(rooms):
+        target_id = str(rooms[target_index].get("id") or "")
+    if not target_id:
+        return None
+
+    specs: List[Dict[str, Any]] = []
+    for room in floor_rooms:
+        normalized = normalize_ai_room_spec({
+            "id": room.get("id"),
+            "type": room.get("type"),
+            "name": room.get("name"),
+            "roof_type": room.get("roof_type"),
+            "is_outdoor": room.get("is_outdoor", False),
+        })
+        if normalized:
+            normalized["id"] = str(room.get("id"))
+            specs.append(normalized)
+    if add_room_type:
+        added_name = (
+            "Attached Bathroom" if add_room_role == "attached"
+            else "Common Bathroom" if add_room_role == "common"
+            else add_room_type.replace("_", " ").title()
+        )
+        new_spec = normalize_ai_room_spec({
+            "id": target_id,
+            "type": add_room_type,
+            "name": added_name,
+            "bathroom_role": add_room_role,
+        })
+        if not new_spec:
+            return None
+        new_spec["id"] = target_id
+        specs.append(new_spec)
+
+    from cloud_extractor import auto_wire_topology
+    wired = auto_wire_topology(specs)
+    target_spec = next((spec for spec in wired if str(spec.get("id")) == target_id), None)
+    anchor_specs = [next((spec for spec in wired if str(spec.get("id")) == anchor_id), None) for anchor_id in anchor_ids]
+    if not target_spec or not all(anchor_specs):
+        return None
+    if add_room_role == "attached":
+        # An ensuite is a private destination, never a common corridor room.
+        # Remove generic auto-wiring and retain only the requested bedroom edge.
+        target_spec["bathroom_role"] = "attached"
+        target_spec["connections"] = []
+    for anchor_id, anchor_spec in zip(anchor_ids, anchor_specs):
+        connections = target_spec.setdefault("connections", [])
+        existing = next((edge for edge in connections if edge.get("target_room_id") == anchor_id), None)
+        if existing:
+            existing.update({"intent": "requested_adjacency", "weight": 40})
+        else:
+            connections.append({
+                "target_room": anchor_spec.get("type"),
+                "target_room_id": anchor_id,
+                "intent": "requested_adjacency",
+                "weight": 40,
+            })
+
+    try:
+        by_id = {str(room.get("id")): room for room in floor_rooms}
+        preserve_keys = (
+            "wallColor", "wallColors", "floorColor", "furnitureColor",
+            "materials", "furniture", "mep_nodes",
+        )
+        doorway_ids = {
+            str(rooms[index].get("id"))
+            for index in (doorway_anchor_indices or [anchor_index])
+            if 0 <= index < len(rooms)
+        }
+        candidates: List[Tuple[float, List[Dict[str, Any]]]] = []
+        for attempt in range(2):
+            try:
+                variant = copy.deepcopy(wired)
+                for spec in variant:
+                    spec["attempt"] = attempt
+                replanner = LayoutEngine(float(plot_width or 40), float(plot_length or 40))
+                replanner.skip_furniture_generation = True
+                nodes = replanner.generate(variant)
+                apply_requested_room_names(nodes, wired)
+                replanned: List[Dict[str, Any]] = []
+                for node in nodes:
+                    payload = node.to_dict()
+                    payload["floorIndex"] = floor_key
+                    payload["isFloor1"] = floor_key == 1
+                    previous = by_id.get(str(node.id))
+                    if previous:
+                        payload["name"] = previous.get("name") or payload["name"]
+                        for key in preserve_keys:
+                            if key in previous:
+                                payload[key] = copy.deepcopy(previous[key])
+                        _clamp_room_contents(payload)
+                    else:
+                        payload["furniture"] = furniture_for_room(
+                            payload["type"], payload["width"], payload["length"]
+                        )
+                    replanned.append(payload)
+
+                target_room = next((room for room in replanned if str(room.get("id")) == target_id), None)
+                anchor_rooms = [next((room for room in replanned if str(room.get("id")) == anchor_id), None) for anchor_id in anchor_ids]
+                if not target_room or not all(anchor_rooms) or not all(_rooms_share_boundary(target_room, anchor) for anchor in anchor_rooms):
+                    continue
+                if any(
+                    str(anchor_room.get("id")) in doorway_ids
+                    and not _ensure_door_between_rooms(target_room, anchor_room)
+                    for anchor_room in anchor_rooms
+                ):
+                    continue
+
+                # Prefer the valid solution that disturbs existing geometry the
+                # least. The solver seed changes dimensions/packing, providing
+                # genuinely different candidates rather than cosmetic retries.
+                preservation_cost = 0.0
+                for room in replanned:
+                    previous = by_id.get(str(room.get("id")))
+                    if previous:
+                        preservation_cost += sum(
+                            abs(float(room.get(key, 0)) - float(previous.get(key, 0)))
+                            for key in ("x", "z", "width", "length")
+                        )
+                candidates.append((preservation_cost, replanned))
+            except Exception as attempt_exc:
+                logger.warning("[EDIT] Replan candidate %s failed: %s", attempt, attempt_exc)
+
+        if not candidates:
+            logger.error("[EDIT] Replanner produced no candidate satisfying %s -> %s", target_id, anchor_ids)
+            return None
+        _, best = min(candidates, key=lambda item: item[0])
+        unaffected = [copy.deepcopy(room) for room in rooms if _room_floor_key(room) != floor_key]
+        return best + unaffected
+    except Exception as exc:
+        logger.exception("[EDIT] Constraint replanning failed: %s", exc)
+        return None
+
 def build_room_changes(
     prompt: str,
     current_rooms: List[Dict[str, Any]],
@@ -1567,7 +2947,9 @@ def build_room_changes(
     matched_rooms: list,
     matched_sizes: list,
     move_target: str = "",
-    move_dest: str = ""
+    move_dest: str = "",
+    plot_width: float = 40.0,
+    plot_length: float = 40.0,
 ) -> Optional[List[Dict[str, Any]]]:
     """
     Apply modification intents to existing room list.
@@ -1589,7 +2971,11 @@ def build_room_changes(
         intents.append("move")
     if re.search(r"\b(?:remove|delete)\b", text) and not any(intent in intents for intent in ("remove", "delete")):
         intents.append("remove")
-    if re.search(r"\badd\b", text) and "add" not in intents:
+    adds_sub_element = bool(re.search(
+        r"\badd\s+(?:a\s+|an\s+|the\s+)?(?:proper\s+)?(?:door|doorway|window|furniture|light|wiring|plumbing|fixture)\b",
+        text,
+    ))
+    if re.search(r"\badd\b", text) and "add" not in intents and not adds_sub_element:
         intents.append("add")
 
     if not room_types:
@@ -1601,114 +2987,92 @@ def build_room_changes(
 
     rooms = copy.deepcopy(current_rooms)
 
-    # ADD intent — Carve-and-Shrink.
-    # A generated house already uses 100% of its floor area, so we must NEVER
-    # spawn a new room at free/out-of-bounds coordinates (that produced the
-    # floating bathroom outside the footprint). Instead: pick a suitable Parent
-    # Room, shrink it, and place the new room inside the freed strip. Coordinates
-    # are derived entirely from the parent's rect, so the room stays in bounds.
+    # ADD intent — constraint re-plan of the affected floor.
     if "add" in intents and room_types:
-        # Preferred donor parents per new-room type (first match wins, largest of type).
-        PARENT_PREF = {
-            "bathroom":      ["master_bedroom", "bedroom", "corridor", "living_room"],
-            "powder_room":   ["foyer", "living_room", "corridor"],
-            "pooja_room":    ["living_room", "dining_room"],          # never bath/utility/kitchen
-            "utility":       ["kitchen"],
-            "store_room":    ["kitchen", "utility", "dining_room"],
-            "master_bedroom":["bedroom", "living_room"],
-            "bedroom":       ["master_bedroom", "bedroom", "living_room"],
-            "kitchen":       ["dining_room", "living_room"],
-            "dining_room":   ["living_room"],
-            "balcony":       ["bedroom", "living_room"],
-            "foyer":         ["living_room"],
-            "study_room":    ["bedroom", "living_room"],
-            "gym":           ["living_room", "study_room", "bedroom"],
-            "laundry":       ["kitchen", "utility"],
-        }
-        # Target footprint (ft) of the new room.
-        NEW_SIZE = {
-            "bathroom": (6, 7), "powder_room": (4, 5), "pooja_room": (6, 6),
-            "utility": (6, 6), "store_room": (5, 6), "kitchen": (10, 10),
-            "dining_room": (10, 10), "balcony": (5, 8), "foyer": (6, 7),
-            "study_room": (8, 9), "laundry": (5, 6), "master_bedroom": (11, 11),
-            "bedroom": (10, 10),
-            "gym": (10, 12),
-        }
-        MIN_PARENT = 8.0   # parent must keep >= this ft on the carved axis
-        # Types that may legitimately repeat; others are skipped if present.
         REPEATABLE = {"bathroom", "bedroom", "balcony", "store_room"}
+        # In relational edits the extractor can return the existing anchor
+        # before the new subject (for example ["bedroom", "bathroom"] for
+        # "add attached bathroom to bedroom one"). Parse the phrase following
+        # ADD first so we never duplicate the anchor instead of adding the
+        # requested room.
+        add_subject_match = re.search(
+            r"\badd\s+(?:a\s+|an\s+|the\s+)?(.+?)"
+            r"(?=\s+(?:to|at|by|near|beside|next\s+to|adjacent\s+to)\b|$)",
+            text,
+        )
+        add_subject = add_subject_match.group(1).strip() if add_subject_match else ""
+        add_subject = re.sub(r"^(?:proper\s+|new\s+|attached\s+|ensuite\s+)+", "", add_subject)
+        norm = canonical_type(add_subject) if add_subject else canonical_type(room_types[0])
+        normalized_subject = normalize_ai_room_spec({"type": norm, "name": add_subject or norm})
+        if normalized_subject:
+            norm = canonical_type(normalized_subject.get("type"))
+        # Keep common natural-language modifiers as relationship semantics,
+        # not as separate room taxonomies.
+        if norm in {"attached_bathroom", "ensuite_bathroom", "attached_bath", "ensuite"}:
+            norm = "bathroom"
+        if norm in _GENERIC_AI_ROOM_TYPES:
+            add_match = re.search(
+                r"\badd\s+(?:a|an|the)?\s*([a-z][a-z\s]+?)(?=\s+(?:at|by|near|beside|next\s+to|adjacent\s+to)\b|$)",
+                text,
+            )
+            if add_match:
+                norm = canonical_type(add_match.group(1))
+        if not norm:
+            return None
+        existing_types = {canonical_type(room.get("type")) for room in rooms}
+        if norm in existing_types and norm not in REPEATABLE:
+            return None
 
-        for rtype in room_types:
-            norm = rtype.replace(" ", "_")
-            existing_types = {r.get("type", "") for r in rooms}
-            if norm in existing_types and norm not in REPEATABLE:
-                continue
+        # Resolve the requested neighbour from the actual project. For
+        # "add dining room near kitchen", kitchen is the hard anchor. If no
+        # relation was stated, use an architectural default that already
+        # exists in this floor.
+        explicit_matches = [
+            index for index in _prompt_room_matches(prompt, rooms)
+            if canonical_type(rooms[index].get("type")) != norm
+        ]
+        anchor_index = next((
+            index for index, room in enumerate(rooms)
+            if move_dest and canonical_type(move_dest) in {
+                canonical_type(room.get("id")), canonical_type(room.get("type")), canonical_type(room.get("name")),
+            }
+        ), -1)
+        if anchor_index == -1:
+            anchor_index = explicit_matches[0] if explicit_matches else -1
+        bathroom_role = ""
+        if norm == "bathroom":
+            normalized_bath = normalize_ai_room_spec({"type": add_subject or norm, "name": add_subject or norm}) or {}
+            bathroom_role = str(normalized_bath.get("bathroom_role") or "")
+            if not bathroom_role and re.search(r"\b(?:attached|ensuite|en[- ]?suite)\b", text):
+                bathroom_role = "attached"
 
-            nw, nl = NEW_SIZE.get(norm, (8, 8))
-
-            # Pick a parent by preference (largest of that type); else biggest room.
-            parent = None
-            for pref in PARENT_PREF.get(norm, []):
-                cands = [r for r in rooms if pref in r.get("type", "")]
-                if cands:
-                    parent = max(cands, key=lambda r: r.get("width", 0) * r.get("length", 0))
+        preferred_anchors = {
+            "dining_room": ("kitchen", "living_room"),
+            "pooja_room": ("living_room", "dining_room"),
+            "bathroom": ("master_bedroom", "bedroom", "corridor"),
+            "utility": ("kitchen",),
+            "utility_area": ("kitchen",),
+            "store_room": ("kitchen", "utility", "dining_room"),
+            "study_room": ("bedroom", "living_room"),
+            "bedroom": ("corridor", "living_room"),
+        }
+        if anchor_index == -1:
+            anchor_order = preferred_anchors.get(norm, ("living_room", "corridor"))
+            if norm == "bathroom" and bathroom_role == "common":
+                anchor_order = ("corridor", "hallway", "foyer", "living_room")
+            for preferred in anchor_order:
+                anchor_index = next(
+                    (index for index, room in enumerate(rooms) if canonical_type(room.get("type")) == preferred),
+                    -1,
+                )
+                if anchor_index != -1:
                     break
-            if parent is None and rooms:
-                parent = max(rooms, key=lambda r: r.get("width", 0) * r.get("length", 0))
-            if parent is None:
-                continue
-
-            px, pz = parent.get("x", 0), parent.get("z", 0)
-            pw, pl = parent.get("width", 10), parent.get("length", 10)
-
-            # Carve a strip off the parent's longer axis; clamp so the parent
-            # remainder stays >= MIN_PARENT (reject the carve otherwise).
-            if pw >= pl:
-                slice_w = min(nw, pw - MIN_PARENT)
-                if slice_w < 3.0:
-                    continue  # parent too small — reject (no random placement)
-                nx, nz, nwid, nlen = px + pw - slice_w, pz, slice_w, pl
-                parent["width"] = pw - slice_w
-            else:
-                slice_l = min(nl, pl - MIN_PARENT)
-                if slice_l < 3.0:
-                    continue
-                nx, nz, nwid, nlen = px, pz + pl - slice_l, pw, slice_l
-                parent["length"] = pl - slice_l
-
-            # Attached bath carved from a plain bedroom → promote it to Master.
-            if norm == "bathroom" and parent.get("type", "") == "bedroom":
-                parent["type"] = "master_bedroom"
-                parent["name"] = "Master Bedroom"
-
-            rooms.append({
-                "id": f"{norm}-{len(rooms)+1}",
-                "name": f"New {rtype.replace('_', ' ').title()}",
-                "type": norm,
-                "width": round(nwid, 2),
-                "length": round(nlen, 2),
-                "x": round(nx, 2),
-                "z": round(nz, 2),
-                "wallThicknessIn": 8 if norm in ("kitchen", "bathroom", "utility") else 6,
-                # Keep the new room connected to its donor.  Coordinates are
-                # local to the new room, as expected by the React renderer.
-                "doors": [{
-                    "x": 0 if pw >= pl else round(nwid / 2, 2),
-                    "z": round(nlen / 2, 2) if pw >= pl else 0,
-                    "wall_orientation": "west" if pw >= pl else "north",
-                    "width": min(3.0, nwid * 0.6, nlen * 0.6),
-                    "height": 7.0,
-                }],
-                "windows": [],
-                "floorColor": "",
-                "furnitureColor": "",
-                "wallColor": "",
-                "wallColors": {},
-                "furniture": [],
-                "mep_nodes": [],
-                "connections": [{"target_room": parent.get("type", "corridor"), "weight": 10}],
-            })
-        return rooms
+        if anchor_index == -1:
+            return None
+        return _replan_floor_with_constraint(
+            rooms, None, anchor_index, plot_width, plot_length, add_room_type=norm,
+            add_room_role=bathroom_role,
+        )
 
     # REMOVE intent
     if "remove" in intents or "delete" in intents:
@@ -1716,6 +3080,7 @@ def build_room_changes(
         # If they want to remove a sub-element, DO NOT remove the entire room!
         if "door" not in prompt_lower and "window" not in prompt_lower and "furniture" not in prompt_lower:
             removed_any = False
+            removed_room = None
             # Resolve the target from the room metadata actually present in
             # this plan. This supports arbitrary Gemini-generated room names
             # and prevents a broad extractor result from deleting another room.
@@ -1732,7 +3097,7 @@ def build_room_changes(
                     index, _ = max(candidates, key=lambda pair: float(pair[1].get("z", 0)) + float(pair[1].get("length", 0)))
                 else:
                     index, _ = candidates[0]
-                rooms.pop(index)
+                removed_room = rooms.pop(index)
                 removed_any = True
             
             # Second pass: remove exactly one requested room.  Gemini often
@@ -1763,11 +3128,16 @@ def build_room_changes(
                         index, _ = max(candidates, key=lambda pair: float(pair[1].get("z", 0)) + float(pair[1].get("length", 0)))
                     else:
                         index, _ = candidates[0]
-                    rooms.pop(index)
+                    removed_room = rooms.pop(index)
                     removed_any = True
             
             if len(rooms) != len(current_rooms):
-                return rooms
+                # Deleting an internal courtyard/room must not punch a hole in
+                # the house. Reassign a mergeable rectangular cell, then
+                # rebuild door topology so the former doorway becomes wall.
+                if removed_room is not None:
+                    _absorb_removed_room_cell(rooms, removed_room)
+                return reconcile_modified_rooms(current_rooms, rooms)
     # RESIZE intent
     if "resize" in intents:
         size_delta = 0
@@ -1810,88 +3180,211 @@ def build_room_changes(
 
     # MOVE intent
     if "move" in intents:
-        if not move_target:
-            move_match = re.search(r"(?:move|place|put)?\s*(?:the\s+)?([a-z][a-z\s]+?)\s+(?:near|next\s+to|beside|adjacent\s+to)\s+([a-z][a-z\s]+)", text)
-            if move_match:
-                move_target, move_dest = move_match.group(1).strip(), move_match.group(2).strip()
-        if not move_target and room_types:
-            move_target = room_types[0]
-        if not move_dest:
-            for room in current_rooms:
-                name = str(room.get("name", "")).lower()
-                room_type = str(room.get("type", "")).lower().replace("_", " ")
-                if (name and name in text and name != str(move_target).lower()) or (room_type and room_type in text and room_type != str(move_target).lower().replace("_", " ")):
-                    move_dest = room.get("type", "")
-                    break
-        if not move_target:
+        mentioned_indices = _all_prompt_room_matches(prompt, rooms)
+        target_index = -1
+        if move_target:
+            target_key = canonical_type(move_target)
+            target_index = next((
+                index for index, room in enumerate(rooms)
+                if target_key in {
+                    canonical_type(room.get("id")), canonical_type(room.get("type")), canonical_type(room.get("name")),
+                }
+            ), -1)
+        if target_index == -1 and mentioned_indices:
+            # The first existing room named after the MOVE verb is the subject.
+            move_pos = text.find("move")
+            target_index = next((index for index in mentioned_indices if text.find(str(rooms[index].get("name", "")).lower()) >= move_pos), mentioned_indices[0])
+        if target_index == -1 and room_types:
+            target_key = canonical_type(room_types[0])
+            target_index = next((index for index, room in enumerate(rooms) if canonical_type(room.get("type")) == target_key), -1)
+        if target_index == -1:
             return None
-        target_room_name = move_target.lower().replace(" ", "_")
-        dest_val = move_dest.lower().replace(" ", "_") if move_dest else ""
-        
-        idx_a = -1
-        for i, r in enumerate(rooms):
-            if target_room_name in r.get("type", "").lower() or target_room_name in r.get("name", "").lower():
-                idx_a = i
-                break
-        
-        if idx_a != -1:
-            idx_b = -1
-            # Check if dest_val is another room
-            for i, r in enumerate(rooms):
-                if i != idx_a and (dest_val in r.get("type", "").lower() or dest_val in r.get("name", "").lower()):
-                    idx_b = i
-                    break
-            
-            # If not a room, check if it's a direction like south east
-            if idx_b == -1 and dest_val:
-                min_x = min(r.get("x", 0) for r in rooms)
-                max_x = max(r.get("x", 0) + r.get("width", 1) for r in rooms)
-                min_z = min(r.get("z", 0) for r in rooms)
-                max_z = max(r.get("z", 0) + r.get("length", 1) for r in rooms)
-                
-                target_x, target_z = (min_x + max_x)/2, (min_z + max_z)/2
-                if "south" in dest_val: target_z = max_z
-                elif "north" in dest_val: target_z = min_z
-                if "east" in dest_val: target_x = max_x
-                elif "west" in dest_val: target_x = min_x
-                
-                best_dist = float('inf')
-                for i, r in enumerate(rooms):
-                    if i != idx_a:
-                        cx = r.get("x", 0) + r.get("width", 1)/2
-                        cz = r.get("z", 0) + r.get("length", 1)/2
-                        dist = (cx - target_x)**2 + (cz - target_z)**2
-                        if dist < best_dist:
-                            best_dist = dist
-                            idx_b = i
-                            
-            if idx_b != -1:
-                if _rooms_share_boundary(rooms[idx_a], rooms[idx_b]):
-                    return rooms
-                if _place_room_next_to(rooms, idx_a, idx_b):
-                    return rooms
 
-                # Dense plans have no empty cell to move into. Swap the target
-                # with the closest existing cell that touches the destination;
-                # this preserves the full building envelope and every room.
-                neighbours = [
-                    index for index, candidate in enumerate(rooms)
-                    if index not in (idx_a, idx_b)
-                    and _room_floor_key(candidate) == _room_floor_key(rooms[idx_b])
-                    and _rooms_share_boundary(candidate, rooms[idx_b])
-                ]
-                if neighbours:
-                    target_area = float(rooms[idx_a].get("width", 1)) * float(rooms[idx_a].get("length", 1))
-                    swap_index = min(
-                        neighbours,
-                        key=lambda index: abs(
-                            float(rooms[index].get("width", 1)) * float(rooms[index].get("length", 1)) - target_area
-                        ),
-                    )
-                    _swap_room_cells(rooms, idx_a, swap_index)
-                    return rooms
+        # Every other explicitly named room is a required spatial anchor. This
+        # is what makes a compound command atomic: "beside kitchen" AND
+        # "accessible directly from living" must both be true in the result.
+        anchor_indices = [index for index in mentioned_indices if index != target_index]
+        if move_dest:
+            destination_key = canonical_type(move_dest)
+            destination_index = next((
+                index for index, room in enumerate(rooms)
+                if index != target_index and destination_key in {
+                    canonical_type(room.get("id")), canonical_type(room.get("type")), canonical_type(room.get("name")),
+                }
+            ), -1)
+            if destination_index != -1 and destination_index not in anchor_indices:
+                anchor_indices.insert(0, destination_index)
+
+        # Compass-only moves still use a complete cell swap so the old cell is
+        # filled and the floor remains tessellated.
+        direction_text = canonical_type(move_dest or text)
+        if not anchor_indices and any(direction in direction_text for direction in ("north", "south", "east", "west")):
+            floor_indices = [index for index, room in enumerate(rooms) if index != target_index and _room_floor_key(room) == _room_floor_key(rooms[target_index])]
+            if not floor_indices:
+                return None
+            min_x = min(float(rooms[index].get("x", 0)) for index in floor_indices)
+            max_x = max(float(rooms[index].get("x", 0)) + float(rooms[index].get("width", 1)) for index in floor_indices)
+            min_z = min(float(rooms[index].get("z", 0)) for index in floor_indices)
+            max_z = max(float(rooms[index].get("z", 0)) + float(rooms[index].get("length", 1)) for index in floor_indices)
+            goal_x, goal_z = (min_x + max_x) / 2.0, (min_z + max_z) / 2.0
+            if "east" in direction_text: goal_x = max_x
+            if "west" in direction_text: goal_x = min_x
+            if "south" in direction_text: goal_z = max_z
+            if "north" in direction_text: goal_z = min_z
+            swap_index = min(floor_indices, key=lambda index: (
+                (float(rooms[index].get("x", 0)) + float(rooms[index].get("width", 1)) / 2.0 - goal_x) ** 2
+                + (float(rooms[index].get("z", 0)) + float(rooms[index].get("length", 1)) / 2.0 - goal_z) ** 2
+            ))
+            _swap_room_cells(rooms, target_index, swap_index)
+            return rooms
+        if not anchor_indices:
+            return None
+
+        doorway_indices = [
+            index for index in anchor_indices
+            if canonical_type(rooms[index].get("type")) in {"living_room", "corridor", "hallway", "foyer"}
+        ] if re.search(r"\b(?:access|accessible|entrance|door|doorway|enter|connecting)\b", text) else []
+        if not doorway_indices:
+            doorway_indices = [anchor_indices[0]]
+
+        def meets_minimum(room: Dict[str, Any]) -> bool:
+            minimum = ROOM_MINIMUMS.get(canonical_type(room.get("type")))
+            if not minimum:
+                return True
+            width = float(room.get("width", 0)); length = float(room.get("length", 0))
+            return min(width, length) >= float(minimum.get("min_dim", 0)) - 0.1 and width * length >= float(minimum.get("area", 0)) - 1.0
+
+        def finalize(candidate_rooms: List[Dict[str, Any]]) -> Optional[List[Dict[str, Any]]]:
+            target = candidate_rooms[target_index]
+            if not all(_rooms_share_boundary(target, candidate_rooms[index]) for index in anchor_indices):
+                return None
+            for doorway_index in doorway_indices:
+                if not _ensure_door_between_rooms(target, candidate_rooms[doorway_index]):
+                    return None
+            if "without passing through" in text:
+                for anchor_index in anchor_indices:
+                    if anchor_index not in doorway_indices:
+                        _remove_door_between_rooms(target, candidate_rooms[anchor_index])
+            return candidate_rooms
+
+        already_valid = finalize(copy.deepcopy(rooms))
+        if already_valid is not None:
+            return already_valid
+
+        target_area = float(rooms[target_index].get("width", 1)) * float(rooms[target_index].get("length", 1))
+        protected = {"corridor", "hallway", "staircase", "stairwell"}
+        swap_candidates = [
+            index for index, room in enumerate(rooms)
+            if index != target_index and _room_floor_key(room) == _room_floor_key(rooms[target_index])
+        ]
+        swap_candidates.sort(key=lambda index: (
+            canonical_type(rooms[index].get("type")) in protected,
+            abs(float(rooms[index].get("width", 1)) * float(rooms[index].get("length", 1)) - target_area),
+        ))
+        for swap_index in swap_candidates:
+            candidate_rooms = copy.deepcopy(rooms)
+            _swap_room_cells(candidate_rooms, target_index, swap_index)
+            if not meets_minimum(candidate_rooms[target_index]) or not meets_minimum(candidate_rooms[swap_index]):
+                continue
+            finalized = finalize(candidate_rooms)
+            if finalized is not None:
+                return finalized
+
+        return _replan_floor_with_constraint(
+            rooms, target_index, anchor_indices[0], plot_width, plot_length,
+            additional_anchor_indices=anchor_indices[1:],
+            doorway_anchor_indices=doorway_indices,
+        )
 
     return None
+
+
+def add_storey_to_existing_rooms(
+    current_rooms: List[Dict[str, Any]], prompt: str,
+    ai_program: Optional[Dict[Any, List[Any]]],
+    plot_width: float, plot_length: float,
+) -> Tuple[Optional[List[Dict[str, Any]]], str]:
+    """Add one structured upper floor while preserving existing room identity."""
+    target_level, requested_specs = parse_added_floor_request(prompt, ai_program)
+    if target_level is None:
+        return None, ""
+    if not requested_specs:
+        return None, "No valid upper-floor rooms were identified. Name the rooms required on the new floor."
+
+    working = copy.deepcopy(current_rooms)
+    current_max = max((_room_floor_key(room) for room in working), default=0)
+    if target_level <= current_max:
+        target_level = current_max + 1
+    support_level = target_level - 1
+    support_indices = [index for index, room in enumerate(working) if _room_floor_key(room) == support_level]
+    if not support_indices:
+        return None, f"Floor {support_level} does not exist, so floor {target_level} cannot be supported."
+
+    staircase = next((room for room in working if _room_floor_key(room) == support_level and canonical_type(room.get("type")) == "staircase"), None)
+    if staircase is None:
+        anchor_index = next((
+            index for preferred in ("corridor", "foyer", "living_room")
+            for index in support_indices
+            if canonical_type(working[index].get("type")) == preferred
+        ), -1)
+        if anchor_index < 0:
+            return None, "The supporting floor has no corridor, foyer, or living room where a staircase can open safely."
+        replanned = _replan_floor_with_constraint(
+            working, None, anchor_index, plot_width, plot_length,
+            add_room_type="staircase",
+        )
+        if replanned is None:
+            return None, "A safe staircase could not fit on the supporting floor without invalidating existing rooms."
+        working = replanned
+        staircase = next((room for room in working if _room_floor_key(room) == support_level and canonical_type(room.get("type")) == "staircase"), None)
+    if staircase is None:
+        return None, "Staircase creation failed."
+
+    specs = [normalize_ai_room_spec(spec) for spec in requested_specs]
+    specs = [spec for spec in specs if spec and canonical_type(spec.get("type")) not in {"staircase", "corridor", "circulation", "hallway"}]
+    if not specs:
+        return None, "The upper-floor instruction did not contain a usable room program."
+    specs.extend([
+        {"type": "corridor", "name": "Corridor", "confidence": 100},
+        {"type": "staircase", "name": "Staircase", "confidence": 100},
+    ])
+    type_counts: Dict[str, int] = {}
+    for spec in specs:
+        room_type = canonical_type(spec.get("type"))
+        type_counts[room_type] = type_counts.get(room_type, 0) + 1
+        spec["id"] = f"{room_type}-f{target_level}-{type_counts[room_type]}"
+
+    from cloud_extractor import auto_wire_topology
+    specs = auto_wire_topology(specs)
+    upper_stair_spec = next(spec for spec in specs if canonical_type(spec.get("type")) == "staircase")
+    upper_stair_spec["fixed_rect"] = (
+        float(staircase.get("x", 0)), float(staircase.get("z", 0)),
+        float(staircase.get("width", 0)), float(staircase.get("length", 0)),
+    )
+
+    engine = LayoutEngine(float(plot_width or 40), float(plot_length or 40))
+    engine.skip_furniture_generation = False
+    nodes = engine.generate(specs, restrict_slots=True)
+    apply_requested_room_names(nodes, specs)
+    AdjacencyResolver(nodes).resolve()
+    WindowPlacer(nodes, engine.plot_width, engine.plot_length,
+                 setback_x=engine.setback_x, setback_z=engine.setback_z).place_windows()
+    for node in nodes:
+        node.floorIndex = target_level
+        node.doors = [door for door in node.doors if not getattr(door, "is_main", False)]
+
+    from geometry_validator import GeometryValidator
+    validation = GeometryValidator.validate_post_placement(nodes)
+    if not validation.is_valid:
+        return None, "The requested upper floor failed geometry/accessibility validation: " + "; ".join(validation.errors[:4])
+
+    upper_payload = []
+    for node in nodes:
+        payload = node.to_dict()
+        payload["floorIndex"] = target_level
+        payload["isFloor1"] = target_level == 1
+        upper_payload.append(payload)
+    return working + upper_payload, ""
 
 
 def _preserve_modified_project_rooms(rooms: List[Dict[str, Any]]) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
@@ -1941,6 +3434,46 @@ def _preserve_modified_project_rooms(rooms: List[Dict[str, Any]]) -> Tuple[Dict[
     return layout_data, [room for level in sorted(by_floor) for room in by_floor[level]]
 
 
+def build_edit_advisory_result(
+    req: Any,
+    current_rooms: List[Dict[str, Any]],
+    message: str,
+    report: Any = None,
+    base_response: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Return a safe, non-exceptional result when an edit cannot be applied.
+
+    A physically impossible edit is a design outcome, not an API failure. The
+    existing plan remains authoritative and the UI receives actionable options
+    without falsely claiming that geometry changed.
+    """
+    result = copy.deepcopy(base_response or {})
+    layout_data, _ = _preserve_modified_project_rooms(copy.deepcopy(current_rooms))
+    project = getattr(req, "currentProject", None) or {}
+    plot = project.get("plot", {}) if isinstance(project, dict) else {}
+    layout_params = dict(result.get("layout_params") or {})
+    layout_params.setdefault("plot_width", getattr(req, "width", None) or plot.get("width", 40))
+    layout_params.setdefault("plot_length", getattr(req, "length", None) or plot.get("length", 40))
+    result["layout_params"] = layout_params
+    result["layout_data"] = layout_data
+    result["style"] = copy.deepcopy(result.get("style") or project.get("style", {}))
+    result["replace_project"] = False
+    result["edit_status"] = "not_applied"
+    result["requested_edit"] = str(getattr(req, "prompt", "") or "")
+    result["understood"] = list(result.get("understood") or []) + [
+        "Analyzed the requested modification; the existing layout was preserved safely."
+    ]
+    issues = list(getattr(report, "errors", []) or [])
+    alternatives = list(getattr(report, "alternatives", []) or [])
+    result["warnings"] = list(result.get("warnings") or []) + [message] + issues[:4]
+    result["recommendations"] = alternatives[:4] or [
+        "Increase the plot or affected floor area.",
+        "Reduce the requested room size while keeping minimum usable dimensions.",
+        "Allow nearby rooms to be rearranged.",
+    ]
+    return result
+
+
 def _project_rooms_for_edit(project: Optional[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """Flatten every floor, with the active floor first for ambiguous names."""
     if not project:
@@ -1967,8 +3500,72 @@ def _project_rooms_for_edit(project: Optional[Dict[str, Any]]) -> List[Dict[str,
                     room["isFloor1"] = level == 1
                     rooms.append(room)
         if rooms:
+            id_counts: Dict[str, int] = {}
+            for room in rooms:
+                raw_id = str(room.get("id") or "")
+                if raw_id:
+                    id_counts[raw_id] = id_counts.get(raw_id, 0) + 1
+            # Older duplexes reused IDs independently on every floor. Make
+            # them globally unique for transactions, while retaining the
+            # displayed/legacy ID as a natural-language alias.
+            for room in rooms:
+                raw_id = str(room.get("id") or "")
+                if raw_id and id_counts.get(raw_id, 0) > 1:
+                    level = _room_floor_key(room)
+                    room["legacy_id"] = raw_id
+                    room["id"] = f"{raw_id}-f{level}"
+                    for connection in room.get("connections", []) or []:
+                        if isinstance(connection, dict) and connection.get("target_room_id") in id_counts and id_counts[str(connection.get("target_room_id"))] > 1:
+                            connection["target_room_id"] = f"{connection['target_room_id']}-f{level}"
             return rooms
     return [dict(room) for room in project.get("rooms", []) or [] if isinstance(room, dict)]
+
+
+def build_ai_project_context(project: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    """Build a compact, geometry-aware state for AI modification planning.
+
+    Sending the entire React project obscures the useful signal with materials,
+    UI state, and asset payloads. This context exposes the facts needed for a
+    spatial decision: stable identities, bounds, floor, and actual neighbours.
+    """
+    project = project or {}
+    rooms = _project_rooms_for_edit(project)
+    summaries: List[Dict[str, Any]] = []
+    for room in rooms:
+        room_id = str(room.get("id") or "")
+        neighbours = [
+            str(other.get("id") or other.get("type") or "")
+            for other in rooms
+            if other is not room
+            and _room_floor_key(other) == _room_floor_key(room)
+            and _rooms_share_boundary(room, other)
+        ]
+        summaries.append({
+            "id": room_id,
+            "type": canonical_type(room.get("type")),
+            "name": str(room.get("name") or room.get("type") or "Room"),
+            "floor": _room_floor_key(room),
+            "x": float(room.get("x", 0)),
+            "z": float(room.get("z", 0)),
+            "width": float(room.get("width", 0)),
+            "length": float(room.get("length", 0)),
+            "area_sqft": round(float(room.get("width", 0)) * float(room.get("length", 0)), 2),
+            "neighbours": neighbours,
+            "open_to_sky": bool(room.get("is_outdoor")) or str(room.get("roof_type", "")).lower() == "open",
+        })
+    plot = project.get("plot") or {}
+    return {
+        "plot": {
+            "width": float(plot.get("width", 40) or 40),
+            "length": float(plot.get("length", 40) or 40),
+        },
+        "active_floor": int(project.get("current_floor_index", 0) or 0),
+        "rooms": summaries,
+        "outdoor_areas": [
+            {key: area.get(key) for key in ("id", "type", "name", "x", "z", "width", "length", "floorIndex")}
+            for area in project.get("outdoor_areas", []) or [] if isinstance(area, dict)
+        ],
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -2037,7 +3634,9 @@ async def generate_plan(req: GenerateRequest):
             # so it must flow through the modification pipeline below.
             _log("info", "Routing → HIGH complexity extraction (project-aware)")
             try:
-                slm_result = reason_modifications_deepseek(req.prompt, req.currentProject)
+                slm_result = reason_modifications_deepseek(
+                    req.prompt, build_ai_project_context(req.currentProject)
+                )
                 elapsed = (time.time() - ai_start)*1000
                 _log("success", f"Cloud extraction responded in {elapsed:.0f}ms")
             except Exception as e:
@@ -2047,7 +3646,9 @@ async def generate_plan(req: GenerateRequest):
             # Path B-Low: Local CSP Matrix Solver
             _log("info", "Routing → LOW complexity modification via Gemini")
             try:
-                slm_result = extract_keywords_groq(req.prompt, ALL_VOCABULARIES)
+                slm_result = reason_modifications_deepseek(
+                    req.prompt, build_ai_project_context(req.currentProject)
+                )
                 elapsed = (time.time() - ai_start)*1000
                 _log("success", f"Gemini extraction done in {elapsed:.0f}ms")
             except Exception as e:
@@ -2064,6 +3665,7 @@ async def generate_plan(req: GenerateRequest):
                 _log("error", f"Gemini extraction failed: {e}")
 
         if slm_result:
+            slm_result = apply_spatial_analysis_defaults(slm_result)
             _log("success", f"AI extracted: intent={slm_result.get('intent', '?')}, bhk={slm_result.get('bhk', '?')}, rooms={slm_result.get('target_rooms', [])}, style={slm_result.get('style', '?')}")
             # Map SLM result to the data structures expected by the rest of the pipeline
             layout_params = {}
@@ -2101,6 +3703,12 @@ async def generate_plan(req: GenerateRequest):
 
                 if valid_rooms:
                     layout_params["rooms"] = [{"type": r.replace(" ", "_"), "confidence": 100} for r in valid_rooms]
+            for raw_type in slm_result.get("outdoor_rooms", []) or []:
+                room_type = canonical_type(raw_type)
+                if room_type in _INTERNAL_OPEN_TYPES:
+                    layout_params.setdefault("rooms", []).append(
+                        normalize_ai_room_spec({"type": "courtyard", "name": "Courtyard"})
+                    )
             
             # Roof style extraction from prompt directly
             prompt_lower = req.prompt.lower()
@@ -2116,7 +3724,12 @@ async def generate_plan(req: GenerateRequest):
             # Extract basic numbers like plot width/length using regex just in case
             numbers = extract_numbers(req.prompt)
             for k, v in numbers.items():
-                if k not in layout_params:
+                # Explicit numeric facts in the user's text are authoritative.
+                # This guards against model context drift such as reading 3BHK
+                # as 4BHK or reusing dimensions from an earlier request.
+                if k in {"bhk", "floors", "plot_width", "plot_length", "area_sqft"}:
+                    layout_params[k] = v
+                elif k not in layout_params:
                     layout_params[k] = v
 
             open_matches = re.findall(r'open\s+([a-zA-Z]+)', req.prompt.lower())
@@ -2125,7 +3738,11 @@ async def generate_plan(req: GenerateRequest):
 
             details = {
                 "intents": [{"canonical": slm_result.get("intent", "").lower()}],
-                "rooms": [{"canonical": r.get("type", "").replace(" ", "_"), "confidence": 100} for r in layout_params.get("rooms", [])],
+                "rooms": [
+                    {"canonical": canonical_type(r), "confidence": 100}
+                    for r in slm_result.get("target_rooms", []) or []
+                    if canonical_type(r) and not is_instruction_like_room_label(r)
+                ],
                 "styles": [{"canonical": slm_result.get("style")}] if slm_result.get("style") else [],
                 "materials": [{"canonical": m} for m in slm_result.get("materials", [])],
                 "sizes": [],
@@ -2157,6 +3774,11 @@ async def generate_plan(req: GenerateRequest):
                 "elderly_suite": bool(slm_result.get("elderly_suite")),
                 "foyer":         bool(slm_result.get("foyer")),
                 "brahmasthan":   bool(slm_result.get("brahmasthan")),
+                "angan":         bool(slm_result.get("angan")) or any(
+                    canonical_type(value) in _INTERNAL_OPEN_TYPES
+                    for value in slm_result.get("outdoor_rooms", []) or []
+                ),
+                "double_height": bool(slm_result.get("double_height")),
             }
             # Merge with any Indian options sent from the frontend
             fe_indian = req.indianOptions or {}
@@ -2165,6 +3787,9 @@ async def generate_plan(req: GenerateRequest):
             layout_params["indian_options"] = merged_indian
 
             warnings = []
+            ai_understood, ai_warnings = spatial_analysis_messages(slm_result)
+            understood.extend(ai_understood)
+            warnings.extend(ai_warnings)
         else:
             _log("warn", "AI extraction returned None — falling back to rule-based NLP")
             # Fallback to Old NLP analysis
@@ -2216,7 +3841,8 @@ async def generate_plan(req: GenerateRequest):
             "beige": "#F5F5DC"
         }
         exterior_map = {
-            "mustard": "#E2B838",
+            "ivory": "#FDF5E6",
+            "cream": "#FDF5E6",
             "white": "#FFFFFF",
             "concrete": "#808080",
             "brick": "#B22222",
@@ -2232,7 +3858,7 @@ async def generate_plan(req: GenerateRequest):
         if colors_dict.get("interior") and not theme.get("wall"):
             wall_finish = interior_map.get(colors_dict["interior"], colors_dict["interior"])
 
-        ext_color = theme.get("exterior") or colors_dict.get("exterior", "White")
+        ext_color = theme.get("exterior") or colors_dict.get("exterior", "ivory")
         ext_color = exterior_map.get(ext_color, ext_color)
 
         roof_color = active_preset.get("roof_type", "RCC Slab")
@@ -2282,7 +3908,6 @@ async def generate_plan(req: GenerateRequest):
             mep_adds = slm_result.get("mep_additions", []) if slm_result else []
             if mep_adds and slm_result.get("intent") == "MODIFY_MEP":
                 _log("info", f"MEP modification detected: adding {len(mep_adds)} item(s)")
-                import copy
                 updated_rooms = copy.deepcopy(current_rooms)
                 for addition in mep_adds:
                     target = addition.get("room", "").lower()
@@ -2318,12 +3943,41 @@ async def generate_plan(req: GenerateRequest):
                 req.prompt, current_rooms, details.get("intents", []),
                 valid_rooms_spec, details.get("sizes", []),
                 details.get("move_target", ""), details.get("move_dest", ""),
+                req.width or 40.0, req.length or 40.0,
             )
+
+            edit_report = None
+            if modified_rooms is not None:
+                modified_rooms, edit_report = evaluate_modified_room_transaction(
+                    req.prompt, current_rooms, modified_rooms,
+                    req.width or 40.0, req.length or 40.0, slm_result,
+                )
 
             if modified_rooms is not None:
                 _log("success", f"build_room_changes returned {len(modified_rooms)} room(s)")
             else:
                 _log("warn", "build_room_changes returned None (no structural change detected)")
+                if edit_report is not None:
+                    return build_edit_advisory_result(
+                        req, current_rooms, edit_rejection_message(edit_report), edit_report, response,
+                    )
+                structural_intents = {
+                    str(item.get("canonical", "")).lower()
+                    for item in details.get("intents", []) if isinstance(item, dict)
+                }
+                if structural_intents.intersection({"add", "move", "remove", "delete", "resize"}):
+                    ai_reason = str((slm_result or {}).get("analysis_summary") or "").strip()
+                    blockers = (slm_result or {}).get("blocking_constraints", []) or []
+                    explanation = ai_reason or "; ".join(str(item) for item in blockers[:3])
+                    return build_edit_advisory_result(
+                        req, current_rooms,
+                        (
+                            "The requested layout change could not satisfy geometry and adjacency constraints; "
+                            "the existing plan was left unchanged."
+                            + (f" Analysis: {explanation}" if explanation else "")
+                        ),
+                        base_response=response,
+                    )
 
             # Fix 2: Preserve colors when modifying rooms
             if modified_rooms:
@@ -2617,6 +4271,7 @@ async def generate_plan(req: GenerateRequest):
                 layout_params["plot_width"] = plot_w
                 layout_params["plot_length"] = plot_l
                 layout_params["area_sqft"] = int(plot_w * plot_l)
+                warnings.extend(space_recommendations(layout_params["rooms"], plot_w, plot_l))
 
                 if "engine" not in locals():
                      engine = LayoutEngine(plot_w, plot_l, colors=colors_dict)
@@ -2996,6 +4651,7 @@ async def generate_from_template(req: TemplateRequest):
         template_warnings = validate_layout(generated_nodes_0)
         from geometry_validator import GeometryValidator
         template_warnings.extend(GeometryValidator.validate_post_placement(generated_nodes_0).errors)
+        template_warnings.extend(space_recommendations(template.get("rooms", []), req.width, req.length))
         
         shared_walls_0 = compute_shared_walls(generated_nodes_0)
         layout_data["floor_0"] = [n.to_dict() for n in generated_nodes_0]
@@ -3074,6 +4730,7 @@ async def generate_from_template(req: TemplateRequest):
             "environment": "sunset",
             "lighting": "warm",
             "accentColor": "#10b981", # default emerald
+            "exteriorColor": "#FDF5E6",
         }
         
         colors_dict = req.colors or {}
@@ -3099,7 +4756,8 @@ async def generate_from_template(req: TemplateRequest):
             "beige": "#F5F5DC"
         }
         exterior_map = {
-            "mustard": "#E2B838",
+            "ivory": "#FDF5E6",
+            "cream": "#FDF5E6",
             "white": "#FFFFFF",
             "concrete": "#808080",
             "brick": "#B22222",
@@ -3123,6 +4781,10 @@ async def generate_from_template(req: TemplateRequest):
             template_warnings = list(template_warnings) + template_validation["issues"]
 
         response = {
+            # A template is always a brand-new design session. Clients must
+            # replace their project state instead of merging these rooms into
+            # the previously displayed house.
+            "replace_project": True,
             "layout_params": layout_params,
             "understood": understood,
             "warnings": template_warnings,
@@ -3197,6 +4859,45 @@ def _noop_emit(*_args, **_kwargs):
 
 def _stream_generate_work(req: "GenerateRequest", emit_fn: Callable) -> None:
     """Run full generate-plan logic, pushing SSE dicts to emit_fn."""
+    generation_started = time.monotonic()
+    generation_budget_seconds = max(10.0, float(os.getenv("GENERATION_BUDGET_SECONDS", "30")))
+    generation_deadline = generation_started + generation_budget_seconds
+    debug_trace: List[Dict[str, str]] = []
+
+    def trace(message: str, level: str = "info") -> None:
+        debug_trace.append({
+            "type": level,
+            "message": message,
+            "time": f"{(time.monotonic() - generation_started):.2f}s",
+        })
+        getattr(logger, "warning" if level == "warn" else "info")("[GEN TRACE] %s", message)
+
+    def type_counts(items: Iterable[Any]) -> Dict[str, int]:
+        from collections import Counter
+        return dict(Counter(
+            _program_room_class(item.get("type") if isinstance(item, dict) else getattr(item, "type", ""))
+            for item in items or []
+        ))
+
+    def node_bounds(items: Iterable[RoomNode]) -> Optional[Dict[str, float]]:
+        nodes = list(items or [])
+        if not nodes:
+            return None
+        return {
+            "min_x": round(min(node.rect.x for node in nodes), 2),
+            "min_z": round(min(node.rect.z for node in nodes), 2),
+            "max_x": round(max(node.rect.x + node.rect.width for node in nodes), 2),
+            "max_z": round(max(node.rect.z + node.rect.length for node in nodes), 2),
+        }
+
+    def require_generation_budget(stage: str, reserve_seconds: float = 0.0) -> None:
+        remaining = generation_deadline - time.monotonic()
+        if remaining < reserve_seconds:
+            raise TimeoutError(
+                f"Generation stopped at {stage} to respect the {generation_budget_seconds:.0f}-second limit. "
+                "Try fewer rooms, one floor, or a larger plot."
+            )
+
     def emit(stage: int, label: str, substage: str = ""):
         emit_fn({"stage": stage, "label": label, "substage": substage})
 
@@ -3212,7 +4913,13 @@ def _stream_generate_work(req: "GenerateRequest", emit_fn: Callable) -> None:
         # works for arbitrary Gemini-generated spaces without a hardcoded room
         # catalogue. Ambiguous/add/style requests continue to AI extraction.
         prompt_lower = req.prompt.lower()
-        existing_rooms = _project_rooms_for_edit(req.currentProject)
+        request_mode = str(req.requestMode or "").strip().lower()
+        existing_rooms = [] if request_mode == "create" else _project_rooms_for_edit(req.currentProject)
+        logger.info(
+            "[REQUEST MODE] mode=%s existing_rooms_visible_to_analyzer=%d",
+            request_mode or "auto", len(existing_rooms),
+        )
+        trace(f"Request mode={request_mode or 'auto'}; existing rooms supplied to analyzer={len(existing_rooms)}")
         has_targeted_action = bool(re.search(
             r"\b(?:remove|delete|increase|bigger|larger|expand|decrease|smaller|reduce|shrink|move|place|put)\b",
             prompt_lower,
@@ -3221,12 +4928,26 @@ def _stream_generate_work(req: "GenerateRequest", emit_fn: Callable) -> None:
             r"\b(?:color|colour|paint|exterior|interior|facade|roof)\b",
             prompt_lower,
         ))
-        edits_sub_element = bool(re.search(r"\b(?:door|window|furniture|light|wiring|plumbing)\b", prompt_lower))
-        if existing_rooms and has_targeted_action and not has_combined_style_action and not edits_sub_element:
-            fast_modified = build_room_changes(req.prompt, existing_rooms, [], [], [])
+        named_room_indices = _all_prompt_room_matches(req.prompt, existing_rooms) if existing_rooms else []
+        has_room_geometry_request = bool(named_room_indices) and bool(re.search(
+            r"\b(?:room|near|beside|adjacent|position|behind|access|entrance|doorway|connecting)\b",
+            prompt_lower,
+        ))
+        if existing_rooms and has_targeted_action and has_room_geometry_request and not has_combined_style_action:
+            project_plot = (req.currentProject or {}).get("plot", {})
+            fast_modified = build_room_changes(
+                req.prompt, existing_rooms, [], [], [],
+                plot_width=req.width or project_plot.get("width", 40),
+                plot_length=req.length or project_plot.get("length", 40),
+            )
+            if fast_modified is not None:
+                fast_modified, fast_report = evaluate_modified_room_transaction(
+                    req.prompt, existing_rooms, fast_modified,
+                    req.width or project_plot.get("width", 40),
+                    req.length or project_plot.get("length", 40),
+                )
             if fast_modified is not None:
                 layout_data, _ = _preserve_modified_project_rooms(fast_modified)
-                project_plot = (req.currentProject or {}).get("plot", {})
                 result = {
                     "layout_params": {
                         "plot_width": req.width or project_plot.get("width", 40),
@@ -3239,11 +4960,21 @@ def _stream_generate_work(req: "GenerateRequest", emit_fn: Callable) -> None:
                 }
                 emit_fn({"done": True, "result": result})
                 return
+            elif 'fast_report' in locals():
+                emit_fn({"done": True, "result": build_edit_advisory_result(
+                    req, existing_rooms, edit_rejection_message(fast_report), fast_report,
+                )})
+                return
 
         slm_result = None
         if USE_SLM_ENGINE:
             try:
-                slm_result = extract_keywords_to_json(req.prompt, ALL_VOCABULARIES)
+                if existing_rooms:
+                    slm_result = reason_modifications_deepseek(
+                        req.prompt, build_ai_project_context(req.currentProject)
+                    )
+                else:
+                    slm_result = extract_keywords_to_json(req.prompt, ALL_VOCABULARIES)
             except Exception as slm_e:
                 logger.error("SLM Extraction Failed: %s", slm_e)
                 slm_result = None
@@ -3251,6 +4982,7 @@ def _stream_generate_work(req: "GenerateRequest", emit_fn: Callable) -> None:
         warnings: List[str] = []
 
         if slm_result:
+            slm_result = apply_spatial_analysis_defaults(slm_result)
             layout_params: Dict[str, Any] = {}
             if slm_result.get("bhk"):
                 layout_params["bhk"] = slm_result["bhk"]
@@ -3262,6 +4994,9 @@ def _stream_generate_work(req: "GenerateRequest", emit_fn: Callable) -> None:
             seen_types = set()
             
             for r in slm_result.get("target_rooms", []):
+                if is_instruction_like_room_label(r):
+                    logger.warning("[SEMANTIC GUARD] Ignored instruction-shaped target room: %s", r)
+                    continue
                 room_str = r.lower().replace("_", " ")
                 if room_str in prompt_lower.replace("_", " ") or room_str.replace(" ", "") in prompt_lower.replace(" ", ""):
                     r_clean = r.replace(" ", "_").lower()
@@ -3306,11 +5041,75 @@ def _stream_generate_work(req: "GenerateRequest", emit_fn: Callable) -> None:
                 if k not in layout_params:
                     layout_params[k] = v
 
-            explicit_program = extract_explicit_floor_program(req.prompt, layout_params.get("rooms", []))
+            # Explicit floor headings are the user's strongest contract.  The
+            # semantic model remains primary for free-form prompts, while this
+            # compiler prevents a timeout/partial response from silently
+            # replacing a detailed multi-floor program with a template.
+            explicit_program = {}
+            written_program = extract_explicit_floor_program(req.prompt, layout_params.get("rooms", []))
+            gemini_program = slm_result.get("floor_program") if isinstance(slm_result, dict) else None
+            for level, raw_specs in normalize_floor_program_payload(gemini_program).items():
+                normalized_specs = []
+                for raw_spec in raw_specs:
+                    normalized = normalize_ai_room_spec(raw_spec)
+                    if normalized:
+                        normalized_specs.append(normalized)
+                if normalized_specs:
+                    explicit_program[level] = normalized_specs
+            if written_program:
+                if explicit_program and {
+                    level: [_program_room_class(spec.get("type")) for spec in specs]
+                    for level, specs in explicit_program.items()
+                } != {
+                    level: [_program_room_class(spec.get("type")) for spec in specs]
+                    for level, specs in written_program.items()
+                }:
+                    warnings.append("The written per-floor room schedule overrode a conflicting AI extraction.")
+                explicit_program = written_program
             if explicit_program:
+                source = "written floor schedule" if written_program else "Gemini floor program"
+                trace(
+                    f"Accepted {source}: " + "; ".join(
+                        f"floor {level}={type_counts(specs)}" for level, specs in sorted(explicit_program.items())
+                    )
+                )
+            explicit_program = ensure_internal_open_spaces(explicit_program, slm_result)
+            if explicit_program:
+                # Architectural completeness guard for model-produced floor
+                # programs. Preserve all arbitrary rooms, while adding only
+                # the universal house/circulation spaces required to make the
+                # requested levels enterable and usable.
+                ground_specs = explicit_program.setdefault(0, [])
+                ground_types = {canonical_type(spec.get("type")) for spec in ground_specs}
+                if int(layout_params.get("bhk", 0) or 0) > 0:
+                    for core_type in ("living_room", "kitchen"):
+                        if core_type not in ground_types:
+                            ground_specs.append({"type": core_type, "name": core_type.replace("_", " "), "confidence": 100})
+                            ground_types.add(core_type)
+                if len(explicit_program) > 1:
+                    for level in range(0, max(explicit_program) + 1):
+                        level_specs = explicit_program.setdefault(level, [])
+                        level_types = {canonical_type(spec.get("type")) for spec in level_specs}
+                        if "staircase" not in level_types:
+                            level_specs.append({"type": "staircase", "name": "Staircase", "confidence": 100})
+                        circulation_types = {"corridor", "circulation", "hallway", "foyer", "lobby", "passage"}
+                        if not level_types.intersection(circulation_types):
+                            level_specs.append({"type": "corridor", "name": "Corridor", "confidence": 100})
                 layout_params["floor_program"] = explicit_program
                 layout_params["rooms"] = [spec for level in sorted(explicit_program) for spec in explicit_program[level]]
                 layout_params["floors"] = max(layout_params.get("floors", 1), max(explicit_program) + 1)
+            elif isinstance(slm_result, dict) and isinstance(slm_result.get("floors"), int):
+                # Trust an inferred multi-floor count only when Gemini also
+                # supplied a floor program or the prompt actually discusses
+                # levels. This prevents an unrelated prior floor count from
+                # leaking into a simple new-house request.
+                has_level_language = bool(re.search(
+                    r"\b(?:floor|floors|storey|storeys|story|stories|level|levels|duplex|triplex|basement|terrace|rooftop|upstairs|downstairs)\b",
+                    req.prompt.lower(),
+                ))
+                inferred_floors = max(1, int(slm_result["floors"]))
+                if inferred_floors == 1 or has_level_language:
+                    layout_params["floors"] = max(layout_params.get("floors", 1), inferred_floors)
 
             open_matches = re.findall(r'open\s+([a-zA-Z]+)', prompt_lower)
             if open_matches:
@@ -3323,6 +5122,10 @@ def _stream_generate_work(req: "GenerateRequest", emit_fn: Callable) -> None:
                 "elderly_suite": bool(slm_result.get("elderly_suite")),
                 "foyer":         bool(slm_result.get("foyer")),
                 "brahmasthan":   bool(slm_result.get("brahmasthan")),
+                "angan":         bool(slm_result.get("angan")) or any(
+                    canonical_type(value) in _INTERNAL_OPEN_TYPES
+                    for value in slm_result.get("outdoor_rooms", []) or []
+                ),
             }
             fe_indian = req.indianOptions or {}
             merged_indian = {k: (indian_from_slm.get(k, False) or fe_indian.get(k, False))
@@ -3330,9 +5133,20 @@ def _stream_generate_work(req: "GenerateRequest", emit_fn: Callable) -> None:
             layout_params["indian_options"] = merged_indian
 
             understood = [f"Configuration: {slm_result['bhk']}BHK"] if slm_result.get("bhk") else []
+            ai_understood, ai_warnings = spatial_analysis_messages(slm_result)
+            understood.extend(ai_understood)
+            warnings.extend(ai_warnings)
             details = {
                 "intents": [{"canonical": slm_result.get("intent", "").lower()}],
-                "rooms": [{"canonical": r.get("type", "").replace(" ", "_"), "confidence": 100} for r in layout_params.get("rooms", [])],
+                # Edit targets must come from target_rooms, not the complete
+                # floor program. Otherwise ADD dining_room is misread as ADD
+                # every existing room, and a generic program type can become
+                # a literal room named "room".
+                "rooms": [
+                    {"canonical": canonical_type(r), "confidence": 100}
+                    for r in slm_result.get("target_rooms", []) or []
+                    if canonical_type(r)
+                ],
                 "styles": [],
                 "materials": [],
                 "sizes": [],
@@ -3376,7 +5190,7 @@ def _stream_generate_work(req: "GenerateRequest", emit_fn: Callable) -> None:
         
         style_out = {
             "wallFinish":      active_preset.get("wall_material", "AAC Block"),
-            "exteriorColor":   colors_dict.get("exterior", "White"),
+            "exteriorColor":   colors_dict.get("exterior", "ivory"),
             "accentColor":     theme.get("accent") or "#10b981",
             "roofStyle":       colors_dict.get("roof", "terracotta"),
             "windows":         active_preset.get("windows", "UPVC"),
@@ -3395,9 +5209,36 @@ def _stream_generate_work(req: "GenerateRequest", emit_fn: Callable) -> None:
         }
 
         # Handle modification of existing project
-        current_rooms: List[Dict] = _project_rooms_for_edit(req.currentProject)
+        floor_extension_level, _ = parse_added_floor_request(
+            req.prompt, (slm_result or {}).get("floor_program") if isinstance(slm_result, dict) else None,
+        )
+        is_fresh_create = request_mode == "create" or (
+            str((slm_result or {}).get("intent", "")).upper() == "CREATE"
+            and not (req.currentProject and floor_extension_level is not None)
+        )
+        current_rooms: List[Dict] = [] if is_fresh_create else _project_rooms_for_edit(req.currentProject)
 
         if current_rooms:
+            add_floor_level = floor_extension_level
+            if add_floor_level is not None:
+                require_generation_budget("upper-floor extension", 9.0)
+                project_plot = (req.currentProject or {}).get("plot", {})
+                storey_rooms, storey_error = add_storey_to_existing_rooms(
+                    current_rooms, req.prompt,
+                    (slm_result or {}).get("floor_program") if isinstance(slm_result, dict) else None,
+                    req.width or project_plot.get("width", 40),
+                    req.length or project_plot.get("length", 40),
+                )
+                if storey_rooms is None:
+                    emit_fn({"error": storey_error or "The requested upper floor could not be generated safely."})
+                    return
+                response["layout_data"], _ = _preserve_modified_project_rooms(storey_rooms)
+                response["layout_params"]["floors"] = max(_room_floor_key(room) for room in storey_rooms) + 1
+                response["understood"].append(
+                    f"Added floor {add_floor_level} with the requested rooms and aligned staircase access"
+                )
+                emit_fn({"done": True, "result": response})
+                return
             if attach_requested_outdoor_areas(
                 response, current_rooms, req.prompt,
                 req.width or 40.0, req.length or 40.0,
@@ -3407,7 +5248,6 @@ def _stream_generate_work(req: "GenerateRequest", emit_fn: Callable) -> None:
                 return
             mep_adds = slm_result.get("mep_additions", []) if slm_result else []
             if mep_adds and slm_result.get("intent") == "MODIFY_MEP":
-                import copy
                 updated_rooms = copy.deepcopy(current_rooms)
                 for addition in mep_adds:
                     target = addition.get("room", "").lower()
@@ -3428,9 +5268,35 @@ def _stream_generate_work(req: "GenerateRequest", emit_fn: Callable) -> None:
                 req.prompt, current_rooms,
                 details.get("intents", []), details.get("rooms", []), details.get("sizes", []),
                 details.get("move_target", ""), details.get("move_dest", ""),
+                req.width or 40.0, req.length or 40.0,
             )
+            edit_report = None
+            if modified_rooms is not None:
+                modified_rooms, edit_report = evaluate_modified_room_transaction(
+                    req.prompt, current_rooms, modified_rooms,
+                    req.width or 40.0, req.length or 40.0, slm_result,
+                )
+                if modified_rooms is None:
+                    emit_fn({"done": True, "result": build_edit_advisory_result(
+                        req, current_rooms, edit_rejection_message(edit_report), edit_report, response,
+                    )})
+                    return
             if modified_rooms is None and "bhk" in layout_params and str(slm_result.get("intent", "")).upper() == "CREATE" and bool(re.search(r"\b(?:generate|create|build|design|start\s+over|new\s+house)\b", req.prompt, re.I)):
                 current_rooms = []
+            elif modified_rooms is None and current_rooms and str((slm_result or {}).get("intent", "")).upper() in {"ADD", "MOVE", "REMOVE", "RESIZE"}:
+                ai_reason = str((slm_result or {}).get("analysis_summary") or "").strip()
+                blockers = (slm_result or {}).get("blocking_constraints", []) or []
+                explanation = ai_reason or "; ".join(str(item) for item in blockers[:3])
+                emit_fn({"done": True, "result": build_edit_advisory_result(
+                    req, current_rooms,
+                    (
+                        "The requested layout change could not satisfy room identity, geometry, and adjacency constraints. "
+                        "The existing plan was left unchanged."
+                        + (f" Analysis: {explanation}" if explanation else "")
+                    ),
+                    base_response=response,
+                )})
+                return
             elif modified_rooms is None and current_rooms:
                 # 1. Figure out which color the user wants
                 target_color = details.get("global_color") or details.get("color_hex")
@@ -3557,6 +5423,8 @@ def _stream_generate_work(req: "GenerateRequest", emit_fn: Callable) -> None:
         base_rooms: List[Dict] = []
         explicit_program = layout_params.get("floor_program") or {}
         if explicit_program:
+            explicit_program = apply_floor_bathroom_roles(explicit_program, req.prompt)
+            layout_params["floor_program"] = explicit_program
             base_rooms = [spec for level in sorted(explicit_program) for spec in explicit_program[level]]
         elif bhk_val > 0:
             base_rooms = get_base_rooms_for_bhk(bhk_val)
@@ -3582,11 +5450,13 @@ def _stream_generate_work(req: "GenerateRequest", emit_fn: Callable) -> None:
 
         # FIX: Missing Bathrooms Injection
         bhk_val = layout_params.get("bhk", sum(1 for r in layout_params["rooms"] if "bedroom" in r.get("type", "")))
-        if bhk_val > 0:
+        if bhk_val > 0 and not explicit_program:
             bath_count = sum(1 for r in layout_params["rooms"] if "bath" in r.get("type", "").lower() or "toilet" in r.get("type", "").lower())
-            if bath_count < bhk_val:
-                for _ in range(bhk_val - bath_count):
-                    layout_params["rooms"].append({"type": "bathroom", "confidence": 100})
+            # BHK is a bedroom count, not a bathroom count. Preserve the
+            # explicit bathroom cardinality; only supply one basic bathroom
+            # when an otherwise generated program omitted bathrooms entirely.
+            if bath_count == 0:
+                layout_params["rooms"].append({"type": "bathroom", "confidence": 100})
 
         _prompt_l = (req.prompt or "").lower()
         _pooja_ok = bool(layout_params.get("indian_options", {}).get("pooja_room")) or \
@@ -3604,7 +5474,18 @@ def _stream_generate_work(req: "GenerateRequest", emit_fn: Callable) -> None:
         prompt_lower = req.prompt.lower()
         if any(kw in prompt_lower for kw in ["stair", "upstair", "first floor", "second floor", "duplex"]):
             floors = max(floors, 2)
-            
+        # The UI floor selector is optional; natural-language floor programs
+        # must still control generation.  Infer the highest requested level
+        # from phrases such as "Ground + First + Second floors".
+        floor_levels = {"ground": 0, "first": 1, "second": 2, "third": 3,
+                        "fourth": 4, "fifth": 5}
+        mentioned_levels = [floor_levels[word] for word in floor_levels
+                            if re.search(rf"\b{word}\s+floor\b", prompt_lower)]
+        if mentioned_levels:
+            floors = max(floors, max(mentioned_levels) + 1)
+        elif re.search(r"\bground\s*\+\s*first\s*\+\s*second\b", prompt_lower):
+            floors = max(floors, 3)
+
         # Wire topology on the final list of rooms to guarantee graph/door semantics!
         from cloud_extractor import auto_wire_topology
         layout_params["rooms"] = auto_wire_topology(layout_params["rooms"], ai_categories=slm_result or {})
@@ -3633,6 +5514,10 @@ def _stream_generate_work(req: "GenerateRequest", emit_fn: Callable) -> None:
             warnings.extend(val_warns)
             layout_params["rooms"] = validated_rooms
         layout_params.update({"plot_width": plot_w, "plot_length": plot_l, "area_sqft": int(plot_w * plot_l)})
+        warnings.extend(space_recommendations(layout_params["rooms"], plot_w, plot_l))
+        area_budget = calculate_area_budget(layout_params["rooms"], plot_w, plot_l, floors)
+        layout_params["area_budget"] = area_budget
+        emit_fn({"capacity": area_budget})
 
         emit(2, "Generating Plot Boundary...", f"Plot {int(plot_w)}×{int(plot_l)} ft · setbacks & orientation")
 
@@ -3648,10 +5533,52 @@ def _stream_generate_work(req: "GenerateRequest", emit_fn: Callable) -> None:
         floor_specs_by_level: Dict[int, List[Dict]] = {}
         if floor_program:
             outdoor_specs, basement_specs = [], []
+            floor_outdoor_types: set[str] = set()
+            ai_outdoor_types = {canonical_type(value) for value in (slm_result or {}).get("outdoor_rooms", []) or []}
             for level, specs in floor_program.items():
-                indoor_specs, level_outdoor = split_outdoor_specs(specs)
-                floor_specs_by_level[int(level)] = sort_spec_by_generation_order(indoor_specs)
-                outdoor_specs.extend(level_outdoor)
+                normalized_specs = []
+                level_outdoor_types = set(ai_outdoor_types)
+                # A room explicitly placed inside floor_program belongs to
+                # that building level even when it is open-air (balcony,
+                # terrace, custom sky court, etc.). Site-only areas are those
+                # listed in outdoor_rooms but absent from every floor program.
+                for spec in specs:
+                    normalized = normalize_ai_room_spec(spec) or dict(spec)
+                    # A visible main entrance is added to the living room by
+                    # the entrance placer. Do not accept an extra AI-invented
+                    # entry/foyer room unless the user actually requested it.
+                    normalized_type = canonical_type(normalized.get("type"))
+                    if normalized_type in {"entry", "entrance", "foyer"} and not re.search(
+                        r"\b(?:entry|entrance\s+foyer|foyer)\b", req.prompt.lower(),
+                    ):
+                        logger.info("[SEMANTIC GUARD] Removed unrequested optional room: %s", normalized_type)
+                        continue
+                    if canonical_type(normalized.get("type")) in {"circulation", "lobby", "passage", "hallway"}:
+                        normalized["type"] = "corridor"
+                        normalized["name"] = "Corridor"
+                    elif canonical_type(normalized.get("type")) in {"staircase", "stairwell"}:
+                        normalized["type"] = "staircase"
+                        normalized["name"] = "Staircase"
+                    if canonical_type(normalized.get("type")) in ai_outdoor_types:
+                        normalized["is_outdoor"] = True
+                        normalized["roof_type"] = "open"
+                    if normalized.get("is_outdoor") or str(normalized.get("roof_type", "")).lower() == "open":
+                        level_outdoor_types.add(canonical_type(normalized.get("type")))
+                        floor_outdoor_types.add(canonical_type(normalized.get("type")))
+                    normalized_specs.append(normalized)
+                wired_specs = auto_wire_topology(normalized_specs, ai_categories=slm_result or {})
+                wired_specs = apply_floor_outdoor_connections(wired_specs, level_outdoor_types, req.prompt)
+                wired_specs = apply_courtyard_and_suite_relationships(wired_specs, req.prompt)
+                wired_specs = apply_prompt_proximities(wired_specs, req.prompt)
+                floor_specs_by_level[int(level)] = sort_spec_by_generation_order(wired_specs)
+            # Non-courtyard outdoor classifications are site layers. Keep
+            # them even when Gemini's floor_program omitted them.
+            existing_outdoor = {canonical_type(spec.get("type")) for spec in outdoor_specs} | floor_outdoor_types
+            for raw_type in (slm_result or {}).get("outdoor_rooms", []) or []:
+                room_type = canonical_type(raw_type)
+                if room_type and room_type not in _INTERNAL_OPEN_TYPES and room_type not in existing_outdoor:
+                    outdoor_specs.append({"type": room_type, "name": room_type.replace("_", " "), "is_outdoor": True})
+                    existing_outdoor.add(room_type)
             floor_0_rooms = floor_specs_by_level.get(0, [])
             first_spec = floor_specs_by_level.get(1, [])
             room_pool = [spec for specs in floor_specs_by_level.values() for spec in specs]
@@ -3673,12 +5600,16 @@ def _stream_generate_work(req: "GenerateRequest", emit_fn: Callable) -> None:
         logger.info("[ZERO-STATIC] Bypassing Gemini Stage 2 coordinates (slow/redundant). Routing directly to high-speed CP Solver.")
 
         # ─── GEOMETRIC GENERATION & VALIDATION PIPELINE (RETRY LOOP) ───
-        max_attempts = 3
+        # One bounded geometry pass keeps end-to-end creation below the 30 s
+        # product budget. CP-SAT already has a deterministic fallback; repeating
+        # both floors used to multiply slow furniture/API work to 2+ minutes.
+        max_attempts = 1
         generated_nodes_0 = []
         generated_nodes_1 = []
         layout_data = {}
 
         for attempt in range(max_attempts):
+            require_generation_budget("geometry planning", 9.0 if floors > 1 else 4.5)
             logger.info(f"[PIPELINE] Attempt {attempt + 1}/{max_attempts} to generate valid layout...")
             
             # Inject attempt parameter into rooms to trigger CP-SAT seed variation
@@ -3701,11 +5632,61 @@ def _stream_generate_work(req: "GenerateRequest", emit_fn: Callable) -> None:
                 _req_types = requested_type_set(layout_params["rooms"], indian_opts)
                 enforce_requested_only(generated_nodes_0, _req_types)
 
+                fidelity_0 = floor_program_fidelity_errors(generated_nodes_0, floor_0_rooms, 0)
+                if fidelity_0:
+                    present_ids = {str(node.id) for node in generated_nodes_0}
+                    present_counts = type_counts(generated_nodes_0)
+                    consumed: Dict[str, int] = {}
+                    unplaced_rooms = []
+                    for spec in floor_0_rooms:
+                        room_class = _program_room_class(spec.get("type"))
+                        consumed[room_class] = consumed.get(room_class, 0) + 1
+                        if (
+                            str(spec.get("id") or "") not in present_ids
+                            and consumed[room_class] > present_counts.get(room_class, 0)
+                        ):
+                            unplaced_rooms.append({
+                                "id": spec.get("id"),
+                                "type": canonical_type(spec.get("type")),
+                                "name": spec.get("name") or canonical_type(spec.get("type")).replace("_", " ").title(),
+                                "floor": 0,
+                            })
+                    partial_layout = {
+                        "floor_0": [node.to_dict() for node in generated_nodes_0],
+                        "walls_floor_0": compute_shared_walls(generated_nodes_0),
+                        "mep_data": compute_mep_heuristics(generated_nodes_0),
+                        "indianOptions": indian_opts,
+                    }
+                    response.update({
+                        "layout_data": partial_layout,
+                        "area_budget": layout_params.get("area_budget"),
+                        "unplaced_rooms": unplaced_rooms,
+                        "generation_status": "partial",
+                        "replace_project": is_fresh_create,
+                        "validation": {"ok": False, "issues": fidelity_0},
+                        "recommendations": [
+                            "Add a second floor and move suitable private rooms upstairs.",
+                            f"Increase the plot toward {layout_params['area_budget']['recommended_plot']['width']}×{layout_params['area_budget']['recommended_plot']['length']} ft.",
+                            "Optimize the program by removing the lowest-priority optional spaces.",
+                        ],
+                        "warnings": warnings + fidelity_0,
+                        "logs": debug_trace,
+                    })
+                    emit_fn({"done": True, "result": response})
+                    return
+                trace(
+                    f"Floor 0 generated: requested={type_counts(floor_0_rooms)}; "
+                    f"realized={type_counts(generated_nodes_0)}; bounds={node_bounds(generated_nodes_0)}"
+                )
+
                 ArchitecturalRules.optimize_wet_walls(generated_nodes_0)
                 arch_warnings = ArchitecturalRules.validate_rules(generated_nodes_0)
                 AdjacencyResolver(generated_nodes_0, open_rooms=layout_params.get("open_rooms", [])).resolve()
                 WindowPlacer(generated_nodes_0, engine.plot_width, engine.plot_length,
                              setback_x=engine.setback_x, setback_z=engine.setback_z).place_windows()
+                courtyard_window_count = place_courtyard_facing_windows(generated_nodes_0, req.prompt)
+                if any(canonical_type(spec.get("type")) == "courtyard" for spec in floor_0_rooms):
+                    trace(f"Courtyard-facing windows placed={courtyard_window_count}")
                 
                 # Post-placement validation Floor 0
                 from geometry_validator import GeometryValidator
@@ -3716,7 +5697,10 @@ def _stream_generate_work(req: "GenerateRequest", emit_fn: Callable) -> None:
                     if attempt < max_attempts - 1:
                         continue  # Retry!
                     else:
-                        logger.info("[PIPELINE] Floor 0 repair retries exhausted; continuing with the last finite layout.")
+                        raise RuntimeError(
+                            "Floor 0 failed geometry/accessibility validation after repair retries: "
+                            + "; ".join(val_0.errors[:8])
+                        )
 
                 # Initialize layout_data
                 shared_walls_0 = compute_shared_walls(generated_nodes_0)
@@ -3733,6 +5717,7 @@ def _stream_generate_work(req: "GenerateRequest", emit_fn: Callable) -> None:
 
                 # Generate Floor 1 if Duplex
                 if floors > 1:
+                    require_generation_budget("upper-floor planning", 4.5)
                     logger.info("[PIPELINE] Generating Floor 1 (Duplex)...")
                     blocked_zones = []
                     staircase = next((n for n in generated_nodes_0 if n.type == "staircase"), None)
@@ -3740,7 +5725,6 @@ def _stream_generate_work(req: "GenerateRequest", emit_fn: Callable) -> None:
                     if living_dh:
                         blocked_zones.append(living_dh.rect)
 
-                    import copy
                     safe_first_spec = copy.deepcopy(first_spec) if first_spec else []
                     if not safe_first_spec:
                         safe_first_spec = [copy.deepcopy(r) for r in layout_params["rooms"] if r["type"] in ("bedroom", "bathroom", "master_bedroom")]
@@ -3760,6 +5744,40 @@ def _stream_generate_work(req: "GenerateRequest", emit_fn: Callable) -> None:
                             floor_1_rooms.append(f1_stair)
                         f1_stair["fixed_rect"] = (staircase.rect.x, staircase.rect.z, staircase.rect.width, staircase.rect.length)
 
+                    # A double-height room is a structural absence on the
+                    # upper floor, not a decoration added after placement.
+                    # Reserve its exact ground-floor rectangle inside CP-SAT
+                    # so bedrooms/corridors are solved around the opening.
+                    if living_dh:
+                        floor_1_rooms = [
+                            room for room in floor_1_rooms
+                            if canonical_type(room.get("type")) != "void"
+                        ]
+                        floor_1_rooms.append({
+                            "type": "void",
+                            "id": "void-f1",
+                            "name": "Double Height Void",
+                            "fixed_rect": (
+                                living_dh.rect.x, living_dh.rect.z,
+                                living_dh.rect.width, living_dh.rect.length,
+                            ),
+                            "is_outdoor": True,
+                            "roof_type": "open",
+                            "connections": [],
+                        })
+
+                    ground_indoor = [
+                        node for node in generated_nodes_0
+                        if not getattr(node, "is_outdoor", False) and node.roof_type != "open"
+                    ]
+                    slab_bounds = (
+                        min(node.rect.x for node in ground_indoor),
+                        min(node.rect.z for node in ground_indoor),
+                        max(node.rect.x + node.rect.width for node in ground_indoor),
+                        max(node.rect.z + node.rect.length for node in ground_indoor),
+                    )
+                    trace(f"Floor 1 allowed slab bounds={tuple(round(value, 2) for value in slab_bounds)}")
+
                     floor1_bp = None
                     if master_bp:
                         floor1_bp = [b for b in master_bp if b.get("floor_number", 0) == 1]
@@ -3768,17 +5786,29 @@ def _stream_generate_work(req: "GenerateRequest", emit_fn: Callable) -> None:
                         floor_1_rooms,
                         blocked_zones=blocked_zones,
                         restrict_slots=True,
-                        master_blueprint=floor1_bp if floor1_bp else None
+                        master_blueprint=floor1_bp if floor1_bp else None,
+                        plot_info={"allowed_bounds": slab_bounds},
                     )
                     apply_requested_room_names(generated_nodes_1, floor_1_rooms)
 
                     align_duplex_floors(generated_nodes_0, generated_nodes_1,
                                         make_void=bool(indian_opts.get("double_height") or indian_opts.get("void")))
                     enforce_requested_only(generated_nodes_1, _req_types)
+                    hard_program_errors = floor_program_fidelity_errors(generated_nodes_1, floor_1_rooms, 1)
+                    hard_program_errors.extend(upper_floor_containment_errors(generated_nodes_0, generated_nodes_1, 1))
+                    if hard_program_errors:
+                        raise RuntimeError(" ".join(hard_program_errors))
+                    trace(
+                        f"Floor 1 generated: requested={type_counts(floor_1_rooms)}; "
+                        f"realized={type_counts(generated_nodes_1)}; bounds={node_bounds(generated_nodes_1)}"
+                    )
                     ArchitecturalRules.optimize_wet_walls(generated_nodes_1)
                     AdjacencyResolver(generated_nodes_1, open_rooms=layout_params.get("open_rooms", [])).resolve()
+                    bridge_staircase_grid_seam(generated_nodes_1)
                     WindowPlacer(generated_nodes_1, engine.plot_width, engine.plot_length,
                                  setback_x=engine.setback_x, setback_z=engine.setback_z).place_windows()
+                    for node in generated_nodes_1:
+                        node.doors = [door for door in node.doors if not getattr(door, "is_main", False)]
 
                     val_1 = GeometryValidator.validate_post_placement(generated_nodes_1)
                     if not val_1.is_valid:
@@ -3786,14 +5816,18 @@ def _stream_generate_work(req: "GenerateRequest", emit_fn: Callable) -> None:
                         if attempt < max_attempts - 1:
                             continue  # Retry!
                         else:
-                            logger.info("[PIPELINE] Floor 1 repair retries exhausted; continuing with the last finite layout.")
+                            raise RuntimeError(
+                                "Floor 1 failed geometry/accessibility validation after repair retries: "
+                                + "; ".join(val_1.errors[:8])
+                            )
 
                     shared_walls_1 = compute_shared_walls(generated_nodes_1)
                     layout_data["floor_1"] = [n.to_dict() for n in generated_nodes_1]
                     layout_data["walls_floor_1"] = shared_walls_1
                     layout_data["mep_data_f1"] = compute_mep_heuristics(generated_nodes_1)
 
-                # If we made it here, both floors succeeded (or we hit max retries)
+                # Reaching this point means every generated floor passed the
+                # hard geometry and accessibility gates.
                 logger.info(f"[PIPELINE] Layout generation succeeded on attempt {attempt + 1}!")
                 break
 
@@ -3860,13 +5894,44 @@ def _stream_generate_work(req: "GenerateRequest", emit_fn: Callable) -> None:
                     if r_name in node.name.lower() or r_name in getattr(node, "type", "").lower():
                         node.wallColor = r_col
         
-        validation_report = final_layout_validation(all_nodes, indian_options=indian_opts, is_duplex=(floors > 1))
+        # Rooms on different storeys occupy the same X/Z coordinates by
+        # design. Validate each floor independently; treating the combined
+        # duplex as one 2-D plane produced false overlap failures everywhere.
+        floor_validation_reports = [
+            (0, final_layout_validation(generated_nodes_0, indian_options=indian_opts, is_duplex=(floors > 1)))
+        ]
+        if generated_nodes_1:
+            floor_validation_reports.append(
+                (1, final_layout_validation(generated_nodes_1, indian_options=indian_opts, is_duplex=True))
+            )
+        validation_report = {
+            "ok": all(report["ok"] for _, report in floor_validation_reports),
+            "checks": {
+                f"floor_{level}_{name}": check
+                for level, report in floor_validation_reports
+                for name, check in report["checks"].items()
+            },
+            "issues": [
+                f"Floor {level}: {issue}"
+                for level, report in floor_validation_reports
+                for issue in report["issues"]
+            ],
+        }
         response["validation"] = validation_report
         if not validation_report["ok"]:
             warnings.extend(validation_report["issues"])
+            issue_summary = "; ".join(validation_report["issues"][:8])
+            raise RuntimeError(
+                "Generated layout failed final buildability validation and was not accepted: "
+                + issue_summary
+            )
 
         response["layout_data"] = layout_data
         response["warnings"] = warnings
+        response["area_budget"] = layout_params.get("area_budget")
+        response["replace_project"] = is_fresh_create
+        trace(f"Accepted layout; replace_project={is_fresh_create}; validation_ok={validation_report['ok']}")
+        response["logs"] = debug_trace
 
         physics = run_physics_prediction(
             room_width=plot_w * 0.3, room_length=plot_l * 0.3,
@@ -3995,6 +6060,7 @@ def _stream_template_work(req: "TemplateRequest", emit_fn: Callable) -> None:
         template_warnings = list(validate_layout(generated_nodes_0))
         from geometry_validator import GeometryValidator
         template_warnings.extend(GeometryValidator.validate_post_placement(generated_nodes_0).errors)
+        template_warnings.extend(space_recommendations(floor_0_rooms + first_spec, req.width, req.length))
         
         shared_walls_0 = compute_shared_walls(generated_nodes_0)
         layout_data: Dict[str, Any] = {
@@ -4122,6 +6188,7 @@ def _stream_template_work(req: "TemplateRequest", emit_fn: Callable) -> None:
             logger.warning(f"Failed to restore preserved properties: {e}")
 
         response = {
+            "replace_project": True,
             "layout_params": layout_params,
             "understood": understood,
             "warnings": template_warnings,

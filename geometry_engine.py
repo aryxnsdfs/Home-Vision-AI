@@ -1,4 +1,6 @@
 import logging
+import math
+import os
 from ortools.sat.python import cp_model
 from collections import deque
 from layout_engine import ROOM_MINIMUMS, _DEFAULT_MIN
@@ -44,6 +46,7 @@ class CPSolver:
         plot_w_ft = floor_data.get('plot_width', 30.0)
         plot_l_ft = floor_data.get('plot_length', 40.0)
         rooms_spec = floor_data.get('rooms', [])
+        allowed_bounds = floor_data.get('allowed_bounds')
 
         if not rooms_spec:
             return floor_data
@@ -113,15 +116,39 @@ class CPSolver:
 
             if "fixed_rect" in room:
                 fx, fz, fw, fl = room["fixed_rect"]
-                model.Add(x == int(fx * scale))
-                model.Add(z == int(fz * scale))
-                model.Add(w == int(fw * scale))
-                model.Add(l == int(fl * scale))
+                # CP-SAT uses a discrete grid while cross-floor structural
+                # anchors retain their exact floating-point coordinates.  A
+                # simple int() on both origin and size made the reserved box
+                # slightly *smaller* than the real staircase.  Restoring the
+                # exact stair after solving could then overlap a corridor by a
+                # fraction of a foot and leave no finite wall for its door.
+                # Reserve the complete enclosing grid box instead.
+                fixed_x = math.floor(fx * scale)
+                fixed_z = math.floor(fz * scale)
+                fixed_x_end = math.ceil((fx + fw) * scale)
+                fixed_z_end = math.ceil((fz + fl) * scale)
+                model.Add(x == fixed_x)
+                model.Add(z == fixed_z)
+                model.Add(w == fixed_x_end - fixed_x)
+                model.Add(l == fixed_z_end - fixed_z)
 
             x_end = model.NewIntVar(0, max(plot_w, 2000), f'xe_{r_id}')
             z_end = model.NewIntVar(0, max(plot_l, 2000), f'ze_{r_id}')
             model.Add(x_end == x + w)
             model.Add(z_end == z + l)
+
+            # Upper indoor rooms require structural support from the lower
+            # slab. Balconies/open-air projections may extend beyond it, but
+            # still remain inside the plot domains above.
+            if allowed_bounds and not room.get("is_outdoor") and str(room.get("roof_type", "")).lower() != "open":
+                bx0 = math.ceil(float(allowed_bounds[0]) * scale)
+                bz0 = math.ceil(float(allowed_bounds[1]) * scale)
+                bx1 = math.floor(float(allowed_bounds[2]) * scale)
+                bz1 = math.floor(float(allowed_bounds[3]) * scale)
+                model.Add(x >= max(0, bx0))
+                model.Add(z >= max(0, bz0))
+                model.Add(x_end <= min(plot_w, bx1))
+                model.Add(z_end <= min(plot_l, bz1))
 
             x_iv = model.NewIntervalVar(x, w, x_end, f'xi_{r_id}')
             z_iv = model.NewIntervalVar(z, l, z_end, f'zi_{r_id}')
@@ -135,6 +162,9 @@ class CPSolver:
             room_vars[r_id] = {
                 'type': r_type,
                 'connections': room.get('connections', []),
+                'preferred_location': room.get('preferred_location', ''),
+                'location_weight': room.get('location_weight', 8),
+                'min_dim': min_dim,
                 'x': x, 'z': z, 'w': w, 'l': l,
                 'x_end': x_end, 'z_end': z_end,
                 'x_iv': x_iv, 'z_iv': z_iv,
@@ -206,7 +236,7 @@ class CPSolver:
                 t_a = room_vars[id_a]['type']
                 t_b = room_vars[id_b]['type']
 
-                if frozenset({t_a, t_b}) in FORBIDDEN_PAIRS:
+                if not floor_data.get('relaxed_recovery') and frozenset({t_a, t_b}) in FORBIDDEN_PAIRS:
                     a, b = room_vars[id_a], room_vars[id_b]
                     # Force ≥ 1 grid-unit gap in at least one direction
                     s1 = model.NewBoolVar(f'fsep_l_{id_a}_{id_b}')
@@ -228,6 +258,12 @@ class CPSolver:
         # PHASE 5 — Soft Objectives
         # ────────────────────────────────────────────
         obj_terms = []
+
+        # Plot coverage is intentionally NOT solved by inflating individual
+        # room variables. A single oversized bathroom/service room can satisfy
+        # an area target while producing a terrible plan. LayoutEngine expands
+        # the finished connected floor plan proportionally instead, so every
+        # room shares the available plot area according to its normal program.
 
         # 5a. Zonal clustering
         zones = {"public": [], "private": []}
@@ -289,7 +325,7 @@ class CPSolver:
             elif 'kitchen' in t: ew = 7
             elif 'bed' in t:     ew = 6
             elif 'bath' in t or 'toilet' in t: ew = 3
-            elif 'corridor' in t or 'hallway' in t: ew = -3
+            elif 'corridor' in t or 'hallway' in t: ew = 12
 
             # Slightly perturb weights on retries to find alternate topologies
             if attempt > 0:
@@ -308,6 +344,23 @@ class CPSolver:
             cz = model.NewIntVar(0, plot_l * 2, f'cz_{r_id}')
             model.Add(cx == 2 * rv['x'] + rv['w'])
             model.Add(cz == 2 * rv['z'] + rv['l'])
+
+            if rv.get('preferred_location') == 'center':
+                # Minimise distance between room centre and buildable-plot
+                # centre. This remains soft so hard access, adjacency and
+                # non-overlap constraints can select a nearby feasible spot.
+                center_dx = model.NewIntVar(0, plot_w * 2, f'center_dx_{r_id}')
+                center_dz = model.NewIntVar(0, plot_l * 2, f'center_dz_{r_id}')
+                model.AddAbsEquality(center_dx, cx - plot_w)
+                model.AddAbsEquality(center_dz, cz - plot_l)
+                center_weight = max(1, min(50, int(rv.get('location_weight', 8))))
+                obj_terms.append(center_weight * center_dx)
+                obj_terms.append(center_weight * center_dz)
+
+                # A hint guides the first feasible search without constraining
+                # the final room dimensions or topology.
+                model.AddHint(rv['x'], max(0, plot_w // 2 - rv['min_dim'] // 2))
+                model.AddHint(rv['z'], max(0, plot_l // 2 - rv['min_dim'] // 2))
 
             for conn in rv['connections']:
                 tt = conn.get('target_room', '')
@@ -336,18 +389,31 @@ class CPSolver:
                 obj_terms.append(wt * dx)
                 obj_terms.append(wt * dz)
 
-        model.Minimize(sum(obj_terms))
+        # Recovery asks only for the first valid complete plan. Optimizing all
+        # pairwise walking distances can consume the whole deadline without
+        # ever publishing a feasible incumbent on dense programs.
+        if not floor_data.get('relaxed_recovery'):
+            model.Minimize(sum(obj_terms))
 
         # ────────────────────────────────────────────
         # PHASE 6 — Solve
         # ────────────────────────────────────────────
         solver = cp_model.CpSolver()
-        solver.parameters.max_time_in_seconds = 5.0 + attempt * 3.0
+        # Complex courtyard/suite graphs routinely have 12–16 hard shared-wall
+        # edges. Four seconds returned UNKNOWN on otherwise feasible 40x80
+        # plots and forced a lossy legacy fallback. Eight seconds still keeps
+        # the complete request inside the 30-second product budget.
+        configured_limit = float(os.getenv("CP_SOLVER_TIMEOUT_SECONDS", "8"))
+        if floor_data.get('relaxed_recovery'):
+            configured_limit = float(os.getenv("CP_RECOVERY_TIMEOUT_SECONDS", "4"))
+        solver_limit = max(1.0, min(8.0, configured_limit))
+        solver.parameters.max_time_in_seconds = solver_limit
         # Set random seed to explore different search spaces
         solver.parameters.random_seed = attempt
-        # Use more workers on retries
-        if attempt > 0:
-            solver.parameters.num_workers = 4
+        # Complex adjacency graphs were previously solved on one search
+        # worker during attempt zero. Use bounded parallel CP search from the
+        # start; the Celery process itself runs in solo mode.
+        solver.parameters.num_workers = max(1, min(8, int(os.getenv("CP_SOLVER_WORKERS", "8"))))
 
         status = solver.Solve(model)
 
@@ -375,7 +441,8 @@ class CPSolver:
             if not validation['passed']:
                 for e in validation['errors']:
                     logger.info(f"[POST-VALIDATE] {e}")
-                if attempt < 2:
+                max_attempts = max(1, int(os.getenv("CP_SOLVER_MAX_ATTEMPTS", "1")))
+                if attempt + 1 < max_attempts:
                     logger.info(f"[RETRY] Re-solving (attempt {attempt + 1})…")
                     # Clear stale results before retry
                     floor_data.pop('resolved_rooms', None)
@@ -387,7 +454,8 @@ class CPSolver:
                 logger.info(f"[FALLBACK] CP model was invalid; using deterministic layout fallback. Details: {model.Validate()}")
             logger.info(f"CP Solver did not return a solution (status {status}, attempt {attempt}); using deterministic fallback.")
             floor_data['validation'] = {'passed': False, 'errors': ['Solver infeasible']}
-            if attempt < 2:
+            max_attempts = max(1, int(os.getenv("CP_SOLVER_MAX_ATTEMPTS", "1")))
+            if attempt + 1 < max_attempts:
                 logger.info(f"[RETRY] Re-solving with more time (attempt {attempt + 1})…")
                 return self.solve_phase_2_csp(floor_data, attempt + 1)
 

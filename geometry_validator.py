@@ -168,6 +168,10 @@ class GeometryValidator:
                 result.errors.append(msg)
                 result.is_valid = False
 
+        # Post-placement must enforce the same non-overlap invariant as the
+        # blueprint validator.  Previously this call was missing, allowing a
+        # corridor stretched through bedrooms to pass as a successful floor.
+        GeometryValidator._check_overlaps(boxes, result)
         GeometryValidator._check_gaps_and_adjacency(boxes, result)
         GeometryValidator._check_connectivity(blueprint, boxes, result)
         return result
@@ -226,7 +230,7 @@ class GeometryValidator:
         for i in range(len(boxes)):
             for j in range(i + 1, len(boxes)):
                 a, b = boxes[i], boxes[j]
-                if a.overlaps(b, epsilon=SNAP_TOLERANCE):
+                if a.overlaps(b, epsilon=EPSILON):
                     overlap_x = min(a.x_max, b.x_max) - max(a.x_min, b.x_min)
                     overlap_z = min(a.z_max, b.z_max) - max(a.z_min, b.z_min)
                     overlap_area = round(overlap_x * overlap_z, 2)

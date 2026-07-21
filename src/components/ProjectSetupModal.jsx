@@ -42,7 +42,7 @@ const COLOR_MAP = {
 };
 
 const EXTERIOR_COLORS = [
-  { id: 'mustard', name: 'Mustard Yellow', hex: '#E4A010', desc: 'Hides dust, iconic warmth' },
+  { id: 'ivory', name: 'Ivory Cream', hex: '#FDF5E6', desc: 'Soft neutral exterior' },
   { id: 'terracotta', name: 'Terracotta Red', hex: '#E2725B', desc: 'Coastal/Southern earthy look' },
   { id: 'cream', name: 'Cream Ivory', hex: '#FDF5E6', desc: 'Heat-reflective, soft' },
   { id: 'beige', name: 'Earthy Beige', hex: '#F5F5DC', desc: 'Modern luxury, low maintenance' },
@@ -331,55 +331,10 @@ function PlotSizeSelector({ inputUnit, setInputUnit, width, setWidth, length, se
   );
 }
 
-// ─── Floors selector — Ground only or Duplex ─────────────────────────────────
-function FloorsSelector({ floors, setFloors }) {
-  return (
-    <div>
-      <label className="block text-sm text-neutral-400 mb-2">Floors</label>
-      <div className="flex gap-3">
-        <button
-          type="button"
-          onClick={() => setFloors(1)}
-          className={`flex-1 py-3 rounded-xl border text-sm font-semibold transition-all ${
-            floors === 1
-              ? 'bg-emerald-500/20 border-emerald-500 text-emerald-300'
-              : 'bg-black/50 border-white/10 text-neutral-400 hover:bg-white/10 hover:text-white'
-          }`}
-        >
-          Ground Floor
-        </button>
-        <button
-          type="button"
-          onClick={() => setFloors(2)}
-          className={`flex-1 py-3 rounded-xl border text-sm font-semibold transition-all ${
-            floors === 2
-              ? 'bg-emerald-500/20 border-emerald-500 text-emerald-300'
-              : 'bg-black/50 border-white/10 text-neutral-400 hover:bg-white/10 hover:text-white'
-          }`}
-        >
-          Ground + First Floor
-          <span className="block text-[10px] font-normal opacity-60">Duplex</span>
-        </button>
-        <button
-          type="button"
-          onClick={() => setFloors(3)}
-          className={`flex-1 py-3 rounded-xl border text-sm font-semibold transition-all ${
-            floors === 3
-              ? 'bg-emerald-500/20 border-emerald-500 text-emerald-300'
-              : 'bg-black/50 border-white/10 text-neutral-400 hover:bg-white/10 hover:text-white'
-          }`}
-        >
-          Ground + First + Second
-          <span className="block text-[10px] font-normal opacity-60">Triplex</span>
-        </button>
-      </div>
-    </div>
-  );
-}
-
 // ─── Main Modal ───────────────────────────────────────────────────────────────
 export default function ProjectSetupModal() {
   const { setOnboardingDone, generateFromTemplate, generateWithAI, apiError, clearApiError, closeSetupModal, project } = useProjectStore();
+  const areaBudget = useProjectStore(state => state.lastAreaBudget);
 
   const [mode, setMode] = useState(null);
   const [loading, setLoading] = useState(false);
@@ -388,12 +343,12 @@ export default function ProjectSetupModal() {
   const [inputUnit, setInputUnit] = useState('ft');
   const [width, setWidth] = useState(40);
   const [length, setLength] = useState(40);
-  const [floors, setFloors] = useState(1);
+  const floors = 1;
   const [inputArea, setInputArea] = useState(1600);
 
   // Colors
   const [colorPrefs, setColorPrefs] = useState({
-    exterior: 'mustard',
+    exterior: 'ivory',
     interior: 'off_white',
     roof: 'terracotta',
     vastuColors: false
@@ -486,6 +441,43 @@ export default function ProjectSetupModal() {
             </div>
           )}
 
+          {apiError && areaBudget && !areaBudget.fits && mode === 'ai' && (
+            <div className="mb-5 rounded-xl border border-amber-500/25 bg-amber-500/10 p-4">
+              <p className="text-sm font-semibold text-amber-200">
+                This layout needs at least {areaBudget.required_sqft?.toLocaleString()} sq ft; approximately {areaBudget.available_sqft?.toLocaleString()} sq ft is buildable.
+              </p>
+              <div className="mt-3 flex flex-wrap gap-2">
+                <button
+                  onClick={async () => {
+                    clearApiError(); setLoading(true);
+                    const { w, l } = getFinalDimensions();
+                    await generateWithAI(`${prompt}\nUse two floors and move suitable private rooms upstairs.`, w, l, indianOptions, colorPrefs, "Standard", "India", {}, 2);
+                    setLoading(false);
+                  }}
+                  className="rounded-lg bg-amber-400 px-3 py-2 text-xs font-bold text-black"
+                >Add a Second Floor</button>
+                <button
+                  onClick={() => {
+                    setInputUnit('ft');
+                    setWidth(areaBudget.recommended_plot?.width || width);
+                    setLength(areaBudget.recommended_plot?.length || length);
+                    clearApiError();
+                  }}
+                  className="rounded-lg border border-white/15 px-3 py-2 text-xs font-semibold text-white"
+                >Increase Plot Size</button>
+                <button
+                  onClick={async () => {
+                    clearApiError(); setLoading(true);
+                    const { w, l } = getFinalDimensions();
+                    await generateWithAI(`${prompt}\nOptimize for this exact plot. Preserve essential rooms and remove the lowest-priority optional spaces first.`, w, l, indianOptions, colorPrefs, "Standard", "India", {}, floors);
+                    setLoading(false);
+                  }}
+                  className="rounded-lg border border-white/15 px-3 py-2 text-xs font-semibold text-white"
+                >Optimize Layout</button>
+              </div>
+            </div>
+          )}
+
           <AnimatePresence mode="wait">
 
             {/* ── Home Screen ── */}
@@ -551,10 +543,9 @@ export default function ProjectSetupModal() {
                     ))}
                   </div>
 
-                  <div className="grid grid-cols-1 md:grid-cols-2 gap-5">
+                  <div className="grid grid-cols-1 gap-5">
                     <PlotSizeSelector inputUnit={inputUnit} setInputUnit={setInputUnit} width={width} setWidth={setWidth}
                       length={length} setLength={setLength} inputArea={inputArea} setInputArea={setInputArea} color="amber" />
-                    <FloorsSelector floors={floors} setFloors={setFloors} />
                   </div>
 
                   <div className="relative group">
@@ -602,10 +593,9 @@ export default function ProjectSetupModal() {
                   ))}
                 </div>
 
-                <div className="grid grid-cols-1 md:grid-cols-2 gap-5">
+                <div className="grid grid-cols-1 gap-5">
                   <PlotSizeSelector inputUnit={inputUnit} setInputUnit={setInputUnit} width={width} setWidth={setWidth}
                     length={length} setLength={setLength} inputArea={inputArea} setInputArea={setInputArea} color="emerald" />
-                  <FloorsSelector floors={floors} setFloors={setFloors} />
                 </div>
 
                 <ColorSelectionPanel colors={colorPrefs} setColors={setColorPrefs} />

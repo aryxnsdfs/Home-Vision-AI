@@ -13,6 +13,8 @@ def _default_extraction_result() -> Dict[str, Any]:
     return {
         "intent": "CREATE",
         "bhk": 0,
+        "floors": 1,
+        "floor_program": {},
         "style": "",
         "materials": [],
         "target_rooms": [],
@@ -102,7 +104,16 @@ Also return every requested exterior/open-air facility in outdoor_rooms (for exa
 STYLES: {known_styles}
 MATERIALS: {known_materials}
 
-Schema: {{"intent": "CREATE" | "ADD" | "REMOVE" | "RESIZE" | "COLOR" | "MODIFY_MEP" | "MOVE", "bhk": int, "style": str, "materials": [str], "target_rooms": [str], "outdoor_rooms": [str], "color_hex": str, "theme_description": str, "move_target_room": str, "move_destination": str, "vastu_specifics": [{{"room": str, "location": str}}], "negative_constraints": [str], "mep_additions": [{{"room": str, "item": str}}], "needs_pooja_room": bool, "utility_area": bool, "powder_room": bool, "elderly_suite": bool, "foyer": bool, "brahmasthan": bool, "angan": bool, "bhandar_ghar": bool, "maliya": bool, "sump_tank": bool, "overhead_tank": bool, "diwan": bool, "otta": bool, "portico": bool, "flat_terrace": bool, "parapet": bool, "mumty": bool, "double_height": bool, "jali": bool, "chhajja": bool, "jharokha": bool, "stack_vent": bool, "facing": "North" | "South" | "East" | "West" | ""}}
+Schema: {{"intent": "CREATE" | "ADD" | "REMOVE" | "RESIZE" | "COLOR" | "MODIFY_MEP" | "MOVE", "bhk": int, "floors": int, "floor_program": {{"0": [{{"type": str, "name": str, "bathroom_role": "attached" | "common" | ""}}], "1": [{{"type": str, "name": str, "bathroom_role": "attached" | "common" | ""}}]}}, "style": str, "materials": [str], "target_rooms": [str], "outdoor_rooms": [str], "color_hex": str, "theme_description": str, "move_target_room": str, "move_destination": str, "vastu_specifics": [{{"room": str, "location": str}}], "negative_constraints": [str], "mep_additions": [{{"room": str, "item": str}}], "needs_pooja_room": bool, "utility_area": bool, "powder_room": bool, "elderly_suite": bool, "foyer": bool, "brahmasthan": bool, "angan": bool, "bhandar_ghar": bool, "maliya": bool, "sump_tank": bool, "overhead_tank": bool, "diwan": bool, "otta": bool, "portico": bool, "flat_terrace": bool, "parapet": bool, "mumty": bool, "double_height": bool, "jali": bool, "chhajja": bool, "jharokha": bool, "stack_vent": bool, "facing": "North" | "South" | "East" | "West" | ""}}
+
+Floor analysis rules:
+- Infer every requested level from any wording, including storeys, floors, levels, duplex/triplex, upper floor, roof level, basement, and regional/custom phrasing.
+- Return floors as the total number of above-ground levels, including ground.
+- Return floor_program with numeric level keys: 0=ground, 1=first level above ground, 2=second level above ground. Put each requested room or facility on the level where the user placed it.
+- floor_program must be a complete, functional house program, not merely a copy of nouns from the prompt. For a BHK home include its ordinary entry/living, cooking and circulation spaces unless the user explicitly excludes them.
+- Every occupied upper level must include aligned staircase access and a circulation space connected to its rooms. Include the matching staircase on the level below.
+- Preserve unfamiliar room names exactly as concise snake_case labels; never replace them with a hardcoded room.
+- Keep every bathroom type as "bathroom" and set bathroom_role="attached" for an ensuite/private bedroom bathroom or "common" for a general/shared bathroom. Preserve the requested count and floor.
 
 Indian feature detection rules (set to true if user mentions):
 - needs_pooja_room: "pooja room", "prayer room", "mandir", "temple", "puja", "devghar"
@@ -190,7 +201,10 @@ Output NOTHING but valid JSON matching this schema. Do not include markdown code
             generation_config=genai.types.GenerationConfig(
                 temperature=0.0,
                 response_mime_type="application/json",
-            )
+            ),
+            # Leave enough of the 30-second worker budget for deterministic
+            # two-floor geometry and accessibility validation.
+            request_options={"timeout": 20},
         )
         content = response.text
         logger.info(f"[GEMINI RAW OUTPUT]\n{content}")

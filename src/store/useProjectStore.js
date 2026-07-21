@@ -20,6 +20,13 @@ const inr = (value) => {
 };
 
 const roundToGrid = (value, grid = 0.5) => Math.max(grid, Math.round(Number(value) / grid) * grid);
+// Generated coordinates are solver boundaries. Rounding each edge separately
+// to a 0.5 ft grid can turn two touching rooms into a visible slit, so preserve
+// backend geometry to two decimals when materializing a project.
+const preserveGeometry = (value, fallback = 0) => {
+  const number = Number(value);
+  return Number.isFinite(number) ? Math.round(number * 100) / 100 : fallback;
+};
 const roomArea = (rooms) => rooms.reduce((sum, room) => sum + room.width * room.length, 0);
 const bounds2d = (room) => ({
   minX: room.x,
@@ -62,7 +69,7 @@ const minAreaFor = (type) => (ROOM_MIN_AREA[type] || 40) * OVERFLOW_BUFFER;
 // Palette id → hex maps (mirror the backend) so the exterior facade and roof
 // colors the user picked are reflected in the 3D scene and persist across edits.
 const EXTERIOR_HEX = {
-  mustard: "#E4A010", gold: "#E4A010", cream: "#FDF5E6", peach: "#FFDAB9",
+  mustard: "#E4A010", gold: "#E4A010", cream: "#FDF5E6", ivory: "#FDF5E6", peach: "#FFDAB9",
   sea_green: "#2E8B57", indigo: "#4B0082", white: "#FFFFFF", concrete: "#808080",
   brick: "#B22222", wood: "#DEB887",
 };
@@ -178,6 +185,33 @@ const defaultProject = {
   materials: materialCatalog
 };
 
+// A template is a new design session, not an edit of the currently displayed
+// house. Always clone the defaults so no room/layout arrays are shared with the
+// previous project or with another generation.
+const createFreshProject = () => {
+  const project = structuredClone(defaultProject);
+  project.id = `HVAI-${Date.now()}-${Math.random().toString(36).slice(2, 8).toUpperCase()}`;
+  project.plot_id = project.id;
+  project.name = "New Home Vision Project";
+  project.floors = project.floors.map((floor, index) => ({
+    ...floor,
+    floor_id: `floor-${index}`,
+    rooms: [],
+    walls: [],
+    doors: [],
+    windows: [],
+    structural_elements: [],
+    stairs: [],
+  }));
+  project.rooms = [];
+  project.walls = [];
+  project.layout_data = {};
+  project.outdoor_areas = [];
+  project.style = { ...project.style, lastPrompt: "" };
+  project.metrics = { ...project.metrics, areaSqft: 0 };
+  return project;
+};
+
 const extractStyle = (prompt) => {
   const text = prompt.toLowerCase();
   const style = {};
@@ -263,6 +297,9 @@ export const useProjectStore = create((set, get) => ({
   onboardingDone: false,
   // Real-time generation progress (null = not generating)
   generationProgress: null,
+  // Incremented for every new design session. Responses from an older session
+  // are ignored, even if their network request finishes later.
+  generationEpoch: 0,
   costPresets: null,
   costMaterials: null,
   
@@ -330,6 +367,22 @@ export const useProjectStore = create((set, get) => ({
 
   setOnboardingDone: (done) => set({ onboardingDone: done }),
   setShowSetupModal: (show) => set({ showSetupModal: show }),
+  startNewTemplate: () => set((state) => ({
+    project: createFreshProject(),
+    onboardingDone: false,
+    showSetupModal: true,
+    selectedRoomId: null,
+    selectedObject: null,
+    visibleFloor: "floor_0",
+    history: [],
+    historyIndex: -1,
+    apiError: null,
+    lastUnderstood: [],
+    lastWarnings: [],
+    generationProgress: null,
+    generationEpoch: state.generationEpoch + 1,
+    uiWarning: null,
+  })),
   setMinimapExpanded: (expanded) => set({ minimapExpanded: expanded }),
   closeSetupModal: () => set({ showSetupModal: false }),
   clearApiError: () => set({ apiError: null }),
@@ -808,6 +861,15 @@ export const useProjectStore = create((set, get) => ({
         let evt;
         try { evt = JSON.parse(text); } catch { continue; }
 
+        if (evt.capacity) {
+          set(s => ({
+            generationProgress: s.generationProgress
+              ? { ...s.generationProgress, capacity: evt.capacity }
+              : s.generationProgress,
+            lastAreaBudget: evt.capacity,
+          }));
+          continue;
+        }
         if (evt.error) throw new Error(evt.error);
         if (evt.done) return evt.result;
       }
@@ -816,7 +878,8 @@ export const useProjectStore = create((set, get) => ({
   },
 
   generateFromTemplate: async (template, width, length, floors = 1, customRooms = null, indianOptions = {}, colors = null, packageLevel = "Standard", country = "India") => {
-    set({ apiError: null });
+    const requestEpoch = get().generationEpoch + 1;
+    set({ apiError: null, generationEpoch: requestEpoch });
     const features = Object.entries(indianOptions || {}).filter(([, v]) => v).map(([k]) => k.replace(/_/g, ' '));
     get()._startProgress({
       title: template,
@@ -830,18 +893,22 @@ export const useProjectStore = create((set, get) => ({
         template, width, length, floors, customRooms, indianOptions, colors,
         package: packageLevel, country,
       });
+      if (get().generationEpoch !== requestEpoch) return;
       get()._finishProgress();
       await new Promise(r => setTimeout(r, 600));
       set({ lastUnderstood: data.understood || [], lastWarnings: data.warnings || [], onboardingDone: true, showSetupModal: false });
+      if (data.area_budget) set({ lastAreaBudget: data.area_budget });
       get().applyGeneratedProject(data);
       get()._applyPaletteColors(colors);
     } catch (err) {
+      if (get().generationEpoch !== requestEpoch) return;
       set({ apiError: err.message, generationProgress: null });
     }
   },
 
   generateWithAI: async (prompt, width, length, indianOptions = {}, colors = null, packageLevel = "Standard", country = "India", customMaterials = {}, floors = 1) => {
-    set({ apiError: null });
+    const requestEpoch = get().generationEpoch + 1;
+    set({ apiError: null, generationEpoch: requestEpoch });
     const features = Object.entries(indianOptions || {}).filter(([, v]) => v).map(([k]) => k.replace(/_/g, ' '));
     get()._startProgress({
       title: null,
@@ -853,22 +920,27 @@ export const useProjectStore = create((set, get) => ({
     try {
       const data = await get()._readSSEStream(`${API_BASE_URL}/generate/stream`, {
         prompt, width, length, floors, use_ai: true,
-        currentProject: get().project, indianOptions, colors,
+        currentProject: get().project, requestMode: "create", indianOptions, colors,
         package: packageLevel, country, customMaterials,
         layoutRules: get().layoutRules || [],
       });
+      if (get().generationEpoch !== requestEpoch) return;
       get()._finishProgress();
       await new Promise(r => setTimeout(r, 600));
       set({ lastUnderstood: data.understood || [], lastWarnings: data.warnings || [], onboardingDone: true, showSetupModal: false });
+      if (data.area_budget) set({ lastAreaBudget: data.area_budget });
       get().applyGeneratedProject(data);
       get()._applyPaletteColors(colors);
     } catch (err) {
+      if (get().generationEpoch !== requestEpoch) return;
       set({ apiError: err.message, generationProgress: null });
     }
   },
 
   applyGeneratedProject: (payload) =>
     set((state) => {
+      const isReplacement = Boolean(payload?.replace_project);
+      const baseProject = isReplacement ? createFreshProject() : state.project;
       // Handle both new layout_data format and fallback to legacy flat rooms array
       let rawRooms = [];
       const layoutData = payload?.layout_data || {};
@@ -903,10 +975,10 @@ export const useProjectStore = create((set, get) => ({
             id: room.id ? String(room.id) : `room-${index}`,
             name: room.name || room.type.replace('_', ' ').replace(/\b\w/g, l => l.toUpperCase()) || `Room ${index + 1}`,
             type: room.type || "living_room",
-            width: roundToGrid(room.width ?? room.widthFt ?? 10),
-            length: roundToGrid(room.length ?? room.depth ?? room.depthFt ?? 10),
-            x: roundToGrid(room.x ?? 0),
-            z: roundToGrid(room.z ?? 0),
+            width: preserveGeometry(room.width ?? room.widthFt ?? 10, 10),
+            length: preserveGeometry(room.length ?? room.depth ?? room.depthFt ?? 10, 10),
+            x: preserveGeometry(room.x ?? 0),
+            z: preserveGeometry(room.z ?? 0),
             wallThicknessIn: Math.max(4, room.wallThicknessIn ?? 6),
             doors: room.doors || [],
             windows: room.windows || [],
@@ -921,6 +993,8 @@ export const useProjectStore = create((set, get) => ({
               ...(room.type === 'bathroom' ? [{ type: 'water_sink', x: roundToGrid(room.x ?? 0) + 1, z: roundToGrid(room.z ?? 0) + 0.5 }, { type: 'geyser', x: roundToGrid(room.x ?? 0) + (room.width ?? 10) - 1, z: roundToGrid(room.z ?? 0) + 0.5 }] : [])
             ],
             furniture: room.furniture || [],
+            roof_type: room.roof_type || 'flat',
+            is_outdoor: Boolean(room.is_outdoor),
             floorIndex: Number.isFinite(room.floorIndex) ? room.floorIndex : (room.isFloor1 ? 1 : 0),
             isFloor1: room.isFloor1 || room.floorIndex === 1 || false
           }))
@@ -949,13 +1023,26 @@ export const useProjectStore = create((set, get) => ({
           walls: candidateWalls.filter(wall => wall.floorIndex === level),
         };
       });
-
+      if (import.meta.env.DEV) {
+        console.info("[LAYOUT APPLY AUDIT]", {
+          replaceProject: isReplacement,
+          returnedFloorKeys: floorKeys,
+          roomCounts: Object.fromEntries(floorLevels.map(floor => [
+            `floor_${floor.level}`,
+            floor.rooms.reduce((counts, room) => {
+              counts[room.type] = (counts[room.type] || 0) + 1;
+              return counts;
+            }, {}),
+          ])),
+          rejectedInvalidRooms: candidateRooms ? candidateRooms.length - finalRooms.length : 0,
+        });
+      }
       const activeLevel = state.project.floors?.[state.project.current_floor_index]?.level
         ?? state.project.current_floor_index
         ?? 0;
       const nextFloors = floorLevels.length > 0
         ? floorLevels.map((returnedFloor) => {
-            const existingFloor = state.project.floors?.find((floor, index) =>
+            const existingFloor = isReplacement ? null : state.project.floors?.find((floor, index) =>
               (floor.level ?? index) === returnedFloor.level
             );
             return {
@@ -964,14 +1051,14 @@ export const useProjectStore = create((set, get) => ({
               height: existingFloor?.height ?? state.project.building?.ceilingHeightFt ?? 10.5,
             };
           })
-        : state.project.floors;
+        : (isReplacement ? [] : state.project.floors);
       const nextCurrentFloorIndex = Math.max(
         0,
         nextFloors.findIndex((floor, index) => (floor.level ?? index) === activeLevel)
       );
 
       const project = {
-        ...state.project,
+        ...baseProject,
         ...(payload?.project || {}),
         plot: {
           width: plotWidth,
@@ -979,21 +1066,23 @@ export const useProjectStore = create((set, get) => ({
           areaSqft: areaSqft
         },
         layout_data: payload?.layout_data
-          ? { ...(state.project.layout_data || {}), ...payload.layout_data }
-          : state.project.layout_data,
-        floor_levels: floorLevels.length ? floorLevels : state.project.floor_levels || [],
-        outdoor_areas: layoutData.outdoor_areas ?? state.project.outdoor_areas ?? [],
-        indianOptions: payload?.layout_data?.indianOptions || state.project.indianOptions || {},
+          ? (isReplacement
+              ? { ...payload.layout_data }
+              : { ...(state.project.layout_data || {}), ...payload.layout_data })
+          : (isReplacement ? {} : state.project.layout_data),
+        floor_levels: floorLevels.length ? floorLevels : (isReplacement ? [] : state.project.floor_levels || []),
+        outdoor_areas: layoutData.outdoor_areas ?? (isReplacement ? [] : state.project.outdoor_areas ?? []),
+        indianOptions: payload?.layout_data?.indianOptions || (isReplacement ? {} : state.project.indianOptions || {}),
         current_floor_index: nextCurrentFloorIndex,
         floors: nextFloors,
         rooms: nextFloors[nextCurrentFloorIndex]?.rooms || state.project.rooms || [],
-        walls: candidateWalls.length > 0 ? candidateWalls : state.project.walls,
+        walls: candidateWalls.length > 0 || isReplacement ? candidateWalls : state.project.walls,
         building: {
-          ...state.project.building,
+          ...baseProject.building,
           ...(payload?.building || {})
         },
         metrics: {
-          ...state.project.metrics,
+          ...baseProject.metrics,
           ...(payload?.physics ? {
             costInr: payload.physics.cost_inr,
             carbonKg: payload.physics.carbon_kg,
@@ -1001,7 +1090,7 @@ export const useProjectStore = create((set, get) => ({
           } : {})
         },
         style: {
-          ...state.project.style,
+          ...baseProject.style,
           ...(payload?.style || {})
         }
       };
@@ -1013,7 +1102,8 @@ export const useProjectStore = create((set, get) => ({
         selectedObject: null,
         uiWarning: null,
         ...(payload?.understood ? { lastUnderstood: payload.understood } : {}),
-        ...(payload?.warnings ? { lastWarnings: payload.warnings } : {})
+        ...(payload?.warnings ? { lastWarnings: payload.warnings } : {}),
+        ...(payload?.unplaced_rooms ? { lastUnplacedRooms: payload.unplaced_rooms } : { lastUnplacedRooms: [] }),
       };
     }),
 

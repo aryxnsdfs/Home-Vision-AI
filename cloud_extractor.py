@@ -33,6 +33,25 @@ class Connection(BaseModel):
 class MepAddition(BaseModel):
     room: str
     item: str
+
+
+class SpatialRelationship(BaseModel):
+    subject_room: str = Field(description="Room being added or moved, using its exact existing ID when available")
+    target_room: str = Field(description="Anchor room, using its exact existing ID when available")
+    relation: str = Field(default="adjacent", description="adjacent, near, attached, inside, north, south, east, or west")
+    required: bool = Field(default=True, description="True when this relationship is explicit in the user's request")
+
+
+class FloorRoomSpec(BaseModel):
+    type: str = Field(description="Concise room type only, such as bedroom, bathroom, study_room, or an exact custom room name")
+    name: str = ""
+    bathroom_role: str = Field(default="", description="attached, common, or empty")
+    topology_role: str = Field(default="", description="hub for circulation/pass-through spaces, or spoke for private/destination spaces")
+
+
+class FloorProgramLevel(BaseModel):
+    floor_number: int = Field(description="Absolute floor index: 0 ground, 1 first floor, 2 second floor")
+    rooms: List[FloorRoomSpec] = Field(default_factory=list)
 MODIFICATION_SYSTEM_PROMPT = """You are a Spatial Engineer modifying an architectural floor plan.
 
 You will receive the CURRENT state of the layout and a modification request.
@@ -58,7 +77,7 @@ def modify_validated_blueprint(
         return {}
 
     # This uses the new SDK, clearing your deprecation warning for this call
-    client = genai.Client(api_key=GEMINI_API_KEY)
+    client = genai.Client(api_key=GEMINI_API_KEY, http_options=genai.types.HttpOptions(timeout=20000))
     
     user_content = (
         f"Request: {prompt}\n"
@@ -104,6 +123,10 @@ class HouseDesignRequest(BaseModel):
     style: str = ""
     materials: List[str] = Field(default_factory=list)
     target_rooms: List[str] = Field(default_factory=list)
+    floor_program: List[FloorProgramLevel] = Field(
+        default_factory=list,
+        description="Requested floor programs. For ADD-floor edits include only newly requested floors.",
+    )
     
     # --- ZERO HARDCODING: FULL AI ROOM CLASSIFICATION ---
     outdoor_rooms: List[str] = Field(default_factory=list, description="Rooms open to the sky (e.g., courtyard, angan).")
@@ -119,6 +142,11 @@ class HouseDesignRequest(BaseModel):
     theme_description: str = ""
     move_target_room: str = ""
     move_destination: str = ""
+    requested_relationships: List[SpatialRelationship] = Field(default_factory=list)
+    feasibility: str = Field(default="feasible", description="feasible, requires_relayout, or impossible_without_scope_change")
+    spatial_strategy: str = Field(default="preserve", description="preserve, swap_cells, local_relayout, or full_relayout")
+    analysis_summary: str = Field(default="", description="Short explanation of the spatial plan and its reason")
+    blocking_constraints: List[str] = Field(default_factory=list)
     vastu_specifics: List[VastuSpecific] = Field(default_factory=list)
     negative_constraints: List[str] = Field(default_factory=list)
     mep_additions: List[MepAddition] = Field(default_factory=list)
@@ -169,7 +197,7 @@ def generate_furniture_manifest(room_specs: List[Dict[str, Any]], user_prompt: s
         return _FURNITURE_CACHE[cache_key]
     try:
         from google import genai
-        client = genai.Client(api_key=GEMINI_API_KEY)
+        client = genai.Client(api_key=GEMINI_API_KEY, http_options=genai.types.HttpOptions(timeout=20000))
         system_prompt = """You are a professional interior-space planner for a low-poly 3D home generator.
 For EVERY supplied room, create a complete context-aware furniture and object manifest.
 Room types are open-ended; infer the correct contents from the room name and user request.
@@ -250,7 +278,7 @@ def generate_cultural_program(prompt: str, emit_fn: Callable = None) -> dict:
     except ImportError:
         return {}
 
-    client = genai.Client(api_key=GEMINI_API_KEY)
+    client = genai.Client(api_key=GEMINI_API_KEY, http_options=genai.types.HttpOptions(timeout=20000))
     if emit_fn:
         emit_fn({"stage": 1, "label": "AI Planning Requirements...", "substage": "Inferring cultural context and room program..."})
     
@@ -359,7 +387,7 @@ def generate_master_blueprint(
         logger.error("google-genai not installed. Cannot generate master blueprint.")
         return {}
 
-    client = genai.Client(api_key=GEMINI_API_KEY)
+    client = genai.Client(api_key=GEMINI_API_KEY, http_options=genai.types.HttpOptions(timeout=20000))
 
     if corrections:
         # Self-correction pass
@@ -507,14 +535,25 @@ class QueryRouter:
         logger.info("[ROUTER] Routing to Gemini Heavy Lane (1M+ context & Native Schema)")
         try:
             from google import genai
-            client = genai.Client(api_key=GEMINI_API_KEY)
+            client = genai.Client(api_key=GEMINI_API_KEY, http_options=genai.types.HttpOptions(timeout=20000))
             
-            sys_prompt = """You are a strict JSON translation engine for architectural layouts.
-Extract EVERY room, indoor space, outdoor area, floor, and custom facility the user requests.
-Room names are open-ended: do not limit, replace, omit, or reject a space because it is not in a vocabulary.
-Preserve unfamiliar names as concise snake_case labels in target_rooms (for example music_studio, art_gallery,
-recording_room, robotics_lab, library, or any other user-created space). Do not confuse furniture or materials
-with rooms. Return only the requested spaces and all requested spaces."""
+            sys_prompt = """You are a spatial planning engineer, not merely a keyword extractor.
+Extract EVERY requested room, outdoor area, floor, style, and action without replacing open-ended room names.
+
+When CURRENT SPATIAL STATE is supplied:
+- Inspect exact room IDs, dimensions, floor numbers, shared-wall neighbours, plot bounds, and open-to-sky spaces.
+- Resolve the user's subject and anchor to exact existing IDs whenever possible.
+- Express every explicit 'near', 'at', 'beside', 'attached', compass, or floor relationship in requested_relationships.
+- Decide whether the change can preserve geometry, needs a cell swap, needs a local floor re-layout, or cannot fit
+  without changing scope. Put that decision in spatial_strategy and feasibility.
+- Explain the geometric reason briefly in analysis_summary and list actual blockers in blocking_constraints.
+- ADD means the new room must appear in target_rooms even when it is absent from the current state.
+- When ADD requests a new floor/storey/duplex level, return floor_program as a list of objects shaped {"floor_number": 1, "rooms": [{"type": "free_form_room_name", "name": "display name", "bathroom_role": ""}]}. Never turn the instruction sentence into a room name. Room type is open-ended, not an enum.
+- MOVE must set move_target_room and move_destination. Never silently reinterpret MOVE as ADD or COLOR.
+- Do not invent coordinates or claim success. A deterministic constraint solver will execute and verify the plan.
+- For every floor_program room set topology_role to HUB only when people may naturally pass through it; set SPOKE for private or destination rooms. Bedrooms, offices, theaters, prayer rooms and attached bathrooms are normally SPOKE. Corridors, halls and appropriate open living/dining circulation areas may be HUB.
+
+Room vocabulary is open-ended. Return only JSON matching the schema."""
             if current_floorplan:
                 user_content = f"Current State: {json.dumps(current_floorplan)}\nRequest: {user_prompt}"
             else:
@@ -647,7 +686,10 @@ def auto_wire_topology(room_types: list, ai_categories: dict = None) -> list:
     outdoor_set.update({"balcony", "courtyard", "garden", "parking", "portico", "veranda", "terrace", "flat_terrace"})
     wet_set.update({"bathroom", "powder_room", "toilet", "washroom", "laundry"})
     circ_set.update({"corridor", "hallway", "foyer", "staircase", "passage"})
-    private_set.update({"bedroom", "master_bedroom", "elderly_suite", "study_room", "office", "gym"})
+    private_set.update({
+        "bedroom", "master_bedroom", "elderly_suite", "study_room", "office", "gym",
+        "walk_in_closet", "walkin_closet", "dressing_room", "closet",
+    })
 
     room_specs = []
     type_counts: Dict[str, int] = {}
@@ -679,7 +721,14 @@ def auto_wire_topology(room_types: list, ai_categories: dict = None) -> list:
         is_bedroom = "bedroom" in rt or rt in {"bed", "master_bed"}
         is_bathroom = any(token in rt for token in ("bath", "toilet", "washroom", "powder"))
         
-        if rt in outdoor_set:
+        topology_role = str(r.get("topology_role") or "").strip().lower()
+        if topology_role == "hub":
+            circulation_idx.append(i)
+            r['role'] = {'traffic': 'high', 'can_be_passage': True}
+        elif topology_role == "spoke":
+            private_idx.append(i)
+            r['role'] = {'traffic': 'low', 'can_be_passage': False}
+        elif rt in outdoor_set:
             outdoor_idx.append(i)
             r['role'] = {'traffic': 'high', 'can_be_passage': True}
         elif rt in circ_set:
@@ -705,16 +754,34 @@ def auto_wire_topology(room_types: list, ai_categories: dict = None) -> list:
         })
 
     # Phase 2: Dynamic Topology Wiring based on AI Bins
-    # 1. Chain Public Zones together (Open Concept Flow)
-    for i in range(len(public_idx) - 1):
-        add_conn(public_idx[i], public_idx[i+1], "open_flow", 10)
-
-    # 2. Determine Primary Hub for Circulation
-    hub_idx = circulation_idx[0] if circulation_idx else (public_idx[0] if public_idx else 0)
+    # 1. Determine Primary Hub for Circulation. Prefer a real corridor over a
+    # foyer; the foyer is an entry transition, not the whole-house spine.
+    # Prefer a horizontal circulation space as the hub. Gemini often lists
+    # the staircase first; using it as the hub leaves it disconnected from the
+    # corridor and can make the staircase act like an exterior entrance.
+    hub_idx = next(
+        (index for index in circulation_idx if room_specs[index]["type"] in {"corridor", "hallway", "passage"}),
+        circulation_idx[0] if circulation_idx else (public_idx[0] if public_idx else 0),
+    )
 
     # The circulation spine itself must open into the public entry zone.
     if circulation_idx and public_idx and hub_idx != public_idx[0]:
         add_conn(hub_idx, public_idx[0], "standard", 20)
+
+    # Every public/destination space receives its own hub connection. Never
+    # manufacture a railway-carriage chain such as dining -> office -> theater
+    # -> prayer merely because Gemini listed those rooms in that order.
+    for pi in public_idx:
+        if pi != hub_idx and pi != public_idx[0]:
+            add_conn(pi, hub_idx, "standard", 10)
+
+    # The final architectural validator treats kitchen/dining adjacency as a
+    # buildability contract. Encode that same contract before solving instead
+    # of discovering the mismatch after two floors have already been packed.
+    kitchen_idx = next((i for i, room in enumerate(room_specs) if room["type"] in {"kitchen", "open_kitchen"}), None)
+    dining_idx = next((i for i, room in enumerate(room_specs) if room["type"] in {"dining_room", "dining_area"}), None)
+    if kitchen_idx is not None and dining_idx is not None:
+        add_conn(kitchen_idx, dining_idx, "open_flow", 25)
 
     # Vertical circulation is never a bedroom passage. A staircase must open
     # to the circulation hub (corridor/foyer/living), which also guides the

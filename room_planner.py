@@ -485,13 +485,18 @@ def final_layout_validation(
             break
     checks["vastu"] = (not vastu_issues, vastu_issues)
 
-    # 5. Structural integrity — RCC clear spans must stay within reason.
+    # 5. Structural integrity. A room's long dimension is not automatically an
+    # unsupported RCC clear span: column/beam grids are generated separately.
+    # Only reject extreme room envelopes here; normal spans receive their
+    # actual support design from structural_generator.
     struct_issues: List[str] = []
     for n in nodes:
         if n.type in STRUCTURAL_TYPES:
             continue
-        span = max(n.rect.width, n.rect.length)
-        if span > 24.0:
+        # A corridor's long axis is travel length, not an unsupported clear
+        # span; its structural span is the narrow axis between supports.
+        span = min(n.rect.width, n.rect.length) if n.type in {"corridor", "hallway", "passage"} else max(n.rect.width, n.rect.length)
+        if span > 36.0:
             struct_issues.append(f"{n.name}: {span:.0f} ft span exceeds RCC limit (needs intermediate beam).")
     checks["structural_integrity"] = (not struct_issues, struct_issues)
 

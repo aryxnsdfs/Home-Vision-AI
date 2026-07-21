@@ -371,7 +371,7 @@ function TopBar() {
                 </div>
               </button>
               <button
-                onClick={() => useProjectStore.getState().setShowSetupModal(true)}
+                onClick={() => useProjectStore.getState().startNewTemplate()}
                 className="rounded bg-slate-800 px-2 py-0.5 text-xs font-bold text-emerald-400 hover:bg-slate-700 hover:text-emerald-300 transition-colors pointer-events-auto border border-slate-700"
               >
                 New Template
@@ -619,6 +619,7 @@ function PromptBar() {
       const json = await currentState._readSSEStream(`${API_BASE_URL}/generate/stream`, {
         prompt: clean,
         currentProject: currentState.project,
+        requestMode: "edit",
         layoutRules: currentState.layoutRules || [],
         indianOptions: currentState.project.indianOptions || {},
       });
@@ -626,21 +627,42 @@ function PromptBar() {
 
       // Use backend logs if available, otherwise show basic info
       const backendLogs = json.logs || [];
-      const clientLog = { type: "success", message: `Round-trip: ${elapsed}s`, time: new Date().toLocaleTimeString() };
-      setGenLogs([...backendLogs, clientLog]);
+      const editApplied = json.edit_status !== "not_applied";
+      const recommendationLogs = editApplied
+        ? []
+        : (json.recommendations || []).map(message => ({
+            type: "info", message, time: new Date().toLocaleTimeString()
+          }));
+      const clientLog = {
+        type: editApplied ? "success" : "warn",
+        message: editApplied
+          ? `Round-trip: ${elapsed}s`
+          : `Layout preserved after analysis (${elapsed}s)`,
+        time: new Date().toLocaleTimeString()
+      };
+      setGenLogs([...backendLogs, clientLog, ...recommendationLogs]);
 
       applyGeneratedProject(json);
-      setStatus("✓ Applied");
+      setStatus(editApplied ? "✓ Applied" : "⚠ Needs more space");
     } catch (err) {
       const elapsed = ((performance.now() - t0) / 1000).toFixed(2);
+      const isStructuralEdit = /\b(add|remove|delete|move|place|position|resize|expand|shrink|room|door|doorway|window)\b/i.test(clean);
+      const isStyleEdit = /\b(color|colour|paint|material|theme|style|exterior|interior|facade|roof)\b/i.test(clean);
       setGenLogs(prev => [
         ...prev,
         { type: "error", message: `Failed after ${elapsed}s: ${err.message}`, time: new Date().toLocaleTimeString() },
-        { type: "info", message: "Falling back to local style parsing", time: new Date().toLocaleTimeString() },
+        ...(isStyleEdit && !isStructuralEdit
+          ? [{ type: "info", message: "Falling back to local style parsing", time: new Date().toLocaleTimeString() }]
+          : []),
       ]);
-      // Graceful fallback to local style parsing
-      applyStylePrompt(clean);
-      setStatus("✓ Style applied locally");
+      // A failed room/door operation must never be disguised as a successful
+      // style update. Local fallback is valid only for an actual style prompt.
+      if (isStyleEdit && !isStructuralEdit) {
+        applyStylePrompt(clean);
+        setStatus("✓ Style applied locally");
+      } else {
+        setStatus("✕ Layout unchanged");
+      }
     } finally {
       setSubmitting(false);
       setPrompt("");
@@ -651,6 +673,8 @@ function PromptBar() {
   const rooms = useProjectStore(s => (s.project.floors ? s.project.floors[s.project.current_floor_index || 0].rooms : []));
   const lastUnderstood = useProjectStore(s => s.lastUnderstood);
   const lastWarnings = useProjectStore(s => s.lastWarnings);
+  const storedUnplacedRooms = useProjectStore(s => s.lastUnplacedRooms);
+  const lastUnplacedRooms = storedUnplacedRooms || [];
   const hasRooms = rooms && rooms.length > 0;
 
   const logColors = {
@@ -671,7 +695,20 @@ function PromptBar() {
   return (
     <div className="pointer-events-none fixed bottom-[110px] left-3 right-3 z-50 mx-auto flex max-w-2xl flex-col items-center gap-2 sm:left-24 sm:right-24 sm:bottom-[100px]">
 
-      
+      {lastUnplacedRooms.length > 0 && (
+        <div className="pointer-events-auto w-full rounded-xl border border-amber-500/30 bg-neutral-950/95 p-3 shadow-xl backdrop-blur-xl">
+          <p className="text-xs font-bold text-amber-300">Partial layout · unplaced rooms</p>
+          <div className="mt-2 flex flex-wrap gap-1.5">
+            {lastUnplacedRooms.map((room, index) => (
+              <span key={room.id || index} className="rounded-md bg-amber-500/10 px-2 py-1 text-[11px] text-amber-100">
+                {room.name || room.type}
+              </span>
+            ))}
+          </div>
+        </div>
+      )}
+
+
       <motion.div
         initial={{ y: 16, opacity: 0 }}
         animate={{ y: 0, opacity: 1 }}
@@ -721,7 +758,11 @@ function PromptBar() {
 function MiniMapFloorSwitch() {
   const visibleFloor = useProjectStore((s) => s.visibleFloor);
   const setVisibleFloor = useProjectStore((s) => s.setVisibleFloor);
-  const rooms = useProjectStore((s) => (s.project.floors ? s.project.floors[s.project.current_floor_index || 0].rooms : []));
+  const floors = useProjectStore((s) => s.project.floors);
+  const rooms = useMemo(
+    () => (floors || []).flatMap(floor => floor?.rooms || []),
+    [floors]
+  );
   const levels = [...new Set((rooms || []).map(r => Number.isFinite(r.floorIndex) ? r.floorIndex : (r.isFloor1 ? 1 : 0)))].sort((a, b) => a - b);
   if (levels.length <= 1) return null;
   const label = (level) => level < 0 ? "Basement" : level === 0 ? "Ground" : `${level === 1 ? "First" : level === 2 ? "Second" : level} Floor`;
@@ -748,7 +789,11 @@ function MiniMapFloorSwitch() {
 
 function MiniMap() {
   const [expanded, setExpanded] = React.useState(false);
-  const allRooms = useProjectStore((state) => (state.project.floors ? state.project.floors[state.project.current_floor_index || 0].rooms : []));
+  const floors = useProjectStore((state) => state.project.floors);
+  const allRooms = useMemo(
+    () => (floors || []).flatMap(floor => floor?.rooms || []),
+    [floors]
+  );
   const selectedRoomId = useProjectStore((state) => state.selectedRoomId);
   const selectRoom = useProjectStore((state) => state.selectRoom);
   const setCameraView = useProjectStore((state) => state.setCameraView);
@@ -2106,7 +2151,7 @@ function FloorToggleInline() {
   const visibleFloor = useProjectStore((state) => state.visibleFloor);
   const setVisibleFloor = useProjectStore((state) => state.setVisibleFloor);
   const project = useProjectStore((state) => state.project);
-  const rooms = project.floors ? project.floors[project.current_floor_index || 0].rooms : [];
+  const rooms = (project.floors || []).flatMap(floor => floor?.rooms || []);
   const levels = [...new Set((rooms || []).map(r => Number.isFinite(r.floorIndex) ? r.floorIndex : (r.isFloor1 ? 1 : 0)))].sort((a, b) => a - b);
   if (levels.length <= 1) return null;
   return (

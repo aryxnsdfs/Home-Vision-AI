@@ -43,6 +43,7 @@ export default function GenerationOverlay() {
   const visible = !!generationProgress;
   const finalizing = generationProgress?.finalizing ?? false;
   const meta = generationProgress?.meta ?? {};
+  const capacity = generationProgress?.capacity;
 
   useEffect(() => {
     if (!visible) return;
@@ -165,6 +166,7 @@ export default function GenerationOverlay() {
                   <p className="text-white/30 text-sm">Design generation complete</p>
                 </motion.div>
               </motion.div>
+
             )}
           </AnimatePresence>
 
@@ -182,6 +184,33 @@ export default function GenerationOverlay() {
                   Generating your home
                 </p>
               </motion.div>
+
+              {capacity && (
+                <motion.div
+                  className="mb-7 rounded-xl border border-white/10 bg-white/5 p-3"
+                  initial={{ opacity: 0, y: 6 }}
+                  animate={{ opacity: 1, y: 0 }}
+                >
+                  <div className="mb-2 flex items-center justify-between text-xs">
+                    <span className="font-medium text-white/70">Area budget</span>
+                    <span className={capacity.fits ? "text-emerald-400" : "text-red-400"}>
+                      {capacity.required_sqft?.toLocaleString()} / {capacity.available_sqft?.toLocaleString()} sq ft
+                    </span>
+                  </div>
+                  <div className="h-2 overflow-hidden rounded-full bg-white/10">
+                    <motion.div
+                      className={`h-full rounded-full ${capacity.fits ? "bg-emerald-400" : "bg-red-500"}`}
+                      initial={{ width: 0 }}
+                      animate={{ width: `${Math.min(100, capacity.usage_percent || 0)}%` }}
+                    />
+                  </div>
+                  <p className="mt-2 text-[11px] text-white/45">
+                    {capacity.fits
+                      ? `${Math.max(0, capacity.available_sqft - capacity.required_sqft).toLocaleString()} sq ft remains for flexibility.`
+                      : `Needs ${(capacity.required_sqft - capacity.available_sqft).toLocaleString()} sq ft more. Consider another floor, a ${capacity.recommended_plot?.width}×${capacity.recommended_plot?.length} ft plot, or optimization.`}
+                  </p>
+                </motion.div>
+              )}
 
               {/* Stage list */}
               <div className="space-y-4">

@@ -62,6 +62,7 @@ const wallPalette = {
   warm_beige: "#F5F5DC",
   light_grey: "#D3D3D3",
   mustard: "#E4A010",
+  ivory: "#FDF5E6",
   terracotta: "#E2725B",
   cream: "#FDF5E6",
   beige: "#F5F5DC",
@@ -350,7 +351,7 @@ function buildWallSegmentsWithOpenings(wallKind, length, thickness, openings, wa
   return segments;
 }
 
-function wallSegmentsFor(room, bounds, wallThickness) {
+function wallSegmentsFor(room, bounds, wallThickness, rooms = []) {
   const segments = [];
   const windowPanes = [];
   const doorPanes = [];
@@ -433,7 +434,26 @@ function wallSegmentsFor(room, bounds, wallThickness) {
   // The backend marks circulation rooms (corridor/hallway/staircase) with
   // suppress_wall_faces — faces shared with adjacent rooms. Skip those faces
   // so only the adjacent room renders the shared wall (prevents double-thick).
-  const suppress = new Set(room.suppress_wall_faces || []);
+  // Suppression metadata can become stale after a room is resized or moved.
+  // Only suppress a face when the current rectangles really share that face;
+  // otherwise the stale flag creates a visible slit in the generated wall.
+  const sharesFace = (face) => {
+    const tolerance = 0.08;
+    return (rooms || []).some(other => {
+      if (!other || other.id === room.id) return false;
+      const ox = Number(other.x), oz = Number(other.z);
+      const ow = Number(other.width), ol = Number(other.length);
+      if (![ox, oz, ow, ol].every(Number.isFinite)) return false;
+      const overlapX = Math.min(room.x + room.width, ox + ow) - Math.max(room.x, ox);
+      const overlapZ = Math.min(room.z + room.length, oz + ol) - Math.max(room.z, oz);
+      if (face === 'north') return Math.abs(room.z - (oz + ol)) <= tolerance && overlapX > tolerance;
+      if (face === 'south') return Math.abs((room.z + room.length) - oz) <= tolerance && overlapX > tolerance;
+      if (face === 'west') return Math.abs(room.x - (ox + ow)) <= tolerance && overlapZ > tolerance;
+      if (face === 'east') return Math.abs((room.x + room.width) - ox) <= tolerance && overlapZ > tolerance;
+      return false;
+    });
+  };
+  const suppress = new Set((room.suppress_wall_faces || []).filter(sharesFace));
 
   // North wall (z = 0, along x)
   if (!suppress.has('north')) {
@@ -699,8 +719,8 @@ export default function Room({
   }
 
   const { segments: wallSegments, windowPanes, doorPanes } = useMemo(
-    () => wallSegmentsFor(room, bounds, wallThickness),
-    [bounds.length, bounds.width, room, wallThickness]
+    () => wallSegmentsFor(room, bounds, wallThickness, rooms),
+    [bounds.length, bounds.width, room, wallThickness, rooms]
   );
   const validWallSegments = wallSegments.filter(segment =>
     ['px', 'py', 'pz', 'sx', 'sy', 'sz'].every(key => Number.isFinite(segment[key])) &&
