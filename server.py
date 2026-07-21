@@ -5635,6 +5635,7 @@ def _stream_generate_work(req: "GenerateRequest", emit_fn: Callable) -> None:
         room_pool = list(layout_params["rooms"])
         room_pool, structural_features = strip_structural(room_pool)
         floor_program = layout_params.get("floor_program") or {}
+        has_explicit_schedule = bool(floor_program)
         floor_specs_by_level: Dict[int, List[Dict]] = {}
         if floor_program:
             outdoor_specs, basement_specs = [], []
