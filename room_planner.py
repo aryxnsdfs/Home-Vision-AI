@@ -213,16 +213,14 @@ def validate_circulation_access(nodes: List[RoomNode]) -> Dict[str, Any]:
                     queue.append(path + [nxt])
 
         if not found_path:
-            errors.append(f"UNREACHABLE: '{n.name}' ({n.id}) has no walking path from main entrance.")
+            errors.append({"code": "UNREACHABLE_ROOM", "message": f"'{n.name}' ({n.id}) has no walking path from main entrance."})
             continue
 
         intermediate_ids = found_path[1:-1]
         for mid_id in intermediate_ids:
             mid_node = node_by_id.get(mid_id)
             if mid_node and _canon(mid_node.type) in FORBIDDEN_TRANSIT_TYPES:
-                errors.append(
-                    f"FORBIDDEN_TRANSIT: Path to '{n.name}' passes through private/service space '{mid_node.name}' ({mid_node.type})."
-                )
+                errors.append({"code": "INVALID_TRANSIT", "message": f"Path to '{n.name}' passes through private/service space '{mid_node.name}' ({mid_node.type})."})
 
     return {"passed": len(errors) == 0, "errors": errors}
 
@@ -606,17 +604,30 @@ def final_layout_validation(
     checks["vastu"] = (not vastu_issues, vastu_issues)
 
     # 5. Structural integrity. Inject structural column grid into rooms with spans > 25 ft.
-    struct_issues: List[str] = []
+    # 3. Minimum room sizes
+    size_issues = []
+    for n in nodes:
+        w, l = n.rect.width, n.rect.length
+        ctype = _canon(n.type)
+        if ctype in MIN_ROOM_AREAS and (w * l) < (MIN_ROOM_AREAS[ctype] * 0.9):
+            size_issues.append({"code": "WARNING_SMALL_ROOM", "message": f"{n.name} is {(w*l):.0f} sqft, below minimum."})
+    checks["minimum_sizes"] = (not size_issues, size_issues)
+
+    # 4. Mandatory minimum dimensions
+    dim_issues = []
+    for n in nodes:
+        w, l = n.rect.width, n.rect.length
+        if min(w, l) < 3.0:
+            dim_issues.append({"code": "WARNING_NARROW_ROOM", "message": f"{n.name} has a dimension < 3.0ft."})
+    checks["minimum_dimensions"] = (not dim_issues, dim_issues)
+
+    # 5. Structural integrity (span limits)
+    struct_issues = []
     import math
     for n in nodes:
-        if n.type in STRUCTURAL_TYPES:
-            continue
-        span = min(n.rect.width, n.rect.length) if n.type in {"corridor", "hallway", "passage"} else max(n.rect.width, n.rect.length)
+        span = min(n.rect.width, n.rect.length)
         if span > 25.0:
-            mep_list = getattr(n, "mep_nodes", None)
-            if mep_list is None:
-                n.mep_nodes = []
-                mep_list = n.mep_nodes
+            mep_list = getattr(n, "mep_nodes", []) or []
             has_columns = any(isinstance(m, dict) and m.get("type") in {"structural_column", "column", "pillar"} for m in mep_list)
             if not has_columns:
                 cols_x = max(0, math.ceil(n.rect.width / 20.0) - 1)
@@ -636,14 +647,14 @@ def final_layout_validation(
                             })
                             has_columns = True
             if span > 150.0 and not has_columns:
-                struct_issues.append(f"{n.name}: {span:.0f} ft span exceeds RCC limit.")
+                struct_issues.append({"code": "STRUCTURAL_LIMIT", "message": f"{n.name}: {span:.0f} ft span exceeds RCC limit."})
     checks["structural_integrity"] = (not struct_issues, struct_issues)
 
     # 6. Buildability — no degenerate/overlapping rooms.
-    build_issues: List[str] = []
+    build_issues = []
     for n in nodes:
         if n.rect.width <= 0 or n.rect.length <= 0:
-            build_issues.append(f"{n.name}: non-positive dimension (unbuildable).")
+            build_issues.append({"code": "INVALID_ROOM_DIMENSIONS", "message": f"{n.name}: non-positive dimension (unbuildable)."})
     for i, a in enumerate(nodes):
         for b in nodes[i + 1:]:
             if a.type in STRUCTURAL_TYPES or b.type in STRUCTURAL_TYPES:
@@ -651,17 +662,20 @@ def final_layout_validation(
             ox = min(a.rect.x + a.rect.width, b.rect.x + b.rect.width) - max(a.rect.x, b.rect.x)
             oz = min(a.rect.z + a.rect.length, b.rect.z + b.rect.length) - max(a.rect.z, b.rect.z)
             if ox > 0.3 and oz > 0.3:
-                build_issues.append(f"{a.name} overlaps {b.name}.")
+                build_issues.append({"code": "ROOM_OVERLAP", "message": f"{a.name} overlaps {b.name}."})
     checks["buildability"] = (not build_issues, build_issues)
 
     # 7. Universal Circulation & Transit Policy Check
     circ_access = validate_circulation_access(nodes)
     checks["universal_circulation_policy"] = (circ_access["passed"], circ_access["errors"])
 
-    ok = all(passed for passed, _ in checks.values())
     issues_all = [i for _, issues in checks.values() for i in issues]
+    
+    # Validation is OK ONLY if there are no errors belonging to FATAL_CATEGORIES
+    ok = not any(err.get("code") in FATAL_CATEGORIES for err in issues_all if isinstance(err, dict))
+    
     return {
         "ok": ok,
         "checks": {k: {"ok": v[0], "issues": v[1]} for k, v in checks.items()},
-        "issues": issues_all,
+        "errors": issues_all, # Structured errors
     }
