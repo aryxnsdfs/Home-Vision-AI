@@ -404,7 +404,17 @@ export default function ProjectSetupModal() {
     const { w, l } = getFinalDimensions();
     if (!prompt.trim() || !w || !l || w <= 0 || l <= 0) return;
     setLoading(true);
-    await analyzePrompt(prompt, w, l, floors);
+    await generateWithAI(
+      prompt,
+      w,
+      l,
+      indianOptions,
+      colorPrefs,
+      "Standard",
+      "India",
+      {},
+      floors
+    );
     setLoading(false);
   };
 

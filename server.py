@@ -5784,7 +5784,7 @@ def _stream_generate_work(req: "GenerateRequest", emit_fn: Callable) -> None:
                 
             # --- APPLY ROOM SCALING ---
             coverage_str = str(slm_result.get("coverage_preference", "")) if slm_result else ""
-            coverage_ratio = 0.65 # default
+            coverage_ratio = 0.75 # default (75% building coverage)
             if "40" in coverage_str: coverage_ratio = 0.40
             elif "50" in coverage_str: coverage_ratio = 0.50
             elif "70" in coverage_str: coverage_ratio = 0.70

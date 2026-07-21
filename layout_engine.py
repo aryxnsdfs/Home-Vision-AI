@@ -903,7 +903,7 @@ class LayoutEngine:
         # use at least 80% of the plot. A 95% buildable span on each axis leaves
         # a 90.25% maximum footprint, giving the solver enough room to reach the
         # 80% target without crossing the plot boundary.
-        self.target_coverage = 0.80
+        self.target_coverage = 0.75
         self.buildable_width = self.plot_width * 0.95
         self.buildable_length = self.plot_length * 0.95
         self.setback_x = (self.plot_width - self.buildable_width) / 2
