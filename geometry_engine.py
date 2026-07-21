@@ -327,9 +327,9 @@ class CPSolver:
                 processed_edges.add(edge)
 
                 trv = room_vars[target_id]
-                self._add_touch_constraint(model, rv, trv, r_id, target_id, door_w)
+                self._add_touch_constraint(model, rv, trv, r_id, target_id)
 
-        logger.info(f"[CP-SAT] {len(processed_edges)} required door edges encoded as HARD constraints.")
+        logger.info(f"[CP-SAT] {len(processed_edges)} required adjacency edges encoded as HARD constraints.")
 
         # ────────────────────────────────────────────
         # PHASE 4 — Forbidden Adjacencies (HARD)
@@ -625,37 +625,37 @@ class CPSolver:
     # ── helpers ──────────────────────────────────────
 
     @staticmethod
-    def _add_touch_constraint(model, a, b, a_id, b_id, door_w):
+    def _add_touch_constraint(model, a, b, a_id, b_id, min_overlap=1.0):
         """
-        HARD: rooms *a* and *b* must share a wall with ≥ door_w overlap.
+        HARD: rooms *a* and *b* must share a wall with ≥ min_overlap overlap (adjacency).
 
         Encodes four directional cases; at least one must be true.
         """
         tag = f'{a_id}__{b_id}'
 
-        # Case 1 — A left of B  (A.x_end == B.x, Z overlap ≥ door_w)
+        # Case 1 — A left of B  (A.x_end == B.x, Z overlap ≥ min_overlap)
         c1 = model.NewBoolVar(f'L_{tag}')
         model.Add(a['x'] + a['w'] == b['x']).OnlyEnforceIf(c1)
-        model.Add(a['z'] + door_w <= b['z'] + b['l']).OnlyEnforceIf(c1)
-        model.Add(b['z'] + door_w <= a['z'] + a['l']).OnlyEnforceIf(c1)
+        model.Add(a['z'] + min_overlap <= b['z'] + b['l']).OnlyEnforceIf(c1)
+        model.Add(b['z'] + min_overlap <= a['z'] + a['l']).OnlyEnforceIf(c1)
 
         # Case 2 — A right of B  (B.x_end == A.x)
         c2 = model.NewBoolVar(f'R_{tag}')
         model.Add(b['x'] + b['w'] == a['x']).OnlyEnforceIf(c2)
-        model.Add(a['z'] + door_w <= b['z'] + b['l']).OnlyEnforceIf(c2)
-        model.Add(b['z'] + door_w <= a['z'] + a['l']).OnlyEnforceIf(c2)
+        model.Add(a['z'] + min_overlap <= b['z'] + b['l']).OnlyEnforceIf(c2)
+        model.Add(b['z'] + min_overlap <= a['z'] + a['l']).OnlyEnforceIf(c2)
 
-        # Case 3 — A above B  (A.z_end == B.z, X overlap ≥ door_w)
+        # Case 3 — A above B  (A.z_end == B.z, X overlap ≥ min_overlap)
         c3 = model.NewBoolVar(f'A_{tag}')
         model.Add(a['z'] + a['l'] == b['z']).OnlyEnforceIf(c3)
-        model.Add(a['x'] + door_w <= b['x'] + b['w']).OnlyEnforceIf(c3)
-        model.Add(b['x'] + door_w <= a['x'] + a['w']).OnlyEnforceIf(c3)
+        model.Add(a['x'] + min_overlap <= b['x'] + b['w']).OnlyEnforceIf(c3)
+        model.Add(b['x'] + min_overlap <= a['x'] + a['w']).OnlyEnforceIf(c3)
 
         # Case 4 — A below B  (B.z_end == A.z)
         c4 = model.NewBoolVar(f'B_{tag}')
         model.Add(b['z'] + b['l'] == a['z']).OnlyEnforceIf(c4)
-        model.Add(a['x'] + door_w <= b['x'] + b['w']).OnlyEnforceIf(c4)
-        model.Add(b['x'] + door_w <= a['x'] + a['w']).OnlyEnforceIf(c4)
+        model.Add(a['x'] + min_overlap <= b['x'] + b['w']).OnlyEnforceIf(c4)
+        model.Add(b['x'] + min_overlap <= a['x'] + a['w']).OnlyEnforceIf(c4)
 
         model.AddBoolOr([c1, c2, c3, c4])
 
