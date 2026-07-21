@@ -388,6 +388,23 @@ export default function ProjectSetupModal() {
     setLoading(true);
     const rooms = [];
     Object.entries(customCounts).forEach(([type, count]) => {
+      for (let i = 0; i < count; i++) rooms.push(type);
+    });
+    if (!rooms.includes('foyer')) rooms.push('foyer');
+    const { w, l } = getFinalDimensions();
+    if (!w || !l || w <= 0 || l <= 0) { setLoading(false); return; }
+    const customOptions = { ...indianOptions, promptInjection: "CRITICAL REQUIREMENT: Bathrooms MUST be attached to bedrooms. Do not place a bathroom separately from a bedroom. A bathroom must share a wall and an intersection with a bedroom." };
+    await generateFromTemplate('CUSTOM', w, l, floors, rooms, customOptions, colorPrefs, "Standard", "India");
+    useProjectStore.getState().setCameraView('top');
+    setLoading(false);
+  };
+
+  const handleGenerateAI = async (e) => {
+    e?.preventDefault();
+    const { w, l } = getFinalDimensions();
+    if (!prompt.trim() || !w || !l || w <= 0 || l <= 0) return;
+    setLoading(true);
+    await analyzePrompt(prompt, w, l, floors);
     setLoading(false);
   };
 
