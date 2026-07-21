@@ -634,6 +634,7 @@ def final_layout_validation(
     nodes: List[RoomNode],
     indian_options: Optional[Dict[str, Any]] = None,
     is_duplex: bool = False,
+    canonical_specs: Optional[List[Dict[str, Any]]] = None,
 ) -> Dict[str, Any]:
     """Explicitly confirm the layout is buildable.
 
@@ -644,6 +645,30 @@ def final_layout_validation(
     """
     indian_options = indian_options or {}
     checks: Dict[str, Tuple[bool, List[str]]] = {}
+
+    # 0. Canonical Program Integrity Check
+    if canonical_specs:
+        missing_issues = []
+        realized_counts: Dict[str, int] = {}
+        for n in nodes:
+            ctype = _canon(n.type)
+            realized_counts[ctype] = realized_counts.get(ctype, 0) + 1
+        
+        expected_counts: Dict[str, int] = {}
+        for spec in canonical_specs:
+            ctype = _canon(spec.get("type"))
+            expected_counts[ctype] = expected_counts.get(ctype, 0) + 1
+
+        for rtype, req_count in expected_counts.items():
+            if rtype in {"corridor", "hallway", "passage", "staircase", "void", "outdoor_space"}:
+                continue
+            realized_count = realized_counts.get(rtype, 0)
+            if realized_count < req_count:
+                missing_issues.append({
+                    "code": "MISSING_REQUIRED_ROOM",
+                    "message": f"Required room '{rtype}' is missing from realized layout. Requested {req_count}, realized {realized_count}."
+                })
+        checks["program_integrity"] = (not missing_issues, missing_issues)
 
     by_type: Dict[str, List[RoomNode]] = {}
     for n in nodes:

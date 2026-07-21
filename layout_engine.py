@@ -1939,9 +1939,44 @@ class LayoutEngine:
 
         return nodes
 
-# ---------------------------------------------------------------------------
-# Adjacency Graph & Doors
-# ---------------------------------------------------------------------------
+ACCESS_POLICIES = {
+    "bedroom": {
+        "allowed_from": {"corridor", "hallway", "passage", "lobby", "foyer", "family_lounge", "staircase", "landing"},
+        "forbidden_from": {"bathroom", "toilet", "kitchen", "bedroom", "master_bedroom", "dining_room", "utility_area", "store_room"},
+    },
+    "master_bedroom": {
+        "allowed_from": {"corridor", "hallway", "passage", "lobby", "foyer", "family_lounge", "staircase", "landing"},
+        "forbidden_from": {"bathroom", "toilet", "kitchen", "bedroom", "dining_room", "utility_area", "store_room"},
+    },
+    "bathroom": {
+        "allowed_from": {"corridor", "hallway", "passage", "lobby", "foyer", "bedroom", "master_bedroom"},
+        "forbidden_from": {"kitchen", "dining_room"},
+    },
+    "kitchen": {
+        "allowed_from": {"dining_room", "corridor", "hallway", "passage", "utility_area", "store_room", "living_room", "family_lounge"},
+        "forbidden_from": {"bathroom", "toilet", "bedroom", "master_bedroom"},
+    },
+}
+
+def is_legal_door_pair(r1, r2) -> bool:
+    from room_planner import _canon
+    t1, t2 = _canon(r1.type), _canon(r2.type)
+    if t1 in ACCESS_POLICIES:
+        pol1 = ACCESS_POLICIES[t1]
+        if t2 in pol1.get("forbidden_from", set()):
+            if t1 in {"bathroom", "toilet"} and getattr(r1, "bathroom_role", "") == "attached":
+                if getattr(r1, "assigned_to", "") in {r2.id, r2.name, r2.type}:
+                    return True
+            return False
+    if t2 in ACCESS_POLICIES:
+        pol2 = ACCESS_POLICIES[t2]
+        if t1 in pol2.get("forbidden_from", set()):
+            if t2 in {"bathroom", "toilet"} and getattr(r2, "bathroom_role", "") == "attached":
+                if getattr(r2, "assigned_to", "") in {r1.id, r1.name, r1.type}:
+                    return True
+            return False
+    return True
+
 
 class AdjacencyResolver:
     def __init__(self, rooms: List[RoomNode], open_rooms: List[str] = None):
@@ -2050,44 +2085,6 @@ class AdjacencyResolver:
                 
                 placed_doors_between.add(pair)
                 logger.info(f"    Placed door between '{r1.name}' and '{r2.name}'")
-
-ACCESS_POLICIES = {
-    "bedroom": {
-        "allowed_from": {"corridor", "hallway", "passage", "lobby", "foyer", "family_lounge", "staircase", "landing"},
-        "forbidden_from": {"bathroom", "toilet", "kitchen", "bedroom", "master_bedroom", "dining_room", "utility_area", "store_room"},
-    },
-    "master_bedroom": {
-        "allowed_from": {"corridor", "hallway", "passage", "lobby", "foyer", "family_lounge", "staircase", "landing"},
-        "forbidden_from": {"bathroom", "toilet", "kitchen", "bedroom", "dining_room", "utility_area", "store_room"},
-    },
-    "bathroom": {
-        "allowed_from": {"corridor", "hallway", "passage", "lobby", "foyer", "bedroom", "master_bedroom"},
-        "forbidden_from": {"kitchen", "dining_room"},
-    },
-    "kitchen": {
-        "allowed_from": {"dining_room", "corridor", "hallway", "passage", "utility_area", "store_room", "living_room", "family_lounge"},
-        "forbidden_from": {"bathroom", "toilet", "bedroom", "master_bedroom"},
-    },
-}
-
-def is_legal_door_pair(r1, r2) -> bool:
-    from room_planner import _canon
-    t1, t2 = _canon(r1.type), _canon(r2.type)
-    if t1 in ACCESS_POLICIES:
-        pol1 = ACCESS_POLICIES[t1]
-        if t2 in pol1.get("forbidden_from", set()):
-            if t1 in {"bathroom", "toilet"} and getattr(r1, "bathroom_role", "") == "attached":
-                if getattr(r1, "assigned_to", "") in {r2.id, r2.name, r2.type}:
-                    return True
-            return False
-    if t2 in ACCESS_POLICIES:
-        pol2 = ACCESS_POLICIES[t2]
-        if t1 in pol2.get("forbidden_from", set()):
-            if t2 in {"bathroom", "toilet"} and getattr(r2, "bathroom_role", "") == "attached":
-                if getattr(r2, "assigned_to", "") in {r1.id, r1.name, r1.type}:
-                    return True
-            return False
-    return True
 
         # --- PASS 2: RESCUE STRANDED ROOMS ---
         # If strict topological checks blocked a room from getting ANY doors, 
