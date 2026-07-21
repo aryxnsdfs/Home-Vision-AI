@@ -5653,11 +5653,9 @@ def _stream_generate_work(req: "GenerateRequest", emit_fn: Callable) -> None:
                     # the entrance placer. Do not accept an extra AI-invented
                     # entry/foyer room unless the user actually requested it.
                     normalized_type = canonical_type(normalized.get("type"))
-                    if normalized_type in {"entry", "entrance", "foyer"} and not re.search(
-                        r"\b(?:entry|entrance|foyer|mudroom|shoe\s*area|lobby)\b", req.prompt.lower(),
-                    ):
-                        logger.info("[SEMANTIC GUARD] Removed unrequested optional room: %s", normalized_type)
-                        continue
+                    # Preserving the explicit Foyer extracted by the LLM
+                    if normalized_type in {"entry", "entrance", "foyer"}:
+                        normalized["required"] = True
                     if canonical_type(normalized.get("type")) in {"circulation", "lobby", "passage", "hallway"}:
                         normalized["type"] = "corridor"
                         normalized["name"] = "Corridor"

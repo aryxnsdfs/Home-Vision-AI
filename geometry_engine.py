@@ -544,10 +544,10 @@ class CPSolver:
                     "id": r_id,
                     "type": rv['type'],
                     "connections": rv['connections'],
-                    "x": solver.Value(rv['x']) / scale,
-                    "z": solver.Value(rv['z']) / scale,
-                    "width": solver.Value(rv['w']) / scale,
-                    "length": solver.Value(rv['l']) / scale,
+                    "x": from_cp(solver.Value(rv['x'])),
+                    "z": from_cp(solver.Value(rv['z'])),
+                    "width": from_cp(solver.Value(rv['w'])),
+                    "length": from_cp(solver.Value(rv['l'])),
                 })
 
             # ── PHASE 7 — Post-Solve Validation ──
