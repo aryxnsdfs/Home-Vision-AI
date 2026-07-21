@@ -6047,18 +6047,19 @@ def _stream_generate_work(req: "GenerateRequest", emit_fn: Callable) -> None:
                 for level, report in floor_validation_reports
                 for name, check in report["checks"].items()
             },
-            "issues": [
-                f"Floor {level}: {issue}"
+            "errors": [
+                error if isinstance(error, dict) else {"code": "WARNING", "message": str(error)}
                 for level, report in floor_validation_reports
-                for issue in report["issues"]
+                for error in report.get("errors", report.get("issues", []))
             ],
         }
 
         # LOCAL REPAIR PASS for repairable validation issues
         if not validation_report["ok"]:
             repaired_any = False
-            for issue in validation_report["issues"]:
-                if "Kitchen is not adjacent to the Dining Room" in issue or "not adjacent" in issue.lower():
+            for error in validation_report["errors"]:
+                msg = error.get("message", "")
+                if "Kitchen is not adjacent to the Dining Room" in msg or "not adjacent" in msg.lower():
                     k_node = next((n for n in generated_nodes_0 if "kitchen" in getattr(n, "type", "").lower()), None)
                     d_node = next((n for n in generated_nodes_0 if "dining" in getattr(n, "type", "").lower()), None)
                     if k_node and d_node:
@@ -6104,20 +6105,20 @@ def _stream_generate_work(req: "GenerateRequest", emit_fn: Callable) -> None:
                         for level, report in floor_validation_reports
                         for name, check in report["checks"].items()
                     },
-                    "issues": [
-                        f"Floor {level}: {issue}"
+                    "errors": [
+                        error if isinstance(error, dict) else {"code": "WARNING", "message": str(error)}
                         for level, report in floor_validation_reports
-                        for issue in report["issues"]
+                        for error in report.get("errors", report.get("issues", []))
                     ],
                 }
 
         response["validation"] = validation_report
         if not validation_report["ok"]:
-            warnings.extend(validation_report["issues"])
-            logger.warning("[PIPELINE] Validation issues remaining after repair: %s", "; ".join(validation_report["issues"]))
-            unbuildable = [i for i in validation_report["issues"] if "overlaps" in i.lower() or "unbuildable" in i.lower()]
-            if unbuildable:
-                raise RuntimeError("Generated layout failed final buildability validation: " + "; ".join(unbuildable))
+            warnings.extend([e.get("message", str(e)) for e in validation_report["errors"]])
+            error_msgs = [e.get("message", "") for e in validation_report["errors"] if e.get("code") != "WARNING"]
+            logger.warning("[PIPELINE] Validation issues remaining after repair: %s", "; ".join(error_msgs))
+            # Fatal Categories should correctly raise an error for now until the full Multi-Candidate loops are implemented
+            raise RuntimeError("Generated layout failed final buildability validation: " + "; ".join(error_msgs))
 
         response["layout_data"] = layout_data
         response["warnings"] = warnings
