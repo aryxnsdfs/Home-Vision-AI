@@ -859,13 +859,22 @@ def auto_wire_topology(room_types: list, ai_categories: dict = None) -> list:
 
     # Rule C: Ensure every DESTINATION room connects to at least one circulation space
     for i, room in enumerate(room_specs):
-        r_passage = room.get("role", {}).get("can_be_passage", True)
-        if not r_passage and hub_idx is not None and i != hub_idx:
+        r_passage = room.get("role", {}).get("can_be_passage", False)
+        if r_passage:
+            continue  # Only skip explicitly known circulation rooms
+        if hub_idx is not None and i != hub_idx:
             has_circ = any(
                 id_to_spec.get(c.get("target_room_id", ""), {}).get("role", {}).get("can_be_passage", False)
                 for c in room.get("connections", [])
             )
             if not has_circ:
                 add_conn(i, hub_idx, "standard", 10)
+
+    # --- ABSOLUTE FAIL-SAFE: ORPHAN SWEEPER ---
+    # Ensure no room is ever left as a sealed box
+    for i, room in enumerate(room_specs):
+        valid_conns = [c for c in room.get('connections', []) if not c.get('_remove')]
+        if len(valid_conns) == 0 and hub_idx is not None and i != hub_idx:
+            add_conn(i, hub_idx, "standard", 10)
 
     return room_specs
