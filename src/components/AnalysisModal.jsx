@@ -4,12 +4,10 @@ import { useProjectStore } from '../store/useProjectStore';
 import { X, Check, ArrowRight, ChevronRight, Home, Building } from 'lucide-react';
 
 export default function AnalysisModal() {
-  const { analysisResult, generateWithAI, isAnalyzing, clearAnalysis } = useProjectStore(state => ({
-    analysisResult: state.analysisResult,
-    generateWithAI: state.generateWithAI,
-    isAnalyzing: state.isAnalyzing,
-    clearAnalysis: () => useProjectStore.setState({ analysisResult: null })
-  }));
+  const analysisResult = useProjectStore(state => state.analysisResult);
+  const generateWithAI = useProjectStore(state => state.generateWithAI);
+  const isAnalyzing = useProjectStore(state => state.isAnalyzing);
+  const clearAnalysis = () => useProjectStore.setState({ analysisResult: null });
 
   const [answers, setAnswers] = useState({});
   const [loading, setLoading] = useState(false);
