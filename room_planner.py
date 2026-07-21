@@ -621,7 +621,6 @@ def final_layout_validation(
 
     # 5. Structural integrity. Inject structural column grid into rooms with spans > 25 ft.
     # 3. Minimum room sizes
-    from layout_engine import ROOM_MINIMUMS
     size_issues = []
     for n in nodes:
         w, l = n.rect.width, n.rect.length
