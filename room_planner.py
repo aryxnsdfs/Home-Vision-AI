@@ -541,6 +541,13 @@ def split_duplex_specs(
             
         # Sever all AI-hallucinated direct paths to bedrooms/kitchen/etc.
         stair["connections"] = []
+        for r in floor_specs:
+            if r is not stair:
+                r["connections"] = [
+                    c for c in r.get("connections", [])
+                    if str(c.get("target_room_id", "")) != str(stair.get("id"))
+                    and _canon(c.get("target_room", "")) not in {"staircase", "stairwell"}
+                ]
         
         hub = next(
             (r for r in floor_specs if _canon(r.get("type", "")) in {"lobby", "stair_landing", "corridor", "hallway"}),

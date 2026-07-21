@@ -180,41 +180,37 @@ class CPSolver:
             if room.get("min_w_override") and room.get("min_l_override"):
                 min_area_ft = max(min_area_ft, float(room["min_w_override"] * room["min_l_override"]))
 
-            x = model.NewIntVar(0, plot_w - min_dim, f'x_{r_id}')
-            z = model.NewIntVar(0, plot_l - min_dim, f'z_{r_id}')
-            w = model.NewIntVar(min_dim, plot_w, f'w_{r_id}')
-            l = model.NewIntVar(min_dim, plot_l, f'l_{r_id}')
+            if "fixed_rect" in room:
+                fx, fz, fw, fl = room["fixed_rect"]
+                fixed_x = math.floor(fx * COORD_SCALE)
+                fixed_z = math.floor(fz * COORD_SCALE)
+                fixed_x_end = math.ceil((fx + fw) * COORD_SCALE)
+                fixed_z_end = math.ceil((fz + fl) * COORD_SCALE)
+                fw_cp = fixed_x_end - fixed_x
+                fl_cp = fixed_z_end - fixed_z
+                
+                # Directly bound the variables to prevent 'min_dim' contradictions
+                x = model.NewIntVar(fixed_x, fixed_x, f'x_{r_id}')
+                z = model.NewIntVar(fixed_z, fixed_z, f'z_{r_id}')
+                w = model.NewIntVar(fw_cp, fw_cp, f'w_{r_id}')
+                l = model.NewIntVar(fl_cp, fl_cp, f'l_{r_id}')
+            else:
+                x = model.NewIntVar(0, max(0, plot_w - min_dim), f'x_{r_id}')
+                z = model.NewIntVar(0, max(0, plot_l - min_dim), f'z_{r_id}')
+                w = model.NewIntVar(min_dim, plot_w, f'w_{r_id}')
+                l = model.NewIntVar(min_dim, plot_l, f'l_{r_id}')
 
-            # Aspect ratio (no super-elongated rooms)
-            if "fixed_rect" not in room:
+                # Aspect ratio (no super-elongated rooms)
                 if "corridor" not in r_type and "hallway" not in r_type:
-                    model.Add(100 * w >= 50 * l)   # w/l ≥ 0.5
-                    model.Add(100 * w <= 200 * l)   # w/l ≤ 2.0
+                    model.Add(100 * w >= 50 * l)   # w/l >= 0.5
+                    model.Add(100 * w <= 200 * l)   # w/l <= 2.0
                 else:
-                    # Corridor: at least one dimension must be narrow (≤ 5 ft)
+                    # Corridor: at least one dimension must be narrow (<= 5 ft)
                     b1 = model.NewBoolVar(f'w_{r_id}_limit')
                     b2 = model.NewBoolVar(f'l_{r_id}_limit')
                     model.Add(w <= to_cp(5.0)).OnlyEnforceIf(b1)
                     model.Add(l <= to_cp(5.0)).OnlyEnforceIf(b2)
                     model.AddBoolOr([b1, b2])
-
-            if "fixed_rect" in room:
-                fx, fz, fw, fl = room["fixed_rect"]
-                # CP-SAT uses a discrete grid while cross-floor structural
-                # anchors retain their exact floating-point coordinates.  A
-                # simple int() on both origin and size made the reserved box
-                # slightly *smaller* than the real staircase.  Restoring the
-                # exact stair after solving could then overlap a corridor by a
-                # fraction of a foot and leave no finite wall for its door.
-                # Reserve the complete enclosing grid box instead.
-                fixed_x = math.floor(fx * COORD_SCALE)
-                fixed_z = math.floor(fz * COORD_SCALE)
-                fixed_x_end = math.ceil((fx + fw) * COORD_SCALE)
-                fixed_z_end = math.ceil((fz + fl) * COORD_SCALE)
-                model.Add(x == fixed_x)
-                model.Add(z == fixed_z)
-                model.Add(w == fixed_x_end - fixed_x)
-                model.Add(l == fixed_z_end - fixed_z)
 
             x_end = model.NewIntVar(0, max(plot_w, 2000), f'xe_{r_id}')
             z_end = model.NewIntVar(0, max(plot_l, 2000), f'ze_{r_id}')
