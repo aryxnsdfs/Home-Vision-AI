@@ -3,7 +3,7 @@ import logging
 import requests
 import re
 import os
-import google.generativeai as genai
+from google import genai
 from typing import Dict, Any
 
 logger = logging.getLogger("homevision")
