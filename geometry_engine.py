@@ -66,7 +66,7 @@ class CPSolver:
             return floor_data
             
         # 1. Pre-solver feasibility check
-        total_min_area = sum(ROOM_MINIMUMS.get(r.get('type', 'room'), _DEFAULT_MIN).get('area', 64) for r in rooms_spec if not r.get('is_outdoor'))
+        total_min_area = sum(r.get('target_area') or ROOM_MINIMUMS.get(r.get('type', 'room'), _DEFAULT_MIN).get('area', 64) for r in rooms_spec if not r.get('is_outdoor'))
         if allowed_bounds:
             slab_area = max(0.1, float(allowed_bounds[2]) - float(allowed_bounds[0])) * max(0.1, float(allowed_bounds[3]) - float(allowed_bounds[1]))
         else:
@@ -113,7 +113,8 @@ class CPSolver:
             r_type = room.get("type", "room")
             r_id = room.get("id", f"{r_type}_{idx}")
 
-            min_dim = int(ROOM_MINIMUMS.get(r_type, _DEFAULT_MIN).get("min_dim", 8) * scale)
+            base_min_dim = room.get("target_min_dim") or ROOM_MINIMUMS.get(r_type, _DEFAULT_MIN).get("min_dim", 8)
+            min_dim = int(base_min_dim * scale)
             # Enforce architectural minimums
             if "master" in r_type:
                 min_dim = max(min_dim, int(11.0 * scale))
@@ -139,8 +140,9 @@ class CPSolver:
             # must never occur.
             min_dim = max(1, min(min_dim, plot_w, plot_l))
 
+            base_area = room.get("target_area") or ROOM_MINIMUMS.get(r_type, _DEFAULT_MIN).get("area", 64)
             min_area_ft = min(
-                ROOM_MINIMUMS.get(r_type, _DEFAULT_MIN).get("area", 64),
+                base_area,
                 max(1.0, (plot_w / scale) * (plot_l / scale)),
             )
             if room.get("min_w_override") and room.get("min_l_override"):
@@ -551,7 +553,7 @@ class CPSolver:
                         return result
                 
                 # Accurately diagnose why the upper floor could not be packed
-                total_min = sum(ROOM_MINIMUMS.get(r.get('type', 'room'), _DEFAULT_MIN)['area'] 
+                total_min = sum(r.get('target_area') or ROOM_MINIMUMS.get(r.get('type', 'room'), _DEFAULT_MIN)['area'] 
                                 for r in rooms_spec if not r.get('is_outdoor'))
                 slab_w = max(0.1, float(allowed_bounds[2]) - float(allowed_bounds[0]))
                 slab_l = max(0.1, float(allowed_bounds[3]) - float(allowed_bounds[1]))
