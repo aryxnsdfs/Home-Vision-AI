@@ -5885,7 +5885,17 @@ def _stream_generate_work(req: "GenerateRequest", emit_fn: Callable) -> None:
                 if not val_0.is_valid:
                     logger.warning(f"[PIPELINE] Floor 0 validation failed on attempt {attempt + 1}: {val_0.errors}")
                     if attempt < max_attempts - 1:
-                        continue  # Retry!
+                        logger.info(f"[PIPELINE] Attempting LOCAL REPAIR for Floor 0 (Attempt {attempt + 2})")
+                        # Freeze the public core so the solver only shuffles private/wet rooms around it
+                        public_core_types = {"living_room", "kitchen", "dining_room", "foyer", "corridor", "hallway", "lobby", "staircase", "stairwell", "open_kitchen", "dining_area"}
+                        for spec in floor_0_rooms:
+                            rt = canonical_type(spec.get("type"))
+                            if rt in public_core_types:
+                                # Find the generated node to get its coordinates
+                                generated = next((n for n in generated_nodes_0 if n.id == spec.get("id") or canonical_type(n.type) == rt), None)
+                                if generated:
+                                    spec["fixed_rect"] = (generated.rect.x, generated.rect.z, generated.rect.width, generated.rect.length)
+                        continue  # Retry with frozen core!
                     else:
                         raise RuntimeError(
                             "Floor 0 failed geometry/accessibility validation after repair retries: "
