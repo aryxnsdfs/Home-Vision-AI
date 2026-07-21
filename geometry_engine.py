@@ -209,11 +209,15 @@ class CPSolver:
             if "fixed_rect" not in room:
                 model.Add(area >= int(min_area_ft * scale * scale))
 
+            loc_pref = room.get('location_pref') or room.get('preferred_location') or (
+                'front' if r_type in {'foyer', 'porch', 'verandah', 'portico', 'entrance_lobby'} else ''
+            )
             room_vars[r_id] = {
                 'type': r_type,
                 'connections': room.get('connections', []),
-                'preferred_location': room.get('preferred_location', ''),
-                'location_weight': room.get('location_weight', 8),
+                'location_pref': loc_pref,
+                'preferred_location': loc_pref,
+                'location_weight': room.get('location_weight', 50 if r_type in {'foyer', 'porch', 'portico'} else 8),
                 'min_dim': min_dim,
                 'x': x, 'z': z, 'w': w, 'l': l,
                 'x_end': x_end, 'z_end': z_end,
@@ -229,18 +233,26 @@ class CPSolver:
         )
 
         # Linear foundation sizing constraint for Floor 0
+        if room_vars:
+            global_z0 = model.NewIntVar(0, plot_l, 'gz0')
+            for rv in room_vars.values():
+                model.Add(global_z0 <= rv['z'])
+            
+            foyer_rvs = [rv for rv in room_vars.values() if rv['type'] in {'foyer', 'entrance_lobby'}]
+            if foyer_rvs:
+                for f_rv in foyer_rvs:
+                    model.Add(f_rv['z'] == global_z0)
+
         min_dims = floor_data.get('min_foundation_dims')
         if min_dims and room_vars:
             min_fw = int(min_dims[0] * scale)
             min_fl = int(min_dims[1] * scale)
             global_x0 = model.NewIntVar(0, plot_w, 'gx0')
             global_x1 = model.NewIntVar(0, plot_w, 'gx1')
-            global_z0 = model.NewIntVar(0, plot_l, 'gz0')
             global_z1 = model.NewIntVar(0, plot_l, 'gz1')
             for rv in room_vars.values():
                 model.Add(global_x0 <= rv['x'])
                 model.Add(global_x1 >= rv['x_end'])
-                model.Add(global_z0 <= rv['z'])
                 model.Add(global_z1 >= rv['z_end'])
             model.Add(global_x1 - global_x0 >= min(plot_w, min_fw))
             model.Add(global_z1 - global_z0 >= min(plot_l, min_fl))

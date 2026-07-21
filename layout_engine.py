@@ -46,6 +46,10 @@ class Door:
     height: float = 7.0
     is_main: bool = False
     target_room_id: str = ""
+    source: str = ""
+    target: str = ""
+    wall_type: str = "interior"
+    opens_inward: bool = True
 
 @dataclass
 class Window:
@@ -109,7 +113,15 @@ class RoomNode:
             "furnitureColor": self.furnitureColor,
             "furniture": getattr(self, 'furniture', []),
             "mep_nodes": getattr(self, 'mep_nodes', []),
-            "doors": [{"x": round(d.x, 2), "z": round(d.z, 2), "wall_orientation": d.wall_orientation, "width": d.width, "height": getattr(d, 'height', 7.0), "is_main": bool(getattr(d, 'is_main', False)), "target_room_id": getattr(d, 'target_room_id', None)} for d in getattr(self, 'doors', [])],
+            "doors": [{
+                "x": round(d.x, 2), "z": round(d.z, 2), "wall_orientation": d.wall_orientation, "width": d.width,
+                "height": getattr(d, 'height', 7.0), "is_main": bool(getattr(d, 'is_main', False)),
+                "target_room_id": getattr(d, 'target_room_id', None),
+                "source": getattr(d, 'source', 'outside' if getattr(d, 'is_main', False) else ''),
+                "target": getattr(d, 'target', getattr(d, 'target_room_id', '')),
+                "wall_type": getattr(d, 'wall_type', 'exterior' if getattr(d, 'is_main', False) else 'interior'),
+                "opens_inward": bool(getattr(d, 'opens_inward', True)),
+            } for d in getattr(self, 'doors', [])],
             "windows": [{"x": round(w.x, 2), "z": round(w.z, 2), "wall_orientation": w.wall_orientation, "width": w.width, "height": getattr(w, 'height', 4.0), "sill_height": getattr(w, 'sill_height', 3.0)} for w in getattr(self, 'windows', [])],
         }
 
@@ -2297,7 +2309,10 @@ class WindowPlacer:
                 
                 if is_designated_entrance and not main_door_added:
                     if face == designated_face:
-                        r.doors.append(Door(x=rel_x, z=rel_z, width=4.0, height=7.0, is_main=True, wall_orientation=face))
+                        r.doors.append(Door(
+                            x=rel_x, z=rel_z, width=4.0, height=7.0, is_main=True, wall_orientation=face,
+                            source="outside", target="foyer", wall_type="exterior", opens_inward=True
+                        ))
                         main_door_added = True
                         logger.info(f"    Placed main entrance door on '{r.name}' (face {face})")
         
@@ -2312,7 +2327,10 @@ class WindowPlacer:
                         cz = (w["z1"] + w["z2"]) / 2.0
                         is_vert = w["orientation"] == "vertical"
                         face = "west" if is_vert and (cx - r.rect.x) < r.rect.width / 2.0 else "east" if is_vert else "north" if (cz - r.rect.z) < r.rect.length / 2.0 else "south"
-                        r.doors.append(Door(x=cx - r.rect.x, z=cz - r.rect.z, width=4.0, height=7.0, is_main=True, wall_orientation=face))
+                        r.doors.append(Door(
+                            x=cx - r.rect.x, z=cz - r.rect.z, width=4.0, height=7.0, is_main=True, wall_orientation=face,
+                            source="outside", target="foyer", wall_type="exterior", opens_inward=True
+                        ))
                         main_door_added = True
                         logger.info(f"    Placed fallback main entrance door on '{r.name}' (face {face})")
                         break
@@ -2324,7 +2342,10 @@ class WindowPlacer:
                     face = getattr(r, "main_entrance_wall", "south")
                     x = r.rect.width / 2.0 if face in ("north", "south") else (0.0 if face == "west" else r.rect.width)
                     z = r.rect.length / 2.0 if face in ("east", "west") else (0.0 if face == "north" else r.rect.length)
-                    r.doors.append(Door(x=x, z=z, width=4.0, height=7.0, is_main=True, wall_orientation=face))
+                    r.doors.append(Door(
+                        x=x, z=z, width=4.0, height=7.0, is_main=True, wall_orientation=face,
+                        source="outside", target="foyer", wall_type="exterior", opens_inward=True
+                    ))
                     logger.info(f"    Forced main entrance door on '{r.name}' (face {face})")
                     break
 
