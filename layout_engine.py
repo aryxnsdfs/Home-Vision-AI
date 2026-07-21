@@ -1656,10 +1656,13 @@ class LayoutEngine:
             if is_open_sky and floor_color == "#ffffff":
                 floor_color = "#d6d3d1"  # Outdoor pavement fallback tint
 
+            matched_spec = next((spec for spec in rooms_spec if str(spec.get("id")) == matched_id), {})
             nodes.append(RoomNode(
-                id=matched_id, type=matched_rt, name=matched_rt.replace("_", " ").title(),
+                id=matched_id, type=matched_rt, name=matched_spec.get("name") or matched_rt.replace("_", " ").title(),
                 rect=Rect(x, z, w, l), wallThicknessIn=wall_thick, is_wet=is_wet,
-                connections=copy.deepcopy(next((spec.get("connections", []) for spec in rooms_spec if str(spec.get("id")) == matched_id), [])),
+                connections=copy.deepcopy(matched_spec.get("connections", [])),
+                bathroom_role=matched_spec.get("bathroom_role", ""),
+                assigned_to=matched_spec.get("assigned_to", "") or matched_spec.get("attached_to_id", ""),
                 floorColor=floor_color, wallColor=wall_color, furnitureColor=furniture_color,
                 roof_type=roof_val  # Dynamic roof property assignment via AI
             ))
