@@ -1390,10 +1390,11 @@ class GenerateRequest(BaseModel):
     state: Optional[str] = "Maharashtra"
     district: Optional[str] = "Mumbai"
     layoutRules: Optional[List[Dict[str, str]]] = None
-    # Explicit UI intent prevents a new design opened from the setup modal
     # from being misrouted through modification logic merely because an older
     # project is still present in browser state.
     requestMode: Optional[str] = None  # "create" or "edit"
+    analysis_id: Optional[str] = None
+    clarifications: Optional[Dict[str, Any]] = None
 
 
 class TemplateRequest(BaseModel):
