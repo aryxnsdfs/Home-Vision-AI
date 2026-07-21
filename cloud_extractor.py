@@ -601,7 +601,6 @@ MISSING INFORMATION EXTRACTION:
 Evaluate if the prompt explicitly or implicitly provides answers for the following keys:
 - "road_side": Which side of the plot faces the main road? (e.g. North, South)
 - "coverage_preference": How much of the available building area should be used? (e.g. compact, spacious, maximum)
-- "parking_count": How many cars should the plan accommodate?
 
 If any of these cannot be confidently inferred from the prompt, add the key string to the `missing_keys` array. Do NOT add keys if the prompt implies the answer (e.g., "compact house with large garden" implies low coverage).
 

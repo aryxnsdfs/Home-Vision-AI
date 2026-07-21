@@ -31,8 +31,7 @@ export default function AnalysisModal() {
     // We don't have the original prompt/w/l here easily unless we stored it in analyzePrompt.
     // Wait, analyzePrompt doesn't store them in the store?
     // We should just store lastPrompt, lastWidth, lastLength in useProjectStore when analyzePrompt is called.
-    const state = useProjectStore.getState();
-    const finalPrompt = `${state.lastPrompt || ""}\n\nCRITICAL REQUIREMENT: Bathrooms MUST be attached to bedrooms. Do not place a bathroom separately from a bedroom. A bathroom must share a wall and an intersection with a bedroom.`;
+    const finalPrompt = state.lastPrompt || "";
     await generateWithAI(
       finalPrompt,
       state.lastWidth,

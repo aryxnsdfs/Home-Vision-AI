@@ -568,59 +568,54 @@ class CPSolver:
             logger.info(f"CP Solver did not return a solution (status {status}, attempt {attempt}).")
             floor_data['validation'] = {'passed': False, 'errors': ['Solver infeasible']}
             
-            # Relaxation pass + hard abort for slab-constrained upper floors
-            if allowed_bounds and 'resolved_rooms' not in floor_data:
+            # Relaxation pass for slab-constrained upper floors or complex programs
+            if 'resolved_rooms' not in floor_data and attempt < 2:
                 relaxed_specs = self._relax_optional_rooms(rooms_spec)
                 if relaxed_specs is not None:
-                    logger.info("[RELAXATION] Shrinking optional rooms to architectural minimums and retrying...")
+                    logger.info("[RELAXATION] Shrinking rooms to architectural minimums and retrying...")
                     floor_data_relaxed = dict(floor_data)
                     floor_data_relaxed['rooms'] = relaxed_specs
                     floor_data_relaxed['relaxed_recovery'] = True
                     result = self._solve_single_topology(floor_data_relaxed, attempt + 1, topology_type)
                     if 'resolved_rooms' in result:
                         return result
-                
-                # Accurately diagnose why the upper floor could not be packed
-                total_min = sum(r.get('target_area') or ROOM_MINIMUMS.get(r.get('type', 'room'), _DEFAULT_MIN)['area'] 
+
+            max_attempts = max(3, int(os.getenv("CP_SOLVER_MAX_ATTEMPTS", "3")))
+            if attempt + 1 < max_attempts:
+                logger.info(f"[RETRY] Re-solving with perturbed weights (attempt {attempt + 1})…")
+                return self._solve_single_topology(floor_data, attempt + 1, topology_type)
+
+            # Final diagnostic if all attempts fail
+            if allowed_bounds:
+                total_min = sum(ROOM_MINIMUMS.get(r.get('type', 'room'), _DEFAULT_MIN)['area'] 
                                 for r in rooms_spec if not r.get('is_outdoor'))
                 slab_w = max(0.1, float(allowed_bounds[2]) - float(allowed_bounds[0]))
                 slab_l = max(0.1, float(allowed_bounds[3]) - float(allowed_bounds[1]))
                 slab_area = slab_w * slab_l
-                if total_min > slab_area:
-                    raise RuntimeError(
-                        f"Your requested upper-floor layout requires a minimum of {int(total_min)} sq ft, "
-                        f"but the ground floor foundation only provides {int(slab_area)} sq ft. "
-                        f"Please reduce upper-floor rooms or increase the plot size."
-                    )
-                else:
-                    raise RuntimeError(
-                        f"The requested upper-floor rooms ({len(rooms_spec)} rooms, {int(total_min)} sq ft) "
-                        f"could not be packed into the ground floor footprint ({int(slab_area)} sq ft available) "
-                        f"due to strict spatial or door adjacency constraints. Please simplify upper-floor room count or relax layout rules."
-                    )
-
-            max_attempts = max(1, int(os.getenv("CP_SOLVER_MAX_ATTEMPTS", "1")))
-            if attempt + 1 < max_attempts:
-                logger.info(f"[RETRY] Re-solving with more time (attempt {attempt + 1})…")
-                return self._solve_single_topology(floor_data, attempt + 1, topology_type)
+                raise RuntimeError(
+                    f"The requested upper-floor rooms ({len(rooms_spec)} rooms, {int(total_min)} sq ft min) "
+                    f"could not be packed into the ground floor footprint ({int(slab_area)} sq ft available) "
+                    f"due to strict spatial or door adjacency constraints. Please simplify upper-floor room count or relax layout rules."
+                )
 
         return floor_data
 
     def _relax_optional_rooms(self, rooms_spec: list) -> list | None:
-        """Shrink flexible rooms to their absolute architectural minimums."""
+        """Shrink rooms to their absolute architectural minimums for fallback recovery."""
         import copy
-        relaxable_types = {'study_room', 'gym', 'children_s_play_area', 'family_lounge',
-                           'home_office', 'play_area', 'media_room', 'home_theater'}
         relaxed = copy.deepcopy(rooms_spec)
         changed = False
         for room in relaxed:
             rtype = room.get('type', '')
-            if rtype in relaxable_types:
+            if rtype not in {'staircase', 'stairwell', 'void'}:
                 mins = ROOM_MINIMUMS.get(rtype, _DEFAULT_MIN)
-                min_side = mins['min_dim']
-                if room.get('width', 999) > min_side or room.get('length', 999) > min_side:
-                    room['width'] = min_side
-                    room['length'] = min_side
+                min_side = float(mins.get('min_dim', 6.0))
+                min_area = float(mins.get('area', 36.0))
+                if room.get('target_min_dim') != min_side or room.get('target_area') != min_area:
+                    room['target_min_dim'] = min_side
+                    room['target_area'] = min_area
+                    room['min_w_override'] = min_side
+                    room['min_l_override'] = min_side
                     changed = True
         return relaxed if changed else None
 

@@ -6520,10 +6520,6 @@ QUESTION_LIBRARY = {
             "Maximum Allowed (85%)",
         ],
     },
-    "parking_count": {
-        "question": "How many cars should the plan accommodate?",
-        "options": ["None", "1 Car", "2 Cars", "3+ Cars"],
-    },
 }
 
 @app.post("/api/analyze-prompt")
