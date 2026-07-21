@@ -621,11 +621,13 @@ def final_layout_validation(
 
     # 5. Structural integrity. Inject structural column grid into rooms with spans > 25 ft.
     # 3. Minimum room sizes
+    from layout_engine import ROOM_MINIMUMS
     size_issues = []
     for n in nodes:
         w, l = n.rect.width, n.rect.length
         ctype = _canon(n.type)
-        if ctype in MIN_ROOM_AREAS and (w * l) < (MIN_ROOM_AREAS[ctype] * 0.9):
+        mins = ROOM_MINIMUMS.get(ctype)
+        if mins and (w * l) < (mins.get("area", 64) * 0.9):
             size_issues.append({"code": "WARNING_SMALL_ROOM", "message": f"{n.name} is {(w*l):.0f} sqft, below minimum."})
     checks["minimum_sizes"] = (not size_issues, size_issues)
 

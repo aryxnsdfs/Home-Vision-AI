@@ -4427,7 +4427,6 @@ async def generate_plan(req: GenerateRequest):
                         
                     if True:
                         # SAFE FIRST SPEC FIX
-                        import copy
                         safe_first_spec = copy.deepcopy(first_spec) if first_spec else []
                         if not safe_first_spec:
                             safe_first_spec = [copy.deepcopy(r) for r in layout_params["rooms"] if r["type"] in ("bedroom", "bathroom", "master_bedroom")]
@@ -4747,7 +4746,6 @@ async def generate_from_template(req: TemplateRequest):
             staircase = next((n for n in generated_nodes_0 if n.type == "staircase"), None)
             if staircase:
                 # SAFE FIRST SPEC FIX
-                import copy
                 safe_first_spec = copy.deepcopy(first_spec) if first_spec else []
                 if not safe_first_spec:
                     safe_first_spec = [copy.deepcopy(r) for r in tmpl["rooms"] if r["type"] in ("bedroom", "bathroom", "master_bedroom")]
@@ -6075,7 +6073,6 @@ def _stream_generate_work(req: "GenerateRequest", emit_fn: Callable) -> None:
 
         # LOCAL REPAIR PASS for repairable validation issues
         if not validation_report["ok"]:
-            import copy
             repaired_nodes_0 = copy.deepcopy(generated_nodes_0)
             repaired_any = False
             for error in validation_report["errors"]:
