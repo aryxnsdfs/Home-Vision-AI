@@ -1235,6 +1235,32 @@ class LayoutEngine:
 
             if placed_rect is not None:
                 is_wet = room_type == "bathroom" or any(token in room_type for token in ("toilet", "washroom", "laundry"))
+                
+                # --- STRICT FALLBACK VALIDATION ---
+                # A fallback-added room must satisfy postconditions. Do not materialize a bathroom anywhere merely to satisfy room count.
+                if is_wet or "bedroom" in room_type:
+                    has_legal_access = False
+                    
+                    def rects_touch(first: Rect, second: Rect, min_overlap: float = 1.0) -> bool:
+                        overlap_x = min(first.x + first.width, second.x + second.width) - max(first.x, second.x)
+                        overlap_z = min(first.z + first.length, second.z + second.length) - max(first.z, second.z)
+                        return (abs(overlap_x) < 0.1 and overlap_z >= min_overlap) or (abs(overlap_z) < 0.1 and overlap_x >= min_overlap)
+
+                    if target_nodes:
+                        # Attached bathroom/bedroom must touch its target
+                        if any(rects_touch(placed_rect, target.rect) for target in target_nodes):
+                            has_legal_access = True
+                    else:
+                        # Common bathroom/bedroom must touch circulation
+                        circulation_types = {"corridor", "lobby", "family_lounge", "hallway", "foyer"}
+                        if any(rects_touch(placed_rect, node.rect) for node in nodes if node.type in circulation_types):
+                            has_legal_access = True
+                            
+                    if not has_legal_access:
+                        logger.warning(f"[FALLBACK] Rejected {room_id}: Cannot generate legal access (does not touch required neighbor or circulation).")
+                        placed_rect = None
+
+            if placed_rect is not None:
                 nodes.append(RoomNode(
                     id=room_id,
                     type=room_type,

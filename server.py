@@ -5886,13 +5886,21 @@ def _stream_generate_work(req: "GenerateRequest", emit_fn: Callable) -> None:
                         logger.info(f"[PIPELINE] Attempting LOCAL REPAIR for Floor 0 (Attempt {attempt + 2})")
                         # Freeze the public core so the solver only shuffles private/wet rooms around it
                         public_core_types = {"living_room", "kitchen", "dining_room", "foyer", "corridor", "hallway", "lobby", "staircase", "stairwell", "open_kitchen", "dining_area"}
+                        frozen = []
+                        unlocked = []
                         for spec in floor_0_rooms:
                             rt = canonical_type(spec.get("type"))
+                            room_name = spec.get("id") or rt
                             if rt in public_core_types:
                                 # Find the generated node to get its coordinates
                                 generated = next((n for n in generated_nodes_0 if n.id == spec.get("id") or canonical_type(n.type) == rt), None)
                                 if generated:
                                     spec["fixed_rect"] = (generated.rect.x, generated.rect.z, generated.rect.width, generated.rect.length)
+                                    frozen.append(room_name)
+                            else:
+                                unlocked.append(room_name)
+                        logger.info(f"[LOCAL REPAIR] Frozen rooms: {', '.join(frozen)}")
+                        logger.info(f"[LOCAL REPAIR] Unlocked rooms: {', '.join(unlocked)}")
                         continue  # Retry with frozen core!
                     else:
                         raise RuntimeError(
