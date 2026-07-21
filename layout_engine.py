@@ -1984,12 +1984,12 @@ class LayoutEngine:
 
 ACCESS_POLICIES = {
     "bedroom": {
-        "allowed_from": {"corridor", "hallway", "passage", "lobby", "foyer", "family_lounge", "staircase", "landing"},
-        "forbidden_from": {"bathroom", "toilet", "kitchen", "bedroom", "master_bedroom", "dining_room", "utility_area", "store_room"},
+        "allowed_from": {"corridor", "hallway", "passage", "lobby", "private_lobby", "family_lounge", "landing"},
+        "forbidden_from": {"foyer", "bathroom", "toilet", "kitchen", "bedroom", "master_bedroom", "dining_room", "utility_area", "store_room"},
     },
     "master_bedroom": {
-        "allowed_from": {"corridor", "hallway", "passage", "lobby", "foyer", "family_lounge", "staircase", "landing"},
-        "forbidden_from": {"bathroom", "toilet", "kitchen", "bedroom", "dining_room", "utility_area", "store_room"},
+        "allowed_from": {"corridor", "hallway", "passage", "lobby", "private_lobby", "family_lounge", "landing"},
+        "forbidden_from": {"foyer", "bathroom", "toilet", "kitchen", "bedroom", "dining_room", "utility_area", "store_room"},
     },
     "bathroom": {
         "allowed_from": {"corridor", "hallway", "passage", "lobby", "foyer", "bedroom", "master_bedroom"},

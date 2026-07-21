@@ -173,10 +173,7 @@ class CPSolver:
             min_dim = max(1, min(min_dim, plot_w, plot_l))
 
             base_area = room.get("target_area") or ROOM_MINIMUMS.get(r_type, _DEFAULT_MIN).get("area", 64)
-            min_area_ft = max(
-                base_area,
-                max(1.0, (from_cp(plot_w)) * (from_cp(plot_l))),
-            )
+            min_area_ft = max(1.0, float(base_area))
             if room.get("min_w_override") and room.get("min_l_override"):
                 min_area_ft = max(min_area_ft, float(room["min_w_override"] * room["min_l_override"]))
 
