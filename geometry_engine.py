@@ -47,15 +47,31 @@ class CPSolver:
         Retry on failure (up to 3 attempts)
     """
 
+    def _generate_candidate_envelopes(self, plot_w_ft: float, plot_l_ft: float, target_area: float) -> list:
+        import math
+        envelopes = []
+        aspects = [1.0, 1.2, 0.8, 1.5, 0.66]
+        for aspect in aspects:
+            w = math.sqrt(target_area * aspect)
+            l = target_area / max(1.0, w)
+            if w <= plot_w_ft and l <= plot_l_ft:
+                min_x = (plot_w_ft - w) / 2
+                max_x = min_x + w
+                min_z = (plot_l_ft - l) / 2
+                max_z = min_z + l
+                envelopes.append((min_x, min_z, max_x, max_z))
+        
+        # Add full plot fallback
+        envelopes.append((0.0, 0.0, plot_w_ft, plot_l_ft))
+        return envelopes
+
     def solve_phase_2_csp(self, floor_data: dict, attempt: int = 0) -> dict:
         """
         Places rooms on a grid such that:
-        1. Connected rooms share ≥ 4ft wall (HARD)
+        1. Connected rooms share >= 4ft wall (HARD)
         2. Forbidden pairs never touch (HARD)
         3. Minimum room dimensions and areas (HARD)
         4. Zonal clustering and walking distance (SOFT)
-        
-        Now runs a Multi-Candidate loop across different topologies.
         """
         plot_w_ft = floor_data.get('plot_width', 30.0)
         plot_l_ft = floor_data.get('plot_length', 40.0)
@@ -65,25 +81,35 @@ class CPSolver:
         if not rooms_spec:
             return floor_data
             
-        # 1. Pre-solver feasibility check
         total_min_area = sum(r.get('target_area') or ROOM_MINIMUMS.get(r.get('type', 'room'), _DEFAULT_MIN).get('area', 64) for r in rooms_spec if not r.get('is_outdoor'))
         if allowed_bounds:
             slab_area = max(0.1, float(allowed_bounds[2]) - float(allowed_bounds[0])) * max(0.1, float(allowed_bounds[3]) - float(allowed_bounds[1]))
         else:
-            slab_area = plot_w_ft * plot_l_ft * 0.85 # Approximation of buildable footprint
+            slab_area = plot_w_ft * plot_l_ft * 0.85
             
         if total_min_area > slab_area:
-            # We fast-fail before spinning up CP-SAT or multi-topology looping.
-            # Downstream logic in server.py (or layout_engine fallback) can handle this error appropriately.
             logger.error(f"[PRE-CHECK] Infeasible layout: needs {int(total_min_area)} sq ft, but only {int(slab_area)} sq ft available.")
             raise RuntimeError(f"Requested rooms require at least {int(total_min_area)} sq ft, but the available footprint is only {int(slab_area)} sq ft.")
 
-        TOPOLOGY_TYPES = ["compact_hub", "hub_and_branch", "linear_spine"]
+        # Multi-Envelope Loop for Coverage Optimization
+        envelopes = self._generate_candidate_envelopes(plot_w_ft, plot_l_ft, total_min_area) if not allowed_bounds else [allowed_bounds]
         
-        # We will loop topologies here, but for now we maintain the geometric loop 
-        # using the provided pre-wired graph from server.py to preserve stability.
-        # Future: Call auto_wire_topology(topo) for each.
-        return self._solve_single_topology(floor_data, attempt, "compact_hub")
+        last_exception = None
+        for env in envelopes:
+            floor_data_env = dict(floor_data)
+            floor_data_env['allowed_bounds'] = env
+            try:
+                result = self._solve_single_topology(floor_data_env, attempt, "compact_hub")
+                if 'resolved_rooms' in result:
+                    return result
+            except Exception as e:
+                last_exception = e
+                continue
+                
+        # If all envelopes failed, return the floor_data with errors or raise the last exception
+        if last_exception:
+            raise last_exception
+        return floor_data
 
     def _solve_single_topology(self, floor_data: dict, attempt: int, topology_type: str) -> dict:
         plot_w_ft = floor_data.get('plot_width', 30.0)
