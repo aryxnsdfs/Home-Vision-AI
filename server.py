@@ -5694,7 +5694,8 @@ def _stream_generate_work(req: "GenerateRequest", emit_fn: Callable) -> None:
                 logger.info(f"[VERTICAL ESCALATION] Split oversized ground floor ({f0_min_area:.0f} sq ft) into Duplex: {len(floor_specs_by_level[0])} ground rooms, {len(floor_specs_by_level[1])} upper rooms.")
 
             # --- ABSOLUTE FAIL-SAFE: PYTHON FLOOR BALANCER ---
-            if floors > 1 and len(floor_specs_by_level.get(1, [])) > 0:
+            # Skip overriding if Gemini/SLM or the user provided an explicit floor schedule
+            if floors > 1 and len(floor_specs_by_level.get(1, [])) > 0 and not has_explicit_schedule:
                 from layout_engine import get_min_area
                 
                 f0_area = sum(get_min_area(r.get("type", "room")) for r in floor_specs_by_level.get(0, []))
@@ -6248,6 +6249,7 @@ def _stream_generate_work(req: "GenerateRequest", emit_fn: Callable) -> None:
     except Exception as exc:
         logger.error("Streaming generate error: %s\n%s", exc, traceback.format_exc())
         emit_fn({"error": str(exc)})
+        raise exc
 def _stream_template_work(req: "TemplateRequest", emit_fn: Callable) -> None:
     """Run template generation in a background thread, pushing SSE dicts to pq."""
     def emit(stage: int, label: str, substage: str = ""):
