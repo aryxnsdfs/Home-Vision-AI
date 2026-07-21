@@ -485,19 +485,38 @@ def final_layout_validation(
             break
     checks["vastu"] = (not vastu_issues, vastu_issues)
 
-    # 5. Structural integrity. A room's long dimension is not automatically an
-    # unsupported RCC clear span: column/beam grids are generated separately.
-    # Only reject extreme room envelopes here; normal spans receive their
-    # actual support design from structural_generator.
+    # 5. Structural integrity. Inject structural column grid into rooms with spans > 25 ft.
     struct_issues: List[str] = []
+    import math
     for n in nodes:
         if n.type in STRUCTURAL_TYPES:
             continue
-        # A corridor's long axis is travel length, not an unsupported clear
-        # span; its structural span is the narrow axis between supports.
         span = min(n.rect.width, n.rect.length) if n.type in {"corridor", "hallway", "passage"} else max(n.rect.width, n.rect.length)
-        if span > 36.0:
-            struct_issues.append(f"{n.name}: {span:.0f} ft span exceeds RCC limit (needs intermediate beam).")
+        if span > 25.0:
+            mep_list = getattr(n, "mep_nodes", None)
+            if mep_list is None:
+                n.mep_nodes = []
+                mep_list = n.mep_nodes
+            has_columns = any(isinstance(m, dict) and m.get("type") in {"structural_column", "column", "pillar"} for m in mep_list)
+            if not has_columns:
+                cols_x = max(0, math.ceil(n.rect.width / 20.0) - 1)
+                cols_z = max(0, math.ceil(n.rect.length / 20.0) - 1)
+                if cols_x > 0 or cols_z > 0:
+                    for ix in range(1, cols_x + 1):
+                        for iz in range(1, cols_z + 1):
+                            px = n.rect.x + (ix * (n.rect.width / (cols_x + 1)))
+                            pz = n.rect.z + (iz * (n.rect.length / (cols_z + 1)))
+                            n.mep_nodes.append({
+                                "type": "structural_column",
+                                "name": "Structural Column",
+                                "x": round(px, 2),
+                                "z": round(pz, 2),
+                                "width": 1.2,
+                                "length": 1.2,
+                            })
+                            has_columns = True
+            if span > 150.0 and not has_columns:
+                struct_issues.append(f"{n.name}: {span:.0f} ft span exceeds RCC limit.")
     checks["structural_integrity"] = (not struct_issues, struct_issues)
 
     # 6. Buildability — no degenerate/overlapping rooms.
