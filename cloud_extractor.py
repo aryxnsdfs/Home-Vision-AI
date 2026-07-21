@@ -42,6 +42,15 @@ class SpatialRelationship(BaseModel):
     required: bool = Field(default=True, description="True when this relationship is explicit in the user's request")
 
 
+class AttachedBathroomAssignment(BaseModel):
+    assigned_to: str = Field(description="The exact room type this bathroom is attached to, e.g. master_bedroom")
+
+
+class BathroomRequirements(BaseModel):
+    attached: List[AttachedBathroomAssignment] = Field(default_factory=list)
+    common_count: int = 0
+
+
 class FloorRoomSpec(BaseModel):
     type: str = Field(description="Concise room type only, such as bedroom, bathroom, study_room, or an exact custom room name")
     name: str = ""
@@ -138,6 +147,7 @@ class HouseDesignRequest(BaseModel):
     
     global_color: str = ""
     room_colors: List[RoomColor] = Field(default_factory=list)
+    bathroom_requirements: BathroomRequirements = Field(default_factory=BathroomRequirements)
     color_hex: str = ""
     theme_description: str = ""
     move_target_room: str = ""
@@ -719,11 +729,22 @@ def auto_wire_topology(room_types: list, ai_categories: dict = None) -> list:
         "walk_in_closet", "walkin_closet", "dressing_room", "closet",
     })
 
+    ROOM_TYPE_ALIASES = {
+        "living": "living_room",
+        "living hall": "living_room",
+        "dining": "dining_room",
+        "master room": "bedroom",
+        "washroom": "bathroom",
+        "passage": "corridor",
+    }
+
     room_specs = []
     type_counts: Dict[str, int] = {}
     for raw in room_types:
         source = dict(raw) if isinstance(raw, dict) else {"type": raw}
-        room_type = str(source.get("type", "room")).strip().lower().replace(" ", "_")
+        room_type = str(source.get("type", "room")).strip().lower()
+        room_type = ROOM_TYPE_ALIASES.get(room_type, room_type.replace(" ", "_"))
+        room_type = ROOM_TYPE_ALIASES.get(room_type, room_type)
         type_counts[room_type] = type_counts.get(room_type, 0) + 1
         source["type"] = room_type
         source["id"] = str(source.get("id") or f"{room_type}-{type_counts[room_type]}")
