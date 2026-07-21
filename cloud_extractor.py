@@ -830,45 +830,42 @@ def auto_wire_topology(room_types: list, ai_categories: dict = None) -> list:
         if hub_idx != bath_i:
             add_conn(hub_idx, bath_i, "standard", 6)
 
-    return room_specs
-    def add_conn(src_idx, target_idx, intent, weight):
-        room_specs[src_idx]['connections'].append({
-            "target_room": room_specs[target_idx]['type'],
-            "intent": intent,
-            "weight": weight
-        })
+    # 6. Post-processing Topology Rules
+    # Rule A: Ensure foyer connects to hub
+    foyer_idx = next((i for i, r in enumerate(room_specs) if r["type"] == "foyer"), None)
+    if foyer_idx is not None and hub_idx is not None and foyer_idx != hub_idx:
+        has_foyer_hub = any(c.get("target_room_id") == room_specs[hub_idx]["id"] for c in room_specs[foyer_idx]["connections"])
+        if not has_foyer_hub:
+            add_conn(foyer_idx, hub_idx, "standard", 20)
 
-    # Phase 2: Dynamic Topology Wiring
+    # Rule B: Forbid DESTINATION -> DESTINATION direct doors (except ensuite bath-bedroom)
+    id_to_spec = {r["id"]: r for r in room_specs}
+    for room in room_specs:
+        r_passage = room.get("role", {}).get("can_be_passage", True)
+        if not r_passage:
+            filtered_conns = []
+            for conn in room.get("connections", []):
+                target_spec = id_to_spec.get(conn.get("target_room_id", ""))
+                if target_spec:
+                    t_passage = target_spec.get("role", {}).get("can_be_passage", True)
+                    if not t_passage:
+                        r_type = room["type"]
+                        t_type = target_spec["type"]
+                        is_ensuite = ("bath" in r_type or "toilet" in r_type or "bath" in t_type or "toilet" in t_type)
+                        if not is_ensuite:
+                            continue
+                filtered_conns.append(conn)
+            room["connections"] = filtered_conns
 
-    # 1. Chain Public Zones together (Open Concept Flow)
-    for i in range(len(public_idx) - 1):
-        add_conn(public_idx[i], public_idx[i+1], "open_flow", 10)
-
-    # 2. Determine Primary Hub for Circulation
-    hub_idx = circulation_idx[0] if circulation_idx else (public_idx[0] if public_idx else 0)
-
-    # 3. Connect Outdoor Spaces to the Hub
-    for oi in outdoor_idx:
-        if hub_idx != oi:
-            add_conn(hub_idx, oi, "open_flow", 10)
-
-    # 4. Connect Private Zones to the Hub
-    for pi in private_idx:
-        if hub_idx != pi:
-            add_conn(pi, hub_idx, "standard", 10)
-
-    # 5. Distribute Wet Zones (Bathrooms)
-    available_baths = list(wet_idx)
-    
-    # En-suite priority: Give a bath to each private room first
-    for pi in private_idx:
-        if available_baths:
-            bath_i = available_baths.pop(0)
-            add_conn(pi, bath_i, "standard", 10)
-
-    # Remaining wet zones act as common baths connected to the hub
-    for bath_i in available_baths:
-        if hub_idx != bath_i:
-            add_conn(hub_idx, bath_i, "standard", 6)
+    # Rule C: Ensure every DESTINATION room connects to at least one circulation space
+    for i, room in enumerate(room_specs):
+        r_passage = room.get("role", {}).get("can_be_passage", True)
+        if not r_passage and hub_idx is not None and i != hub_idx:
+            has_circ = any(
+                id_to_spec.get(c.get("target_room_id", ""), {}).get("role", {}).get("can_be_passage", False)
+                for c in room.get("connections", [])
+            )
+            if not has_circ:
+                add_conn(i, hub_idx, "standard", 10)
 
     return room_specs
