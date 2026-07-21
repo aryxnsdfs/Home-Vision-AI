@@ -3,6 +3,7 @@ import SceneCanvas from "./components/SceneCanvas.jsx";
 import FloatingOverlay from "./components/FloatingOverlay.jsx";
 import ProjectSetupModal from "./components/ProjectSetupModal.jsx";
 import GenerationOverlay from "./components/GenerationOverlay.jsx";
+import AnalysisModal from "./components/AnalysisModal.jsx";
 import { useProjectStore } from "./store/useProjectStore";
 
 export default function App() {
@@ -21,6 +22,7 @@ export default function App() {
       <SceneCanvas />
       <FloatingOverlay />
       <GenerationOverlay />
+      <AnalysisModal />
     </main>
   );
 }
