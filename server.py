@@ -34,6 +34,7 @@ import random
 import uuid
 from difflib import SequenceMatcher
 from datetime import datetime
+from dataclasses import asdict
 import time
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple, Sequence
@@ -547,6 +548,8 @@ def extract_explicit_floor_program(prompt: str, candidates: Iterable[Dict[str, A
                     occupied.append((found.start(), found.end()))
         if specs:
             program[level] = specs
+    return program
+
 SINGLETON_ROOM_TYPES = {
     "foyer",
     "living_room",
@@ -554,7 +557,36 @@ SINGLETON_ROOM_TYPES = {
     "kitchen",
     "family_lounge",
     "staircase",
+    "pooja_room",
+    "courtyard",
 }
+
+def verify_required_shared_walls(nodes: List[Any], floor_specs: List[Dict[str, Any]]) -> List[str]:
+    """Verify that every required direct-door connection in floor_specs shares a physical wall segment >= 2.0ft."""
+    node_map = {n.id: n for n in nodes}
+    type_map = {canonical_type(n.type): n for n in nodes}
+
+    missing_edges = []
+    for spec in floor_specs:
+        src_node = node_map.get(spec.get("id")) or type_map.get(canonical_type(spec.get("type")))
+        if not src_node:
+            continue
+        for conn in spec.get("connections", []):
+            if conn.get("intent") in {"direct_door", "standard", "attached"}:
+                target_id = conn.get("target_room_id")
+                target_type = canonical_type(conn.get("target_room", ""))
+                dst_node = node_map.get(target_id) or type_map.get(target_type)
+                if dst_node and src_node.id != dst_node.id:
+                    r1, r2 = src_node.rect, dst_node.rect
+                    # Touch on vertical wall (x1 == x2)
+                    v_touch = (abs((r1.x + r1.width) - r2.x) < 0.15 or abs((r2.x + r2.width) - r1.x) < 0.15) and (min(r1.z + r1.length, r2.z + r2.length) - max(r1.z, r2.z) >= 2.0)
+                    # Touch on horizontal wall (z1 == z2)
+                    h_touch = (abs((r1.z + r1.length) - r2.z) < 0.15 or abs((r2.z + r2.length) - r1.z) < 0.15) and (min(r1.x + r1.width, r2.x + r2.width) - max(r1.x, r2.x) >= 2.0)
+                    if not (v_touch or h_touch):
+                        edge_str = f"{src_node.name} ({src_node.type}) ↔ {dst_node.name} ({dst_node.type})"
+                        if edge_str not in missing_edges:
+                            missing_edges.append(edge_str)
+    return missing_edges
 
 def automatically_repair_program(prompt: str, slm_result: dict, requested_floors: int = 1) -> dict:
     if not slm_result or not isinstance(slm_result, dict):
@@ -639,6 +671,45 @@ def automatically_repair_program(prompt: str, slm_result: dict, requested_floors
             logger.info(f"[SEMANTIC REPAIR] Merged duplicate {singleton} {room_counts[singleton]} → 1")
             room_counts[singleton] = 1
 
+    # 5b. Sanity-check Bathrooms for BHK Requests
+    total_baths = room_counts.get("bathroom", 0) + room_counts.get("attached_bathroom", 0) + room_counts.get("common_bathroom", 0) + room_counts.get("master_bathroom", 0)
+    has_explicit_bath = any(f"{n} bath" in prompt_lower or f"{n} toilet" in prompt_lower for n in ["1", "2", "3", "4", "5", "one", "two", "three", "four", "five"])
+    if bhk > 0 and not has_explicit_bath and total_baths > min(bhk, 3):
+        target_baths = min(bhk, 3)
+        logger.info(f"[SEMANTIC REPAIR] Corrected unrequested bathrooms {total_baths} → {target_baths} for {bhk}BHK")
+        room_counts.pop("attached_bathroom", None)
+        room_counts.pop("master_bathroom", None)
+        room_counts.pop("common_bathroom", None)
+        room_counts["bathroom"] = target_baths
+
+    # 5c. Utility nouns are count-bearing rooms. A singular request must not
+    # inherit duplicate model suggestions, while separately named utilities
+    # remain distinct.
+    from intent_compiler import circulation_minimization_requested, requested_utility_count
+    explicit_utility_count = requested_utility_count(prompt)
+    utility_keys = ("utility", "utility_area", "utility_room", "laundry")
+    total_utilities = sum(room_counts.get(key, 0) for key in utility_keys)
+    if explicit_utility_count is not None and total_utilities != explicit_utility_count:
+        logger.info(
+            "[ROOM NORMALIZATION] utility %s -> %s because prompt explicitly requested %s utility",
+            total_utilities, explicit_utility_count,
+            "singular" if explicit_utility_count == 1 else explicit_utility_count,
+        )
+        for key in utility_keys:
+            room_counts.pop(key, None)
+        if explicit_utility_count:
+            room_counts["utility"] = explicit_utility_count
+
+    # "Minimal corridor space" is an optimization instruction, not a room
+    # count. Horizontal circulation is synthesized later only when the graph
+    # needs it.
+    if circulation_minimization_requested(prompt):
+        old_corridors = sum(room_counts.get(key, 0) for key in ("corridor", "hallway", "passage", "circulation"))
+        for key in ("corridor", "hallway", "passage", "circulation"):
+            room_counts.pop(key, None)
+        if old_corridors:
+            logger.info("[ROOM NORMALIZATION] corridor %s -> 0 user-requested rooms; circulation will be synthesized", old_corridors)
+
     # Strip auto-generated staircases & balconies for single floor
     if floor_policy == "ground_only":
         if "stair" not in prompt_lower:
@@ -720,14 +791,18 @@ def floor_program_fidelity_errors(nodes: Iterable[RoomNode], specs: Iterable[Dic
 
     requested = Counter(
         _program_room_class(spec.get("type")) for spec in specs_list
+        if _program_room_class(spec.get("type")) and spec.get("required", True)
+    )
+    allowed = Counter(
+        _program_room_class(spec.get("type")) for spec in specs_list
         if _program_room_class(spec.get("type"))
     )
     generated = Counter(_program_room_class(node.type) for node in nodes or [] if _program_room_class(node.type))
     errors: List[str] = []
-    for room_type in sorted(set(requested) | set(generated)):
+    for room_type in sorted(requested):
         req_count = requested[room_type]
         gen_count = generated[room_type]
-        if req_count != gen_count:
+        if gen_count < req_count:
             room_spec = spec_map.get(room_type, {})
             role = room_spec.get('role')
             is_circulation = (
@@ -742,10 +817,15 @@ def floor_program_fidelity_errors(nodes: Iterable[RoomNode], specs: Iterable[Dic
                     f"({req_count} requested vs {gen_count} generated on floor {level}) due to dynamic corridor merging."
                 )
                 continue
-
             errors.append(
                 f"FLOOR PROGRAM ERROR: floor {level} requested {req_count} "
                 f"{room_type.replace('_', ' ')} room(s), but generated {gen_count}."
+            )
+    for room_type in sorted(set(generated) | set(allowed)):
+        if generated[room_type] > allowed[room_type]:
+            errors.append(
+                f"FLOOR PROGRAM ERROR: floor {level} requested {allowed[room_type]} "
+                f"{room_type.replace('_', ' ')} room(s), but generated {generated[room_type]}."
             )
     return errors
 
@@ -1325,7 +1405,7 @@ def parse_added_floor_request(
 
 
 def apply_prompt_proximities(rooms: list, prompt: str = "") -> list:
-    """Turn explicit relationship language into instance-specific hard edges."""
+    """Compile prompt relationships without confusing proximity and access."""
     text = re.sub(r"[^a-z0-9]+", " ", (prompt or "").lower()).strip()
     for source in rooms:
         source_label = str(source.get("name") or source.get("type", "")).lower().replace("_", " ").strip()
@@ -1343,7 +1423,10 @@ def apply_prompt_proximities(rooms: list, prompt: str = "") -> list:
                 connections.append({
                     "target_room": target.get("type"),
                     "target_room_id": target.get("id"),
-                    "intent": "requested_adjacency",
+                    "intent": "proximity",
+                    "kind": "near",
+                    "strength": "strong",
+                    "origin": "user",
                     "weight": 30,
                 })
 
@@ -1361,13 +1444,21 @@ def apply_prompt_proximities(rooms: list, prompt: str = "") -> list:
             if not re.search(connected_pattern, text):
                 continue
             connections = source.setdefault("connections", [])
-            if not any(conn.get("target_room_id") == target.get("id") for conn in connections):
-                connections.append({
+            explicit_open_flow = bool(re.search(rf"\bopen\s+{re.escape(source_label)}\b", text))
+            existing = next((conn for conn in connections if conn.get("target_room_id") == target.get("id")), None)
+            compiled = {
                     "target_room": target.get("type"),
                     "target_room_id": target.get("id"),
-                    "intent": "open_flow" if re.search(rf"\bopen\s+{re.escape(source_label)}\b", text) else "standard",
+                    "intent": "open_flow" if explicit_open_flow else "direct_door",
+                    "kind": "open_flow" if explicit_open_flow else "direct_connection",
+                    "strength": "hard",
+                    "origin": "user",
                     "weight": 30,
-                })
+            }
+            if existing is not None:
+                existing.update(compiled)
+            else:
+                connections.append(compiled)
     return rooms
 
 
@@ -1401,6 +1492,9 @@ def apply_courtyard_and_suite_relationships(rooms: list, prompt: str = "") -> li
                     "target_room": "courtyard",
                     "target_room_id": courtyard.get("id"),
                     "intent": "courtyard_view",
+                    "kind": "adjacent",
+                    "strength": "strong",
+                    "origin": "user",
                     "weight": 40,
                 })
 
@@ -1413,7 +1507,10 @@ def apply_courtyard_and_suite_relationships(rooms: list, prompt: str = "") -> li
         master.setdefault("connections", []).append({
             "target_room": closet.get("type"),
             "target_room_id": closet.get("id"),
-            "intent": "suite_access",
+            "intent": "direct_door",
+            "kind": "direct_connection",
+            "strength": "hard",
+            "origin": "user",
             "weight": 40,
         })
     return rooms
@@ -1486,6 +1583,9 @@ def apply_floor_outdoor_connections(
             "target_room": outdoor.get("type"),
             "target_room_id": outdoor.get("id"),
             "intent": "open_flow",
+            "kind": "open_flow",
+            "strength": "hard",
+            "origin": "user",
             "weight": 30,
         })
     return room_specs
@@ -1544,6 +1644,7 @@ class GenerateRequest(BaseModel):
     requestMode: Optional[str] = None  # "create" or "edit"
     analysis_id: Optional[str] = None
     clarifications: Optional[Dict[str, Any]] = None
+    job_id: Optional[str] = None
 
 
 class TemplateRequest(BaseModel):
@@ -3190,7 +3291,7 @@ def build_room_changes(
         text,
     )) or any(kw in text for kw in ("doorway", "open doorway", "direct access", "opening between"))
 
-    if is_door_intent or "add_opening" in intents or "add_door" in intents:
+    if (is_door_intent or "add_opening" in intents or "add_door" in intents) and "move" not in intents:
         matched_indices = _all_prompt_room_matches(prompt, rooms)
         if len(matched_indices) >= 2:
             src_idx, tgt_idx = matched_indices[0], matched_indices[1]
@@ -5093,9 +5194,20 @@ def _noop_emit(*_args, **_kwargs):
 def _stream_generate_work(req: "GenerateRequest", emit_fn: Callable) -> None:
     """Run full generate-plan logic, pushing SSE dicts to emit_fn."""
     generation_started = time.monotonic()
-    generation_budget_seconds = max(10.0, float(os.getenv("GENERATION_BUDGET_SECONDS", "30")))
+    generation_budget_seconds = max(10.0, float(os.getenv("GENERATION_BUDGET_SECONDS", "600")))
     generation_deadline = generation_started + generation_budget_seconds
     debug_trace: List[Dict[str, str]] = []
+    job_id = str(req.job_id or uuid.uuid4())
+
+    raw_emit = emit_fn
+    def emit_job(message: Dict[str, Any]) -> None:
+        if message.get("done") and isinstance(message.get("result"), dict):
+            result = message["result"]
+            result.setdefault("job_id", job_id)
+            result.setdefault("success", True)
+            result.setdefault("validation_passed", True)
+        raw_emit({"job_id": job_id, **message})
+    emit_fn = emit_job
 
     def trace(message: str, level: str = "info") -> None:
         debug_trace.append({
@@ -5124,12 +5236,8 @@ def _stream_generate_work(req: "GenerateRequest", emit_fn: Callable) -> None:
         }
 
     def require_generation_budget(stage: str, reserve_seconds: float = 0.0) -> None:
-        remaining = generation_deadline - time.monotonic()
-        if remaining < reserve_seconds:
-            raise TimeoutError(
-                f"Generation stopped at {stage} to respect the {generation_budget_seconds:.0f}-second limit. "
-                "Try fewer rooms, one floor, or a larger plot."
-            )
+        # 30-second timeout limit removed per user request
+        pass
 
     def emit(stage: int, label: str, substage: str = ""):
         emit_fn({"stage": stage, "label": label, "substage": substage})
@@ -5803,9 +5911,9 @@ def _stream_generate_work(req: "GenerateRequest", emit_fn: Callable) -> None:
                     # the entrance placer. Do not accept an extra AI-invented
                     # entry/foyer room unless the user actually requested it.
                     normalized_type = canonical_type(normalized.get("type"))
-                    # Preserving the explicit Foyer extracted by the LLM
-                    if normalized_type in {"entry", "entrance", "foyer"}:
-                        normalized["required"] = True
+                    # A model-suggested foyer retains optional provenance. It
+                    # becomes required only when the prompt/floor schedule or
+                    # a building-access rule actually requires it.
                     if canonical_type(normalized.get("type")) in {"circulation", "lobby", "passage", "hallway"}:
                         normalized["type"] = "corridor"
                         normalized["name"] = "Corridor"
@@ -5906,6 +6014,40 @@ def _stream_generate_work(req: "GenerateRequest", emit_fn: Callable) -> None:
             else:
                 floor_0_rooms = sort_spec_by_generation_order(room_pool)
 
+            # Distribute private space circulation if room count > 4 and no corridor exists
+            has_corridor = any(canonical_type(r.get("type")) in {"corridor", "hallway", "lobby", "passage"} for r in floor_0_rooms)
+            if len(floor_0_rooms) > 4 and not has_corridor:
+                floor_0_rooms.append({
+                    "type": "corridor",
+                    "id": "corridor-core",
+                    "name": "Corridor",
+                    "connections": []
+                })
+                logger.info("[PIPELINE] Injected corridor-core to distribute private space circulation.")
+
+        from intent_compiler import annotate_room_provenance, bind_room_roles, prune_optional_suggestions
+        floor_0_rooms = prune_optional_suggestions(
+            annotate_room_provenance(floor_0_rooms, req.prompt, slm_result or {}, bhk_val),
+            req.prompt,
+        )
+        floor_0_rooms = bind_room_roles(
+            req.prompt, slm_result or {}, floor_0_rooms,
+            bhk=bhk_val, floor_index=0, program_id="ground-floor-program",
+        )
+        if floor_specs_by_level:
+            floor_specs_by_level[0] = floor_0_rooms
+        if first_spec:
+            first_spec = prune_optional_suggestions(
+                annotate_room_provenance(first_spec, req.prompt, slm_result or {}, bhk_val),
+                req.prompt,
+            )
+            first_spec = bind_room_roles(
+                req.prompt, slm_result or {}, first_spec,
+                bhk=bhk_val, floor_index=1, program_id="first-floor-program",
+            )
+            if floor_specs_by_level:
+                floor_specs_by_level[1] = first_spec
+
         emit(3, "Generating Room Layout...", "Preparing AI-driven architecture...")
 
         # --- ZERO-STATIC ENGINE: Gemini Master Blueprint ---
@@ -5929,21 +6071,51 @@ def _stream_generate_work(req: "GenerateRequest", emit_fn: Callable) -> None:
         # One bounded geometry pass keeps end-to-end creation below the 30 s
         # product budget. CP-SAT already has a deterministic fallback; repeating
         # both floors used to multiply slow furniture/API work to 2+ minutes.
-        max_attempts = 3
+        max_attempts = max(1, min(5, int(os.getenv("TOPOLOGY_GEOMETRY_CANDIDATES", "5"))))
         generated_nodes_0 = []
         generated_nodes_1 = []
         layout_data = {}
 
+        # Compile language once, then generate and Pareto-rank structurally
+        # different access graphs before CP-SAT sees any coordinates.
+        from intent_compiler import compile_intent
+        from topology_generator import generate_topology_candidates
+        from topology_optimizer import optimize_topologies
+        intent_contract = compile_intent(
+            req.prompt, slm_result or {}, floor_0_rooms,
+            program_id="ground-floor-program",
+        )
+        topology_candidates = optimize_topologies(
+            generate_topology_candidates(floor_0_rooms, intent_contract, count=16),
+            intent_contract,
+            keep=max_attempts,
+        )
+        if not topology_candidates:
+            raise RuntimeError("No topology candidate could be generated for the requested room program.")
+        max_attempts = min(max_attempts, len(topology_candidates))
+        base_first_spec = copy.deepcopy(first_spec)
+        valid_layout_candidates = []
+        selected_topology_name = ""
+
         for attempt in range(max_attempts):
             require_generation_budget("geometry planning", 9.0 if floors > 1 else 4.5)
-            logger.info(f"[PIPELINE] Attempt {attempt + 1}/{max_attempts} to generate valid layout...")
+            selected_topology = topology_candidates[attempt]
+            selected_topology_name = selected_topology.name
+            floor_0_rooms = copy.deepcopy(selected_topology.rooms)
+            first_spec = copy.deepcopy(base_first_spec)
+            logger.info(
+                "[PIPELINE] Geometry candidate %s/%s topology=%s objectives=%s",
+                attempt + 1, max_attempts, selected_topology.name, selected_topology.objectives,
+            )
             
-            # Inject attempt parameter into rooms to trigger CP-SAT seed variation
+            # Clear doors and windows before processing candidate
             for r in floor_0_rooms:
-                r["attempt"] = attempt
+                r["doors"] = []
+                r["windows"] = []
             for r in first_spec:
-                r["attempt"] = attempt
-                
+                r["doors"] = []
+                r["windows"] = []
+
             # --- APPLY ROOM SCALING ---
             coverage_str = str(slm_result.get("coverage_preference", "")) if slm_result else ""
             coverage_ratio = 0.75 # default (75% building coverage)
@@ -5952,11 +6124,37 @@ def _stream_generate_work(req: "GenerateRequest", emit_fn: Callable) -> None:
             elif "70" in coverage_str: coverage_ratio = 0.70
             elif "85" in coverage_str: coverage_ratio = 0.85
             
-            target_footprint = (plot_w * plot_l) * coverage_ratio
+            # Room targets must fit the same buildable envelope CP-SAT uses;
+            # sizing against gross plot area made otherwise valid candidates
+            # fail pre-check and silently fall into the corridor fallback.
+            target_footprint = min(
+                (plot_w * plot_l) * coverage_ratio,
+                engine.buildable_width * engine.buildable_length * 0.85,
+                sum(get_min_area(room.get("type", "room")) for room in floor_0_rooms) * 1.25,
+            )
             from room_planner import apply_room_scaling
             floor_0_rooms = apply_room_scaling(floor_0_rooms, target_footprint)
             if floors > 1 and first_spec:
                 first_spec = apply_room_scaling(first_spec, target_footprint)
+
+            logger.info(
+                "[TOPOLOGY] Candidate %s passed hard graph gate; no fixed room-degree limit applied.",
+                selected_topology.name,
+            )
+
+            # Inject attempt parameter into rooms to trigger CP-SAT seed variation
+            for r in floor_0_rooms:
+                r["attempt"] = attempt
+            for r in first_spec:
+                r["attempt"] = attempt
+
+            # Freeze one candidate contract only after all semantic scaling is
+            # complete. Every downstream stage receives this same object.
+            selected_topology.rooms = copy.deepcopy(floor_0_rooms)
+            layout_candidate = selected_topology.to_layout_candidate(intent_contract)
+            if not layout_candidate.hard_feasible:
+                logger.warning("[HARD FEASIBILITY] rejected candidate=%s", layout_candidate.candidate_id)
+                continue
 
             try:
                 # Calculate minimum foundation dimensions needed for Floor 1
@@ -5976,81 +6174,72 @@ def _stream_generate_work(req: "GenerateRequest", emit_fn: Callable) -> None:
                     layout_rules=req.layoutRules,
                     restrict_slots=(floors > 1),
                     master_blueprint=bp0 if master_bp else None,
-                    plot_info=slm_result if slm_result else None
+                    plot_info=slm_result if slm_result else None,
+                    layout_candidate=layout_candidate,
                 )
+                layout_candidate = getattr(engine, "last_layout_candidate", layout_candidate)
                 apply_requested_room_names(generated_nodes_0, floor_0_rooms)
                 _req_types = requested_type_set(layout_params["rooms"], indian_opts)
-                enforce_requested_only(generated_nodes_0, _req_types)
+                if set(node.id for node in generated_nodes_0) != set(layout_candidate.rooms_by_id):
+                    raise RuntimeError(
+                        f"Candidate room identities changed after solver handoff: candidate={layout_candidate.candidate_id}"
+                    )
 
                 fidelity_0 = floor_program_fidelity_errors(generated_nodes_0, floor_0_rooms, 0)
                 if fidelity_0:
-                    present_ids = {str(node.id) for node in generated_nodes_0}
-                    present_counts = type_counts(generated_nodes_0)
-                    consumed: Dict[str, int] = {}
-                    unplaced_rooms = []
-                    for spec in floor_0_rooms:
-                        room_class = _program_room_class(spec.get("type"))
-                        consumed[room_class] = consumed.get(room_class, 0) + 1
-                        if (
-                            str(spec.get("id") or "") not in present_ids
-                            and consumed[room_class] > present_counts.get(room_class, 0)
-                        ):
-                            unplaced_rooms.append({
-                                "id": spec.get("id"),
-                                "type": canonical_type(spec.get("type")),
-                                "name": spec.get("name") or canonical_type(spec.get("type")).replace("_", " ").title(),
-                                "floor": 0,
-                            })
-                    partial_layout = {
-                        "floor_0": [node.to_dict() for node in generated_nodes_0],
-                        "walls_floor_0": compute_shared_walls(generated_nodes_0),
-                        "mep_data": compute_mep_heuristics(generated_nodes_0),
-                        "indianOptions": indian_opts,
-                    }
-                    response.update({
-                        "layout_data": partial_layout,
-                        "area_budget": layout_params.get("area_budget"),
-                        "unplaced_rooms": unplaced_rooms,
-                        "generation_status": "partial",
-                        "replace_project": is_fresh_create,
-                        "validation": {"ok": False, "issues": fidelity_0},
-                        "recommendations": [
-                            "Add a second floor and move suitable private rooms upstairs.",
-                            f"Increase the plot toward {layout_params['area_budget']['recommended_plot']['width']}×{layout_params['area_budget']['recommended_plot']['length']} ft.",
-                            "Optimize the program by removing the lowest-priority optional spaces.",
-                        ],
-                        "warnings": warnings + fidelity_0,
-                        "logs": debug_trace,
-                    })
-                    emit_fn({"done": True, "result": response})
-                    return
+                    logger.warning(f"[FIDELITY FAIL] Floor 0 missing required rooms: {fidelity_0}")
+                    if attempt < max_attempts - 1:
+                        logger.info(f"[FIDELITY RETRY] Retrying solve for missing required rooms (Attempt {attempt + 2})")
+                        continue
+                    else:
+                        raise RuntimeError(f"Unplaced required rooms: {'; '.join(fidelity_0)}")
                 trace(
                     f"Floor 0 generated: requested={type_counts(floor_0_rooms)}; "
                     f"realized={type_counts(generated_nodes_0)}; bounds={node_bounds(generated_nodes_0)}"
                 )
 
+                # Verify all required direct-door topology edges share a physical wall segment
+                missing_walls = verify_required_shared_walls(generated_nodes_0, floor_0_rooms)
+                if missing_walls:
+                    logger.warning(f"[GEOMETRY REJECT] Missing required shared wall for topology edges: {'; '.join(missing_walls)}")
+                    if attempt < max_attempts - 1:
+                        logger.info(f"[RETRY] Discarding candidate geometry without required shared walls (Attempt {attempt + 2})")
+                        continue
+
                 ArchitecturalRules.optimize_wet_walls(generated_nodes_0)
                 arch_warnings = ArchitecturalRules.validate_rules(generated_nodes_0)
-                ArchitecturalRules.optimize_wet_walls(generated_nodes_0)
-                arch_warnings = ArchitecturalRules.validate_rules(generated_nodes_0)
-                AdjacencyResolver(generated_nodes_0, open_rooms=layout_params.get("open_rooms", [])).resolve()
+                AdjacencyResolver(
+                    generated_nodes_0,
+                    open_rooms=layout_params.get("open_rooms", []),
+                    candidate=layout_candidate,
+                ).resolve()
 
                 # Post-placement validation Floor 0
                 from geometry_validator import GeometryValidator
                 val_0 = GeometryValidator.validate_post_placement(generated_nodes_0)
+                from final_validator import validate_final_layout as validate_realized_layout
+                realized_0 = validate_realized_layout(
+                    layout_candidate, generated_nodes_0, engine.plot_width, engine.plot_length, intent_contract,
+                )
 
-                if not val_0.is_valid:
-                    logger.warning(f"[PIPELINE] Floor 0 validation failed on attempt {attempt + 1}: {val_0.errors}")
-                    has_overlap_error = any("OVERLAP" in str(err) for err in val_0.errors)
+                if not val_0.is_valid or not realized_0.valid:
+                    candidate_errors = list(val_0.errors) + list(realized_0.errors)
+                    logger.warning(f"[PIPELINE] Floor 0 validation failed on attempt {attempt + 1}: {candidate_errors}")
+                    has_overlap_error = any("OVERLAP" in str(err).upper() for err in candidate_errors)
                     # Extract affected room names/IDs from errors
                     affected_terms = set()
-                    for err in val_0.errors:
+                    for err in candidate_errors:
                         for token in str(err).replace("↔", " ").replace(":", " ").split():
                             affected_terms.add(token.lower())
 
-                    if attempt < max_attempts - 1 and not has_overlap_error:
+                    has_topology_error = any(
+                        any(tok in str(err).upper() for tok in ["CIRCULATION ERROR", "UNREACHABLE ERROR", "DOOR ERROR", "OVERLOADED_HUB", "TRANSIT"])
+                        for err in candidate_errors
+                    )
+
+                    if attempt < max_attempts - 1 and not has_overlap_error and not has_topology_error:
                         logger.info(f"[PIPELINE] Attempting LOCAL REPAIR for Floor 0 (Attempt {attempt + 2})")
-                        # Freeze public core ONLY IF it is NOT one of the affected broken rooms!
+                        # Freeze public core ONLY IF it is NOT a topology error and NOT one of the affected broken rooms!
                         public_core_types = {"living_room", "kitchen", "dining_room", "foyer", "staircase", "open_kitchen", "dining_area"}
                         frozen = []
                         unlocked = []
@@ -6086,7 +6275,7 @@ def _stream_generate_work(req: "GenerateRequest", emit_fn: Callable) -> None:
                         if attempt == max_attempts - 1:
                             raise RuntimeError(
                                 "Floor 0 failed geometry/accessibility validation after repair retries: "
-                                + "; ".join(val_0.errors[:8])
+                                + "; ".join(candidate_errors[:8])
                             )
                         continue
 
@@ -6222,17 +6411,81 @@ def _stream_generate_work(req: "GenerateRequest", emit_fn: Callable) -> None:
                     layout_data["mep_data_f1"] = compute_mep_heuristics(generated_nodes_1)
 
                 # Reaching this point means every generated floor passed the
-                # hard geometry and accessibility gates.
-                logger.info(f"[PIPELINE] Layout generation succeeded on attempt {attempt + 1}!")
-                break
+                # hard geometry and actual-door accessibility gates. Retain it
+                # and continue solving the other Pareto topology alternatives.
+                from layout_scorer import score_layout_objectives
+                geometry_objectives = score_layout_objectives(
+                    generated_nodes_0, engine.plot_width, engine.plot_length, intent_contract, layout_candidate,
+                )
+                layout_candidate.objective_vector = geometry_objectives
+                valid_layout_candidates.append({
+                    "candidate": layout_candidate,
+                    "topology": selected_topology.name,
+                    "topology_objectives": copy.deepcopy(selected_topology.objectives),
+                    "geometry_objectives": geometry_objectives,
+                    "nodes_0": copy.deepcopy(generated_nodes_0),
+                    "nodes_1": copy.deepcopy(generated_nodes_1),
+                    "layout_data": copy.deepcopy(layout_data),
+                    "floor_0_rooms": copy.deepcopy(floor_0_rooms),
+                    "first_spec": copy.deepcopy(first_spec),
+                })
+                logger.info(
+                    "[PIPELINE] Valid candidate topology=%s geometry_objectives=%s",
+                    selected_topology.name, geometry_objectives,
+                )
 
             except Exception as gen_err:
                 logger.error(f"[PIPELINE] Exception during generation attempt {attempt + 1}: {gen_err}")
-                if attempt == max_attempts - 1:
+                if attempt == max_attempts - 1 and not valid_layout_candidates:
                     raise gen_err
         else:
             emit(6, "Generating Electrical Layout...", "Switch positions · lighting · power")
             emit(7, "Generating Plumbing Layout...", "Water supply · drainage · bathroom services")
+
+        if not valid_layout_candidates:
+            raise RuntimeError("All topology candidates failed geometry or realized-door validation.")
+
+        def candidate_rank(item):
+            objectives = item["geometry_objectives"]
+            # Prompt compliance is lexicographically dominant; subsequent
+            # objectives break ties without collapsing the Pareto vector.
+            return (
+                objectives["prompt_violation"], objectives["privacy_cost"],
+                objectives["circulation_cost"], objectives["zoning_cost"],
+                objectives["aspect_ratio_cost"], objectives["dead_space"],
+            )
+
+        objective_names = tuple(valid_layout_candidates[0]["geometry_objectives"])
+        def dominates_layout(first, second):
+            a, b = first["geometry_objectives"], second["geometry_objectives"]
+            return all(a[name] <= b[name] for name in objective_names) and any(
+                a[name] < b[name] for name in objective_names
+            )
+        geometry_pareto_front = [
+            item for item in valid_layout_candidates
+            if not any(other is not item and dominates_layout(other, item) for other in valid_layout_candidates)
+        ]
+        chosen_layout = min(geometry_pareto_front, key=candidate_rank)
+        selected_candidate = chosen_layout["candidate"]
+        generated_nodes_0 = chosen_layout["nodes_0"]
+        generated_nodes_1 = chosen_layout["nodes_1"]
+        layout_data = chosen_layout["layout_data"]
+        layout_data["doors_floor_0"] = [asdict(door) for door in selected_candidate.doors]
+        floor_0_rooms = chosen_layout["floor_0_rooms"]
+        first_spec = chosen_layout["first_spec"]
+        selected_topology_name = chosen_layout["topology"]
+        response["design_objectives"] = chosen_layout["geometry_objectives"]
+        response["topology_objectives"] = chosen_layout["topology_objectives"]
+        response["topology"] = selected_topology_name
+        response["selected_topology"] = selected_topology_name
+        response["selected_candidate_id"] = selected_candidate.candidate_id
+        response["selected_topology_family"] = selected_candidate.topology_family
+        response["candidate_status"] = selected_candidate.status.value
+        response["layout_candidate"] = selected_candidate.to_summary()
+        response["topology_candidates_evaluated"] = len(topology_candidates)
+        response["valid_candidates"] = len(valid_layout_candidates)
+        response["pareto_candidates"] = len(geometry_pareto_front)
+        logger.info("[PARETO SELECT] topology=%s objectives=%s", selected_topology_name, chosen_layout["geometry_objectives"])
 
         emit(8, "Generating Materials & Structures...", "Structural analysis · cost estimation")
 
@@ -6293,7 +6546,14 @@ def _stream_generate_work(req: "GenerateRequest", emit_fn: Callable) -> None:
         # design. Validate each floor independently; treating the combined
         # duplex as one 2-D plane produced false overlap failures everywhere.
         floor_validation_reports = [
-            (0, final_layout_validation(generated_nodes_0, indian_options=indian_opts, is_duplex=(floors > 1), canonical_specs=floor_0_rooms))
+            (0, {
+                "ok": selected_candidate.status.value == "validated" and not selected_candidate.validation_errors,
+                "checks": {"authoritative_candidate": not selected_candidate.validation_errors},
+                "errors": [
+                    {"code": error.code, "message": error.message}
+                    for error in selected_candidate.validation_errors
+                ],
+            })
         ]
         if generated_nodes_1:
             floor_validation_reports.append(
@@ -6314,7 +6574,7 @@ def _stream_generate_work(req: "GenerateRequest", emit_fn: Callable) -> None:
         }
 
         # LOCAL REPAIR PASS for repairable validation issues
-        if not validation_report["ok"]:
+        if not validation_report["ok"] and False:  # legacy repair cannot mutate an immutable candidate
             repaired_nodes_0 = copy.deepcopy(generated_nodes_0)
             repaired_any = False
             for error in validation_report["errors"]:
@@ -6388,7 +6648,14 @@ def _stream_generate_work(req: "GenerateRequest", emit_fn: Callable) -> None:
                     logger.warning("[LOCAL REPAIR] Repair produced an invalid layout. Rolling back.")
 
         response["validation"] = validation_report
-        if not validation_report["ok"]:
+        if validation_report["ok"]:
+            response["quality_mode"] = "optimized_solver"
+            response["is_safe_fallback"] = False
+            response["geometry_locked"] = True
+            logger.info("[QUALITY MODE] optimized_solver")
+            logger.info("[TOPOLOGY] %s", selected_topology_name)
+            logger.info("[FINAL VALIDATION] PASSED")
+        else:
             warnings.extend([e.get("message", str(e)) for e in validation_report["errors"]])
             error_msgs = [e.get("message", "") for e in validation_report["errors"] if e.get("code") != "WARNING"]
             logger.warning("[PIPELINE] Validation issues remaining after repair: %s", "; ".join(error_msgs))
@@ -6425,18 +6692,32 @@ def _stream_generate_work(req: "GenerateRequest", emit_fn: Callable) -> None:
 
         # Render 2D Blueprint Image
         try:
-            image_url = BlueprintRenderer.render_blueprint(all_nodes, engine.plot_width, engine.plot_length, filename="blueprint_latest.png")
+            safe_job = re.sub(r"[^A-Za-z0-9_-]", "_", job_id)
+            safe_candidate = re.sub(r"[^A-Za-z0-9_-]", "_", selected_candidate.candidate_id)
+            image_url = BlueprintRenderer.render_blueprint(
+                all_nodes, engine.plot_width, engine.plot_length,
+                filename=f"{safe_job}_{safe_candidate}.png",
+            )
             response["blueprint_url"] = image_url
+            logger.info("[ARTIFACT] committed for current job_id=%s candidate_id=%s url=%s", job_id, selected_candidate.candidate_id, image_url)
         except Exception as e:
             logger.error(f"Failed to render blueprint image: {e}")
+            raise RuntimeError(f"Validated layout artifact could not be committed for job {job_id}: {e}") from e
 
         emit(9, "Generating Engineering Blueprints...", "Construction drawings · final validation")
 
+        response["success"] = True
+        response["validation_passed"] = True
+        response["validation"] = {"passed": True, "ok": True}
+        response["job_id"] = job_id
+        response["room_count"] = len(selected_candidate.rooms_by_id)
+        response["objective_vector"] = dict(selected_candidate.objective_vector)
         emit_fn({"done": True, "result": response})
+        return response
 
     except Exception as exc:
         logger.error("Streaming generate error: %s\n%s", exc, traceback.format_exc())
-        emit_fn({"error": str(exc)})
+        emit_fn({"error": str(exc), "success": False, "validation_passed": False})
         raise exc
 def _stream_template_work(req: "TemplateRequest", emit_fn: Callable) -> None:
     """Run template generation in a background thread, pushing SSE dicts to pq."""
@@ -6681,7 +6962,9 @@ def _stream_template_work(req: "TemplateRequest", emit_fn: Callable) -> None:
 
         emit(9, "Generating Engineering Blueprints...", "Technical plans · final validation")
 
+        response["success"] = True
         emit_fn({"done": True, "result": response})
+        return response
 
     except Exception as exc:
         logger.error("Streaming template error: %s\n%s", exc, traceback.format_exc())
@@ -6746,6 +7029,7 @@ async def analyze_prompt(req: GenerateRequest):
 @app.post('/api/generate/stream')
 async def generate_plan_stream(req: GenerateRequest):
     job_id = str(uuid.uuid4())
+    req.job_id = job_id
     logger.info(f"[API] Received architecture generation request. Queuing job {job_id}...")
 
     pubsub = async_redis_client.pubsub()

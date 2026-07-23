@@ -15,10 +15,11 @@ import math
 import random
 import uuid
 import copy
+import hashlib
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 from layout_templates import get_template_for_bhk
-from asset_library import furniture_capacity, furniture_for_room, fit_furniture_assets
+from asset_library import furniture_capacity, furniture_for_room, fit_furniture_assets, canonical_type
 
 logger = logging.getLogger(__name__)
 
@@ -88,6 +89,16 @@ class RoomNode:
     # circulation rooms (corridor, hallway, staircase) to prevent double-thick
     # walls when both neighbours render on the same face.
     suppress_wall_faces: List[str] = field(default_factory=list)
+
+    def __post_init__(self):
+        if self.connections is None:
+            self.connections = []
+        if self.doors is None:
+            self.doors = []
+        if self.windows is None:
+            self.windows = []
+        if self.shared_walls is None:
+            self.shared_walls = []
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -890,6 +901,135 @@ def generate_walls_from_aabbs(rooms: List[RoomNode]) -> List[Dict]:
 
     return walls
 
+def safe_corridor_layout(rooms_spec: List[Dict[str, Any]], plot_width: float, plot_length: float, theme: dict = None) -> List[RoomNode]:
+    """Program-driven fallback generator that places 100% of requested rooms in rooms_spec."""
+    if not rooms_spec:
+        return []
+
+    theme = theme or {}
+    logger.info(f"[SAFE FALLBACK] Program-driven fallback layout generating {len(rooms_spec)} rooms for {plot_width}x{plot_length} plot.")
+    logger.info("[QUALITY MODE] safe_fallback")
+
+    nodes: List[RoomNode] = []
+
+    # 1. Separate public, service, and private/wet rooms
+    public_types = {"foyer", "living_room", "dining_room", "living", "dining"}
+    service_types = {"kitchen", "open_kitchen", "store_room", "utility"}
+
+    public_specs = []
+    service_specs = []
+    private_specs = []
+    corridor_spec = None
+
+    for spec in rooms_spec:
+        t = canonical_type(spec.get("type", ""))
+        if "corridor" in t or "passage" in t:
+            if not corridor_spec:
+                corridor_spec = spec
+        elif t in public_types:
+            public_specs.append(spec)
+        elif t in service_types:
+            service_specs.append(spec)
+        else:
+            private_specs.append(spec)
+
+    # Keep instance-owned private satellites beside their exact bedroom in
+    # the legacy fallback (for example balcony-bedroom-attached bath). This is
+    # identity-driven ordering, not a fixed room-count template.
+    private_by_id = {str(spec.get("id")): spec for spec in private_specs if spec.get("id")}
+    consumed_private = set()
+    ordered_private = []
+    for spec in private_specs:
+        spec_id = str(spec.get("id") or "")
+        if spec_id in consumed_private or "bedroom" not in canonical_type(spec.get("type")):
+            continue
+        owned_ids = [
+            str(connection.get("target_room_id"))
+            for connection in spec.get("connections", []) or []
+            if str(connection.get("target_room_id")) in private_by_id
+            and str(connection.get("target_room_id")) != spec_id
+        ]
+        owned = [private_by_id[room_id] for room_id in dict.fromkeys(owned_ids)]
+        if owned:
+            ordered_private.extend(owned[:1] + [spec] + owned[1:])
+            consumed_private.update([spec_id] + [str(item.get("id")) for item in owned])
+    ordered_private.extend(spec for spec in private_specs if str(spec.get("id") or "") not in consumed_private)
+    private_specs = ordered_private
+
+    # Central Spine Corridor (Spans full width so 100% of rooms share a wall with the corridor)
+    corr_z = plot_length * 0.42
+    corr_h = max(4.0, plot_length * 0.12)
+    corr_x = 1.0
+    corr_w = plot_width - 2.0
+
+    corr_id = corridor_spec.get("id") if corridor_spec else "corridor-core"
+    nodes.append(RoomNode(
+        id=corr_id,
+        type="corridor",
+        name="Corridor",
+        rect=Rect(corr_x, corr_z, corr_w, corr_h),
+        wallThicknessIn=6.0,
+        is_wet=False,
+    ))
+
+    # 2. Place Front Zone (Public + Service rooms: z from 1.0 to corr_z)
+    front_specs = public_specs + service_specs
+    if front_specs:
+        front_h = corr_z - 1.0
+        x_cursor = 1.0
+        n_front = len(front_specs)
+        w_per_room = (plot_width - 2.0) / float(n_front)
+        for i, spec in enumerate(front_specs):
+            room_id = str(spec.get("id") or f"{spec.get('type')}-{i+1}")
+            r_type = canonical_type(spec.get("type"))
+            r_name = str(spec.get("name") or r_type.replace("_", " ").title())
+            is_wet = r_type == "kitchen"
+            nodes.append(RoomNode(
+                id=room_id,
+                type=r_type,
+                name=r_name,
+                rect=Rect(x_cursor, 1.0, w_per_room, front_h),
+                wallThicknessIn=8.0 if is_wet else 6.0,
+                is_wet=is_wet,
+                connections=copy.deepcopy(spec.get("connections", []) or []),
+                floorColor=theme.get("floor") or ("#dcfce7" if is_wet else "#ffffff"),
+                is_outdoor=bool(spec.get("is_outdoor")),
+                roof_type=str(spec.get("roof_type") or ("open" if spec.get("is_outdoor") else "flat")),
+                bathroom_role=str(spec.get("bathroom_role") or ""),
+                assigned_to=str(spec.get("assigned_to") or spec.get("attached_to_id") or ""),
+            ))
+            x_cursor += w_per_room
+
+    # 3. Place Rear Zone (Private rooms: Bedrooms & Bathrooms: z from corr_z + corr_h to plot_length - 1.0)
+    if private_specs:
+        rear_z = corr_z + corr_h
+        rear_h = max(10.0, plot_length - rear_z - 1.0)
+        x_cursor = 1.0
+        n_rear = len(private_specs)
+        w_per_room = (plot_width - 2.0) / float(n_rear)
+        for i, spec in enumerate(private_specs):
+            room_id = str(spec.get("id") or f"{spec.get('type')}-{i+1}")
+            r_type = canonical_type(spec.get("type"))
+            r_name = str(spec.get("name") or r_type.replace("_", " ").title())
+            is_wet = "bath" in r_type or "toilet" in r_type or "wash" in r_type
+            nodes.append(RoomNode(
+                id=room_id,
+                type=r_type,
+                name=r_name,
+                rect=Rect(x_cursor, rear_z, w_per_room, rear_h),
+                wallThicknessIn=8.0 if is_wet else 6.0,
+                is_wet=is_wet,
+                connections=copy.deepcopy(spec.get("connections", []) or []),
+                floorColor=theme.get("floor") or ("#dcfce7" if is_wet else "#ffffff"),
+                is_outdoor=bool(spec.get("is_outdoor")),
+                roof_type=str(spec.get("roof_type") or ("open" if spec.get("is_outdoor") else "flat")),
+                bathroom_role=str(spec.get("bathroom_role") or ""),
+                assigned_to=str(spec.get("assigned_to") or spec.get("attached_to_id") or ""),
+            ))
+            x_cursor += w_per_room
+
+    return nodes
+
 
 class LayoutEngine:
     def __init__(self, plot_width: float, plot_length: float, colors: Dict[str, Any] = None):
@@ -1365,7 +1505,7 @@ class LayoutEngine:
                     room_id, room_type,
                 )
 
-    def generate(self, rooms_spec: List[Dict[str, Any]], blocked_zones: Optional[List[Rect]] = None, indian_options: Optional[Dict[str, Any]] = None, layout_rules: Optional[List[Dict[str, str]]] = None, restrict_slots: bool = False, master_blueprint: Optional[List[Dict[str, Any]]] = None, plot_info: Optional[Dict[str, Any]] = None) -> List[RoomNode]:
+    def generate(self, rooms_spec: List[Dict[str, Any]], blocked_zones: Optional[List[Rect]] = None, indian_options: Optional[Dict[str, Any]] = None, layout_rules: Optional[List[Dict[str, str]]] = None, restrict_slots: bool = False, master_blueprint: Optional[List[Dict[str, Any]]] = None, plot_info: Optional[Dict[str, Any]] = None, layout_candidate: Any = None) -> List[RoomNode]:
         if indian_options is None:
             indian_options = {}
         if layout_rules is None:
@@ -1390,6 +1530,8 @@ class LayoutEngine:
         # --- ZERO-STATIC ENGINE: DUMB EXECUTION IF MASTER BLUEPRINT PROVIDED ---
         if master_blueprint:
             logger.info("MasterBlueprint detected! Bypassing constraint solver. Executing raw coordinates.")
+            immutable_solver_handoff = bool((plot_info or {}).get("_immutable_solver_handoff"))
+            geometry_hash_before = layout_candidate.geometry_hash() if layout_candidate is not None else ""
             type_counts: Dict[str, int] = {}
             for bp in master_blueprint:
                 rt = bp.get("room_type", "room").replace(" ", "_").lower()
@@ -1413,19 +1555,19 @@ class LayoutEngine:
                 # Doors and Windows will be generated deterministically by the layout engine!
                 nodes.append(node)
 
-            # --- SNAPPING ALGORITHM (DISABLED) ---
-            # Snapping is now natively handled by CP-SAT Macro-Zone alignment.
-            # Legacy snapping destroyed minimum dimension constraints by averaging coordinates.
+            if layout_candidate is not None:
+                from candidate_contract import CandidateStatus, InternalInvariantError, SolvedRect
+                if set(node.id for node in nodes) != set(layout_candidate.rooms_by_id):
+                    raise InternalInvariantError(
+                        f"candidate={layout_candidate.candidate_id}: MasterBlueprint room identity changed"
+                    )
 
-            # Expand a compact but valid solution before doors/furniture are
-            # generated, then anchor the resulting footprint to the plot.
-            if not has_fixed_anchor:
-                self._expand_to_target_coverage(nodes)
-            self._repair_disconnected_components(nodes)
-            self._close_nearby_wall_seams(nodes)
+            # --- IMMUTABLE GEOMETRY LOCK (CP-SAT COORDINATES) ---
+            # DO NOT resize, stretch, or alter individual room dimensions after CP-SAT solver completes.
+            # CP-SAT produces non-overlapping geometry. Rescaling individual rooms causes post-solver overlaps!
 
             # --- ORIGIN ANCHORING ---
-            if nodes and not has_fixed_anchor:
+            if nodes and not has_fixed_anchor and not immutable_solver_handoff:
                 # 1. Find the absolute boundaries of the generated house
                 min_x = min(n.rect.x for n in nodes)
                 max_x = max(n.rect.x + n.rect.width for n in nodes)
@@ -1444,6 +1586,28 @@ class LayoutEngine:
                     n.rect.x = (n.rect.x - min_x) + offset_x
                     n.rect.z = (n.rect.z - min_z) + offset_z
 
+            if layout_candidate is not None:
+                from candidate_contract import InternalInvariantError, SolvedRect
+                handoff_rectangles = {
+                    node.id: SolvedRect(node.rect.x, node.rect.z, node.rect.width, node.rect.length)
+                    for node in nodes
+                }
+                original_rectangles = layout_candidate.rectangles_by_room_id
+                layout_candidate.rectangles_by_room_id = handoff_rectangles
+                geometry_hash_after = layout_candidate.geometry_hash()
+                layout_candidate.rectangles_by_room_id = original_rectangles
+                if geometry_hash_before != geometry_hash_after:
+                    raise InternalInvariantError(
+                        f"candidate={layout_candidate.candidate_id}: MasterBlueprint altered solved geometry "
+                        f"before={geometry_hash_before} after={geometry_hash_after}"
+                    )
+                layout_candidate.status = CandidateStatus.SERIALIZED
+                logger.info(
+                    "[MASTERBLUEPRINT INVARIANT] geometry hash unchanged candidate_id=%s hash=%s",
+                    layout_candidate.candidate_id, geometry_hash_before,
+                )
+                self.last_layout_candidate = layout_candidate
+
             # Compute shared walls using new finite AABB logic
             self.last_walls = generate_walls_from_aabbs(nodes)
 
@@ -1456,9 +1620,7 @@ class LayoutEngine:
                 self.setback_x, self.setback_z,
             )
 
-            # --- DETERMINISTIC PLACEMENT ---
-            # Adjacency Resolver calculates doors perfectly centered on shared walls
-            AdjacencyResolver(nodes).resolve()
+            # WindowPlacer places windows on exterior walls; AdjacencyResolver runs single-pass in server.py
             WindowPlacer(nodes, self.plot_width, self.plot_length).place_windows()
             
             if not getattr(self, "skip_furniture_generation", False):
@@ -1493,6 +1655,8 @@ class LayoutEngine:
                 'rooms': rooms_spec,
                 'attempt': attempt
             }
+            if layout_candidate is not None:
+                floor_data['candidate'] = layout_candidate
             if isinstance(plot_info, dict) and plot_info.get("allowed_bounds"):
                 floor_data["allowed_bounds"] = tuple(plot_info["allowed_bounds"])
             if hasattr(self, "min_foundation_dims") and self.min_foundation_dims:
@@ -1533,41 +1697,42 @@ class LayoutEngine:
                         "roof_type": source.get("roof_type"),
                         "is_outdoor": bool(source.get("is_outdoor")),
                     })
+                solved_candidate = solved_data.get('candidate', layout_candidate)
+                self.last_layout_candidate = solved_candidate
                 return self.generate(
                     rooms_spec=[], 
                     master_blueprint=cp_blueprint,
-                    plot_info={**(plot_info or {}), "_preserve_fixed_anchor": has_fixed_anchor},
-                    indian_options=indian_options
+                    plot_info={
+                        **(plot_info or {}),
+                        "_preserve_fixed_anchor": has_fixed_anchor,
+                        "_immutable_solver_handoff": True,
+                    },
+                    indian_options=indian_options,
+                    layout_candidate=solved_candidate,
                 )
         except Exception as e:
             logger.error(f"CP Solver exception: {e}")
-            if isinstance(plot_info, dict) and plot_info.get("allowed_bounds"):
-                raise RuntimeError(
-                    "The requested upper-floor layout exceeds the ground floor foundation size. "
-                    "Please reduce upper-floor rooms or increase the plot size."
-                )
+            if layout_candidate is not None:
+                raise
             # Fall back to legacy BSP only for ground floor (no slab constraints)
 
-        if isinstance(plot_info, dict) and plot_info.get("allowed_bounds"):
-            raise RuntimeError(
-                "The requested upper-floor layout exceeds the ground floor foundation size. "
-                "Please reduce upper-floor rooms or increase the plot size."
-            )
-
-        # --- LEGACY BSP ENGINE FALLBACK ---
-
-        type_counts: Dict[str, int] = {}
-        ai_requested_rooms: List[Tuple[str, str]] = []
-        bhk_count = 0
-        for r in rooms_spec:
-            rt = r["type"].replace(" ", "_").lower()
-            if "master_bedroom" in rt or "bedroom" in rt:
-                bhk_count += 1
-            type_counts[rt] = type_counts.get(rt, 0) + 1
-            room_id = str(r.get("id") or f"{rt}-{type_counts[rt]}")
-            ai_requested_rooms.append((room_id, rt))
-
-        requested_type_by_id = {room_id: room_type for room_id, room_type in ai_requested_rooms}
+        # --- PROGRAM-DRIVEN SAFE CORRIDOR LAYOUT FALLBACK ---
+        allowed_bounds = tuple((plot_info or {}).get("allowed_bounds", ()))
+        if len(allowed_bounds) == 4:
+            bx0, bz0, bx1, bz1 = map(float, allowed_bounds)
+            fallback = safe_corridor_layout(rooms_spec, bx1 - bx0, bz1 - bz0, self.theme)
+            for node in fallback:
+                node.rect.x += bx0
+                node.rect.z += bz0
+            fixed_by_id = {
+                str(spec.get("id")): tuple(spec["fixed_rect"])
+                for spec in rooms_spec if isinstance(spec, dict) and spec.get("id") and spec.get("fixed_rect")
+            }
+            for node in fallback:
+                if node.id in fixed_by_id:
+                    node.rect = Rect(*fixed_by_id[node.id])
+            return fallback
+        return safe_corridor_layout(rooms_spec, self.plot_width, self.plot_length, self.theme)
         relationship_owned_spaces = {
             str(edge.get("target_room_id"))
             for spec in rooms_spec if isinstance(spec, dict) and "bedroom" in str(spec.get("type", ""))
@@ -2027,9 +2192,101 @@ def is_legal_door_pair(r1, r2) -> bool:
 
 
 class AdjacencyResolver:
-    def __init__(self, rooms: List[RoomNode], open_rooms: List[str] = None):
+    def __init__(self, rooms: List[RoomNode], open_rooms: List[str] = None, candidate: Any = None):
         self.rooms = rooms
         self.open_rooms = open_rooms or []
+        self.candidate = candidate
+
+    def _resolve_candidate_doors(self, walls: List[Dict[str, Any]]) -> None:
+        """Realize openings exclusively from the candidate's typed relations.
+
+        The per-room Door objects written here are compatibility mirrors for
+        renderers.  ``LayoutCandidate.doors`` is the sole access authority.
+        """
+        from candidate_contract import CandidateStatus, InternalInvariantError, PairedDoor
+
+        candidate = self.candidate
+        candidate.assert_identity_invariants()
+        room_by_id = {room.id: room for room in self.rooms}
+        if set(room_by_id) != set(candidate.rooms_by_id):
+            raise InternalInvariantError(
+                f"candidate={candidate.candidate_id}: door-stage room identity mismatch "
+                f"missing={sorted(set(candidate.rooms_by_id) - set(room_by_id))} "
+                f"extra={sorted(set(room_by_id) - set(candidate.rooms_by_id))}"
+            )
+
+        access_by_pair: Dict[Tuple[str, str], Any] = {}
+        priority = {"exclusive_access": 3, "direct_access": 2, "open_flow": 1}
+        for relation in candidate.relations_by_id.values():
+            if not relation.target_room_id or not relation.creates_access:
+                continue
+            pair = tuple(sorted((relation.source_room_id, relation.target_room_id)))
+            current = access_by_pair.get(pair)
+            if current is None or priority.get(relation.kind, 0) > priority.get(current.kind, 0):
+                access_by_pair[pair] = relation
+
+        def wall_length(wall: Dict[str, Any]) -> float:
+            return abs(wall["z2"] - wall["z1"]) if wall["orientation"] == "vertical" else abs(wall["x2"] - wall["x1"])
+
+        shared_by_pair: Dict[Tuple[str, str], List[Dict[str, Any]]] = {}
+        for wall in walls:
+            if not wall.get("is_shared") or len(wall.get("room_ids", [])) < 2:
+                continue
+            pair = tuple(sorted(wall["room_ids"][:2]))
+            shared_by_pair.setdefault(pair, []).append(wall)
+
+        paired_doors = []
+        for pair, relation in sorted(access_by_pair.items()):
+            available = shared_by_pair.get(pair, [])
+            if not available:
+                # Hard relations were already checked by the CP edge audit.
+                # A missing wall here therefore indicates serialization drift.
+                if relation.is_hard or relation.topology_edge:
+                    raise InternalInvariantError(
+                        f"candidate={candidate.candidate_id}: access relation={relation.relation_id} "
+                        f"lost shared wall between {pair[0]} and {pair[1]} during door realization"
+                    )
+                continue
+            wall = max(available, key=wall_length)
+            length = wall_length(wall)
+            minimum = 4.0 if relation.kind == "open_flow" else 2.0
+            if length + 1e-6 < minimum:
+                if relation.is_hard or relation.topology_edge:
+                    raise InternalInvariantError(
+                        f"candidate={candidate.candidate_id}: relation={relation.relation_id} shared wall "
+                        f"length={length:.2f} cannot fit opening minimum={minimum:.2f}"
+                    )
+                continue
+            width = max(4.0, length - 0.5) if relation.kind == "open_flow" else min(3.0, max(2.0, length - 0.2))
+            cx = (wall["x1"] + wall["x2"]) / 2.0
+            cz = (wall["z1"] + wall["z2"]) / 2.0
+            wall_key = "|".join((pair[0], pair[1], wall["orientation"], f"{wall['x1']:.3f}", f"{wall['z1']:.3f}", f"{wall['x2']:.3f}", f"{wall['z2']:.3f}"))
+            wall_id = "wall_" + hashlib.sha256(wall_key.encode("utf-8")).hexdigest()[:16]
+            door_id = "door_" + hashlib.sha256((candidate.candidate_id + "|" + wall_key).encode("utf-8")).hexdigest()[:16]
+            position = cz - min(wall["z1"], wall["z2"]) if wall["orientation"] == "vertical" else cx - min(wall["x1"], wall["x2"])
+            paired_doors.append(PairedDoor(
+                id=door_id, room_a_id=pair[0], room_b_id=pair[1], wall_id=wall_id,
+                width_ft=round(width, 3), position_ft=round(position, 3),
+                global_x=round(cx, 3), global_z=round(cz, 3), orientation=wall["orientation"],
+            ))
+
+        candidate.set_paired_doors(paired_doors)
+        for paired in paired_doors:
+            first, second = room_by_id[paired.room_a_id], room_by_id[paired.room_b_id]
+            vertical = paired.orientation == "vertical"
+            for source, target in ((first, second), (second, first)):
+                local_x = paired.global_x - source.rect.x
+                local_z = paired.global_z - source.rect.z
+                if vertical:
+                    face = "west" if local_x < source.rect.width / 2.0 else "east"
+                else:
+                    face = "north" if local_z < source.rect.length / 2.0 else "south"
+                source.doors.append(Door(
+                    x=local_x, z=local_z, width=paired.width_ft,
+                    wall_orientation=face, target_room_id=target.id,
+                ))
+        candidate.status = CandidateStatus.DOORS_REALIZED
+        logger.info("[DOOR REALIZATION] candidate=%s paired_doors=%d", candidate.candidate_id, len(paired_doors))
 
     def resolve(self):
         logger.info(f"  [AdjacencyResolver] Resolving doors for {len(self.rooms)} rooms using finite walls.")
@@ -2042,18 +2299,22 @@ class AdjacencyResolver:
             room.doors[:] = [door for door in room.doors if getattr(door, "is_main", False)]
 
         walls = generate_walls_from_aabbs(self.rooms)
+
+        if self.candidate is not None:
+            self._resolve_candidate_doors(walls)
+            return
         
         room_by_id = {r.id: r for r in self.rooms}
         placed_doors_between = set()
         
         def has_connection(src, dst):
             return any(
-                c.get("intent") != "proximity"
+                c.get("intent") not in {"proximity", "separation", "adjacent", "requested_adjacency", "courtyard_view"}
                 and (
                     c.get("target_room_id") == dst.id
                     or (not c.get("target_room_id") and c.get("target_room") == dst.type)
                 )
-                for c in src.connections
+                for c in (src.connections or [])
             )
             
         def get_face(rel_x, rel_z, room, is_v):
@@ -2134,142 +2395,9 @@ class AdjacencyResolver:
                 placed_doors_between.add(pair)
                 logger.info(f"    Placed door between '{r1.name}' and '{r2.name}'")
 
-        # --- PASS 2: RESCUE STRANDED ROOMS ---
-        # If strict topological checks blocked a room from getting ANY doors, 
-        # force a door on its longest shared wall ONLY if it respects architectural access policies.
-        for r in self.rooms:
-            if len(r.doors) == 0:
-                available_walls = [
-                    w for w in walls if w.get("is_shared") and r.id in w["room_ids"]
-                    and is_legal_door_pair(room_by_id[w["room_ids"][0]], room_by_id[w["room_ids"][1]])
-                ]
-                if not available_walls:
-                    logger.warning(f"[DOOR PLANNER] Room '{r.name}' ({r.id}) has no legal wall for door recovery.")
-                    continue
-
-                connected_walls = []
-                for wall in available_walls:
-                    other_id = next((rid for rid in wall["room_ids"] if rid != r.id), None)
-                    other = room_by_id.get(other_id)
-                    if other and (has_connection(r, other) or has_connection(other, r)):
-                        connected_walls.append(wall)
-                if not connected_walls:
-                    # Rescue fallback: use shared wall with circulation/living space
-                    connected_walls = [
-                        w for w in available_walls
-                        if any(room_by_id.get(rid) and (room_by_id[rid].type in {"corridor", "hallway", "foyer", "living_room", "passage"} or "corridor" in room_by_id[rid].type) for rid in w["room_ids"] if rid != r.id)
-                    ]
-                if not connected_walls:
-                    connected_walls = available_walls
-                
-                def wall_len(w):
-                    return abs(w["z2"]-w["z1"]) if w["orientation"]=="vertical" else abs(w["x2"]-w["x1"])
-                
-                best_wall = max(connected_walls, key=wall_len)
-                r1_id, r2_id = best_wall["room_ids"][:2]
-                pair = tuple(sorted([r1_id, r2_id]))
-                
-                r1, r2 = room_by_id[r1_id], room_by_id[r2_id]
-                t1, t2 = canonical_type(r1.type), canonical_type(r2.type)
-
-                # Never allow illegal recovery doors: bathroom ↔ bathroom, bedroom ↔ living, bathroom ↔ foyer
-                if (t1 == "bathroom" and t2 == "bathroom") or (t1 == "bedroom" and t2 == "living_room") or (t1 == "living_room" and t2 == "bedroom") or (t1 == "bathroom" and t2 == "foyer") or (t1 == "foyer" and t2 == "bathroom"):
-                    logger.warning(f"[DOOR PLANNER] Rejected unapproved recovery door between {r1.name} ({t1}) and {r2.name} ({t2})")
-                    continue
-
-                w_len = wall_len(best_wall)
-                
-                door_w = 3.0
-                if w_len < door_w + 1.0:
-                    if w_len >= 2.0:
-                        door_w = max(2.0, round(w_len - 0.2, 1))
-                    else:
-                        continue 
-                
-                cx = (best_wall["x1"] + best_wall["x2"]) / 2.0
-                cz = (best_wall["z1"] + best_wall["z2"]) / 2.0
-                
-                is_vert = best_wall["orientation"] == "vertical"
-                
-                d1_x, d1_z = cx - r1.rect.x, cz - r1.rect.z
-                d2_x, d2_z = cx - r2.rect.x, cz - r2.rect.z
-                
-                face1 = get_face(d1_x, d1_z, r1, is_vert)
-                face2 = get_face(d2_x, d2_z, r2, is_vert)
-                
-                r1.doors.append(Door(x=d1_x, z=d1_z, width=door_w, wall_orientation=face1, target_room_id=r2.id))
-                r2.doors.append(Door(x=d2_x, z=d2_z, width=door_w, wall_orientation=face2, target_room_id=r1.id))
-                
-                placed_doors_between.add(pair)
-                logger.info(f"[DOOR PLANNER] Added recovery door for {r.name} to {r1.name if r.id == r2.id else r2.name} ({door_w}ft)")
-
-        # PASS 3: join disconnected door components.  A room can already have
-        # a valid door and still be in a separate component when strict
-        # topology rejected the only geometrically available edge.  Connect
-        # it through the longest shared wall; this is a real navigable door,
-        # not a warning-only fallback.
-        def door_point(room, door):
-            return room.rect.x + door.x, room.rect.z + door.z
-
-        def shares_door(a, b):
-            for da in a.doors:
-                ax, az = door_point(a, da)
-                for db in b.doors:
-                    bx, bz = door_point(b, db)
-                    if abs(ax - bx) <= 0.35 and abs(az - bz) <= 0.35:
-                        return True
-            return False
-
-        for _ in range(max(0, len(self.rooms) - 1)):
-            visited = {self.rooms[0].id} if self.rooms else set()
-            changed = True
-            while changed:
-                changed = False
-                for wall in walls:
-                    if not wall.get("is_shared") or len(wall.get("room_ids", [])) < 2:
-                        continue
-                    a = room_by_id[wall["room_ids"][0]]
-                    b = room_by_id[wall["room_ids"][1]]
-                    if a.id in visited and b.id not in visited and shares_door(a, b):
-                        visited.add(b.id); changed = True
-                    elif b.id in visited and a.id not in visited and shares_door(a, b):
-                        visited.add(a.id); changed = True
-            disconnected = [room for room in self.rooms if room.id not in visited]
-            if not disconnected:
-                break
-            target = disconnected[0]
-            candidate_walls = []
-            for wall in walls:
-                if not wall.get("is_shared") or target.id not in wall.get("room_ids", []):
-                    continue
-                other_id = next((rid for rid in wall.get("room_ids", []) if rid != target.id), None)
-                other = room_by_id.get(other_id)
-                if other_id in visited and other and (has_connection(target, other) or has_connection(other, target)) and is_legal_door_pair(target, other):
-                    candidate_walls.append(wall)
-            if not candidate_walls:
-                # Fallback: connect to ANY adjacent visited room as long as the door pair is architecturally legal
-                for wall in walls:
-                    if not wall.get("is_shared") or target.id not in wall.get("room_ids", []):
-                        continue
-                    other_id = next((rid for rid in wall.get("room_ids", []) if rid != target.id), None)
-                    other = room_by_id.get(other_id)
-                    if other_id in visited and other and is_legal_door_pair(target, other):
-                        candidate_walls.append(wall)
-            if not candidate_walls:
-                break
-            best_wall = max(candidate_walls, key=lambda w: abs(w["z2"] - w["z1"]) if w["orientation"] == "vertical" else abs(w["x2"] - w["x1"]))
-            other_id = next(rid for rid in best_wall["room_ids"] if rid != target.id)
-            other = room_by_id[other_id]
-            cx = (best_wall["x1"] + best_wall["x2"]) / 2.0
-            cz = (best_wall["z1"] + best_wall["z2"]) / 2.0
-            is_vert = best_wall["orientation"] == "vertical"
-            wall_len = abs(best_wall["z2"] - best_wall["z1"]) if is_vert else abs(best_wall["x2"] - best_wall["x1"])
-            door_w = max(2.0, min(3.0, round(wall_len - 0.2, 1)))
-            tx, tz = cx - target.rect.x, cz - target.rect.z
-            ox, oz = cx - other.rect.x, cz - other.rect.z
-            target.doors.append(Door(x=tx, z=tz, width=door_w, wall_orientation=get_face(tx, tz, target, is_vert), target_room_id=other.id))
-            other.doors.append(Door(x=ox, z=oz, width=door_w, wall_orientation=get_face(ox, oz, other, is_vert), target_room_id=target.id))
-            logger.info(f"[DOOR PLANNER] Connected navigation component: {target.name} ↔ {other.name}")
+        # --- NO DOOR RECOVERY / NO INVENTED TOPOLOGY ---
+        # Doors are strictly generated from the approved topology graph (Pass 1 only).
+        # If any required shared wall is missing, the candidate geometry is rejected.
 
         # A staircase must open directly into the public circulation core.
         # Otherwise a graph can be technically connected while the landing is

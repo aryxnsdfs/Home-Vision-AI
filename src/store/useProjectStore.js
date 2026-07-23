@@ -1,4 +1,5 @@
 import { create } from "zustand";
+import { isActiveValidatedResult } from "./jobResultGate.js";
 // API base resolution order:
 //   1. VITE_API_URL build-time env (best for production — point at the backend).
 //   2. localhost dev → the local FastAPI on :8000.
@@ -300,6 +301,9 @@ export const useProjectStore = create((set, get) => ({
   // Incremented for every new design session. Responses from an older session
   // are ignored, even if their network request finishes later.
   generationEpoch: 0,
+  activeJobId: null,
+  activeBlueprintUrl: null,
+  resultStale: false,
   costPresets: null,
   costMaterials: null,
   
@@ -836,7 +840,7 @@ export const useProjectStore = create((set, get) => ({
   clearGenerationProgress: () => set({ generationProgress: null }),
 
   // ── Shared SSE reader ──────────────────────────────────────────────────
-  _readSSEStream: async (url, body) => {
+  _readSSEStream: async (url, body, options = {}) => {
     const res = await fetch(url, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -847,6 +851,7 @@ export const useProjectStore = create((set, get) => ({
     const reader = res.body.getReader();
     const decoder = new TextDecoder();
     let buf = "";
+    let expectedJobId = null;
 
     while (true) {
       const { done, value } = await reader.read();
@@ -861,6 +866,19 @@ export const useProjectStore = create((set, get) => ({
         let evt;
         try { evt = JSON.parse(text); } catch { continue; }
 
+        if (evt.job_id) {
+          if (!expectedJobId) {
+            expectedJobId = String(evt.job_id);
+            if (!options.requestEpoch || get().generationEpoch === options.requestEpoch) {
+              set({ activeJobId: expectedJobId });
+            }
+          }
+          if (String(evt.job_id) !== expectedJobId) continue;
+          if (get().activeJobId && get().activeJobId !== expectedJobId) continue;
+        } else if (options.requireValidated) {
+          continue;
+        }
+
         if (evt.capacity) {
           set(s => ({
             generationProgress: s.generationProgress
@@ -871,7 +889,13 @@ export const useProjectStore = create((set, get) => ({
           continue;
         }
         if (evt.error) throw new Error(evt.error);
-        if (evt.done) return evt.result;
+        if (evt.done) {
+          const result = evt.result || {};
+          if (options.requireValidated && !isActiveValidatedResult(result, expectedJobId)) {
+            throw new Error("Generation result was not validated for the active job");
+          }
+          return result;
+        }
       }
     }
     throw new Error("Stream ended without a result");
@@ -935,7 +959,10 @@ export const useProjectStore = create((set, get) => ({
 
   generateWithAI: async (prompt, width, length, indianOptions = {}, colors = null, packageLevel = "Standard", country = "India", customMaterials = {}, floors = 1, analysisId = null, clarifications = null) => {
     const requestEpoch = get().generationEpoch + 1;
-    set({ apiError: null, generationEpoch: requestEpoch, analysisResult: null });
+    set({
+      apiError: null, generationEpoch: requestEpoch, analysisResult: null,
+      activeJobId: null, activeBlueprintUrl: null, resultStale: true,
+    });
     const features = Object.entries(indianOptions || {}).filter(([, v]) => v).map(([k]) => k.replace(/_/g, ' '));
     get()._startProgress({
       title: null,
@@ -952,22 +979,26 @@ export const useProjectStore = create((set, get) => ({
         layoutRules: get().layoutRules || [],
         analysis_id: analysisId,
         clarifications: clarifications
-      });
+      }, { requireValidated: true, requestEpoch });
       if (get().generationEpoch !== requestEpoch) return;
+      if (get().activeJobId !== data.job_id) return;
       get()._finishProgress();
       await new Promise(r => setTimeout(r, 600));
       set({ lastUnderstood: data.understood || [], lastWarnings: data.warnings || [], onboardingDone: true, showSetupModal: false });
       if (data.area_budget) set({ lastAreaBudget: data.area_budget });
-      get().applyGeneratedProject(data);
+      get().applyGeneratedProject(data, data.job_id);
       get()._applyPaletteColors(colors);
     } catch (err) {
       if (get().generationEpoch !== requestEpoch) return;
-      set({ apiError: err.message, generationProgress: null });
+      set({ apiError: err.message, generationProgress: null, resultStale: true });
     }
   },
 
-  applyGeneratedProject: (payload) =>
+  applyGeneratedProject: (payload, expectedJobId = null) =>
     set((state) => {
+      if (expectedJobId && (
+        state.activeJobId !== expectedJobId || !isActiveValidatedResult(payload, expectedJobId)
+      )) return {};
       const isReplacement = Boolean(payload?.replace_project);
       const baseProject = isReplacement ? createFreshProject() : state.project;
       // Handle both new layout_data format and fallback to legacy flat rooms array
@@ -1126,6 +1157,8 @@ export const useProjectStore = create((set, get) => ({
 
       return {
         project: withAreaMetrics(project, project.floors[project.current_floor_index]?.rooms || []),
+        resultStale: false,
+        activeBlueprintUrl: payload?.blueprint_url || null,
         visibleFloor: floorLevels.length > 1 ? "all" : state.visibleFloor,
         selectedRoomId: null,
         selectedObject: null,

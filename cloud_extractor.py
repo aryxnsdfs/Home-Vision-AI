@@ -43,6 +43,17 @@ class SpatialRelationship(BaseModel):
     required: bool = Field(default=True, description="True when this relationship is explicit in the user's request")
 
 
+class TypedArchitecturalConstraint(BaseModel):
+    kind: str = Field(description="direction, near, adjacent, direct_connection, reachable, separation, between, open_flow, or exclusive_access")
+    source: str = Field(description="Exact room instance ID when known, otherwise normalized room type")
+    target: Optional[str] = Field(default=None, description="Target room ID/type for binary relationships")
+    value: Optional[str] = Field(default=None, description="Direction or other unary constraint value")
+    strength: str = Field(default="preference", description="hard, strong, or preference")
+    origin: str = Field(default="user", description="user, building_code, architectural_default, or gemini_suggestion")
+    weight: float = Field(default=1.0, ge=0.0)
+    evidence: str = Field(default="", description="Short prompt phrase supporting the constraint")
+
+
 class AttachedBathroomAssignment(BaseModel):
     assigned_to: str = Field(description="The exact room type this bathroom is attached to, e.g. master_bedroom")
 
@@ -130,6 +141,10 @@ class HouseDesignRequest(BaseModel):
     intent: str = Field(description="The core action or intent inferred from the user prompt...")
     bhk: int = 0
     floors: int = 1
+    circulation_topology: str = Field(
+        default="",
+        description="Suggested graph family: compact_hub, hub_and_branch, linear_spine, courtyard_loop, core_and_cluster, or hybrid",
+    )
     style: str = ""
     materials: List[str] = Field(default_factory=list)
     target_rooms: List[str] = Field(default_factory=list)
@@ -163,6 +178,10 @@ class HouseDesignRequest(BaseModel):
     move_target_room: str = ""
     move_destination: str = ""
     requested_relationships: List[SpatialRelationship] = Field(default_factory=list)
+    typed_constraints: List[TypedArchitecturalConstraint] = Field(
+        default_factory=list,
+        description="Typed requirements. Near is distance, adjacent is shared-wall preference, direct_connection is a door, and reachable is graph access.",
+    )
     feasibility: str = Field(default="feasible", description="feasible, requires_relayout, or impossible_without_scope_change")
     spatial_strategy: str = Field(default="preserve", description="preserve, swap_cells, local_relayout, or full_relayout")
     analysis_summary: str = Field(default="", description="Short explanation of the spatial plan and its reason")
@@ -612,6 +631,17 @@ Create an access graph before geometry:
 - A gym, office, library or home_theater must have direct access from a foyer, family_lounge, lobby or corridor.
 - A kitchen should preferably connect directly to dining.
 
+Compile relationships into typed_constraints instead of drawing a final house:
+- "near/close to" -> kind near, normally strong; never invent a door
+- "beside/next to" -> kind adjacent, strong shared-wall preference
+- "connected directly/door to" -> kind direct_connection, hard
+- "accessible from" -> kind reachable, hard graph reachability
+- "on the east/west/north/south side" -> kind direction with that value
+- "away from/not near" -> kind separation
+- "open kitchen/living/dining" -> kind open_flow, hard only when explicit
+Every constraint needs strength and origin. Explicit user wording has origin user;
+architectural advice not stated by the user has origin architectural_default or gemini_suggestion.
+
 MISSING INFORMATION EXTRACTION:
 Evaluate if the prompt explicitly or implicitly provides answers for the following keys:
 - "road_side": Which side of the plot faces the main road? (e.g. North, South)
@@ -770,6 +800,8 @@ def auto_wire_topology(room_types: list, ai_categories: dict = None, bathroom_re
     type_counts: Dict[str, int] = {}
     for raw in room_types:
         source = dict(raw) if isinstance(raw, dict) else {"type": raw}
+        if source.get("bathroom_role") and not source.get("bathroom_role_provenance"):
+            source["bathroom_role_provenance"] = "extraction"
         room_type = str(source.get("type", "room")).strip().lower()
         room_type = ROOM_TYPE_ALIASES.get(room_type, room_type.replace(" ", "_"))
         room_type = ROOM_TYPE_ALIASES.get(room_type, room_type)
@@ -788,6 +820,7 @@ def auto_wire_topology(room_types: list, ai_categories: dict = None, bathroom_re
         room_specs.append({
             "type": "corridor", "id": "corridor-1", "connections": [],
             "role": {"traffic": "high", "can_be_passage": True},
+            "provenance": "topology_synthesized", "required_by_user": False,
         })
     
     circulation_idx, outdoor_idx, wet_idx, private_idx, public_idx = [], [], [], [], []
@@ -861,7 +894,7 @@ def auto_wire_topology(room_types: list, ai_categories: dict = None, bathroom_re
     if living_idx is not None and dining_idx is not None:
         add_conn(living_idx, dining_idx, "direct_door", 25)
     if dining_idx is not None and kitchen_idx is not None:
-        add_conn(dining_idx, kitchen_idx, "direct_door", 25)
+        add_conn(kitchen_idx, dining_idx, "direct_door", 25)
     elif living_idx is not None and kitchen_idx is not None and dining_idx is None:
         add_conn(living_idx, kitchen_idx, "direct_door", 25)
 
@@ -915,10 +948,20 @@ def auto_wire_topology(room_types: list, ai_categories: dict = None, bathroom_re
 
     # Pair each requested ensuite with one distinct bedroom (Bedroom → Attached Bath)
     for bedroom_i, bath_i in zip(bedroom_idx, attached_baths):
+        owner_id = room_specs[bedroom_i]["id"]
+        room_specs[bath_i]["bathroom_role"] = "attached"
+        room_specs[bath_i]["owner_room_id"] = owner_id
+        room_specs[bath_i]["assigned_to"] = owner_id
+        room_specs[bath_i]["attached_to_id"] = owner_id
         add_conn(bedroom_i, bath_i, "direct_door", 30)
 
     # Common bathrooms connect to Corridor Hub
     for bath_i in common_baths:
+        room_specs[bath_i]["bathroom_role"] = "common"
+        room_specs[bath_i].setdefault("bathroom_role_provenance", "architectural_default")
+        room_specs[bath_i]["owner_room_id"] = None
+        room_specs[bath_i].pop("assigned_to", None)
+        room_specs[bath_i].pop("attached_to_id", None)
         if hub_idx != bath_i:
             add_conn(hub_idx, bath_i, "direct_door", 20)
 
@@ -940,7 +983,12 @@ def auto_wire_topology(room_types: list, ai_categories: dict = None, bathroom_re
                 target_spec = id_to_spec.get(conn.get("target_room_id", ""))
                 if target_spec:
                     t_passage = target_spec.get("role", {}).get("can_be_passage", True)
-                    if not t_passage:
+                    both_private_destinations = (
+                        not t_passage
+                        and room.get("role", {}).get("traffic") == "low"
+                        and target_spec.get("role", {}).get("traffic") == "low"
+                    )
+                    if both_private_destinations:
                         r_type = room["type"]
                         t_type = target_spec["type"]
                         is_ensuite = ("bath" in r_type or "toilet" in r_type or "bath" in t_type or "toilet" in t_type)

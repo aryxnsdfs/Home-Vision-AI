@@ -1,14 +1,18 @@
 import logging
 import math
 import os
+import copy
+from typing import List, Any, Dict
 from ortools.sat.python import cp_model
 from collections import deque
 from layout_engine import ROOM_MINIMUMS, _DEFAULT_MIN
+from candidate_contract import CandidateStatus, InternalInvariantError, LayoutCandidate, SolvedRect
 
 logger = logging.getLogger(__name__)
 
-# ─── FORBIDDEN ADJACENCIES ───
-# These room type pairs must NEVER share a physical wall (hygiene/vastu)
+# ─── DEFAULT HYGIENE PREFERENCES ───
+# These pairs are quality penalties, not universal building-code facts.  A
+# caller may promote a pair to a hard rule through ``hard_forbidden_pairs``.
 FORBIDDEN_PAIRS = {
     frozenset({'kitchen', 'bathroom'}),
     frozenset({'kitchen', 'toilet'}),
@@ -26,19 +30,6 @@ def to_cp(value: float) -> int:
 
 def from_cp(value: int) -> float:
     return value / COORD_SCALE
-
-class CandidateStatus:
-    GENERATED = "generated"
-    GEOMETRY_VALID = "geometry_valid"
-    OPENINGS_GENERATED = "openings_generated"
-    VALIDATED = "validated"
-    VALID = "valid"
-    INVALID = "invalid"
-    SCORED = "scored"
-    REPAIR_PENDING = "repair_pending"
-    REPAIRED = "repaired"
-    REJECTED = "rejected"
-
 
 class CPSolver:
     """
@@ -82,7 +73,10 @@ class CPSolver:
         """
         plot_w_ft = floor_data.get('plot_width', 30.0)
         plot_l_ft = floor_data.get('plot_length', 40.0)
-        rooms_spec = floor_data.get('rooms', [])
+        candidate: LayoutCandidate | None = floor_data.get('candidate')
+        if candidate is not None:
+            candidate.assert_identity_invariants()
+        rooms_spec = list(candidate.rooms_by_id.values()) if candidate is not None else floor_data.get('rooms', [])
         allowed_bounds = floor_data.get('allowed_bounds')
 
         if not rooms_spec:
@@ -110,6 +104,8 @@ class CPSolver:
                 if 'resolved_rooms' in result:
                     return result
             except Exception as e:
+                if isinstance(e, InternalInvariantError):
+                    raise
                 last_exception = e
                 continue
                 
@@ -121,7 +117,8 @@ class CPSolver:
     def _solve_single_topology(self, floor_data: dict, attempt: int, topology_type: str) -> dict:
         plot_w_ft = floor_data.get('plot_width', 30.0)
         plot_l_ft = floor_data.get('plot_length', 40.0)
-        rooms_spec = floor_data.get('rooms', [])
+        candidate: LayoutCandidate | None = floor_data.get('candidate')
+        rooms_spec = list(candidate.rooms_by_id.values()) if candidate is not None else floor_data.get('rooms', [])
         allowed_bounds = floor_data.get('allowed_bounds')
 
         if not rooms_spec:
@@ -245,6 +242,7 @@ class CPSolver:
                 'location_pref': loc_pref,
                 'preferred_location': loc_pref,
                 'location_weight': room.get('location_weight', 50 if r_type in {'foyer', 'porch', 'portico'} else 8),
+                'direction_constraints': room.get('direction_constraints', []),
                 'min_dim': min_dim,
                 'x': x, 'z': z, 'w': w, 'l': l,
                 'x_end': x_end, 'z_end': z_end,
@@ -295,77 +293,163 @@ class CPSolver:
                 ba = model.NewIntVar(0, plot_w * plot_l, f'bed_area_{i}')
                 model.AddMultiplicationEquality(ba, [b['w'], b['l']])
                 model.Add(ma >= ba)
+        # Default zoning is deliberately soft. Only explicit hard directional
+        # constraints are promoted to CP-SAT feasibility rules.
+        pub_count, srv_count, priv_count = 0, 0, 0
+        for rv in room_vars.values():
+            rt = rv['type'].lower()
+            if rt in {"foyer", "living_room", "dining_room", "living", "dining"}:
+                pub_count += 1
+            elif rt in {"kitchen", "open_kitchen", "store_room", "utility"}:
+                srv_count += 1
+            elif "bedroom" in rt or "bath" in rt or "toilet" in rt:
+                priv_count += 1
 
+            for constraint in rv.get('direction_constraints', []):
+                if str(constraint.get('strength', '')).lower() != 'hard':
+                    continue
+                direction = str(constraint.get('value', '')).lower().replace('-', '_')
+                center_x2 = 2 * rv['x'] + rv['w']
+                center_z2 = 2 * rv['z'] + rv['l']
+                if 'east' in direction:
+                    model.Add(center_x2 >= plot_w)
+                if 'west' in direction:
+                    model.Add(center_x2 <= plot_w)
+                if 'north' in direction:
+                    model.Add(center_z2 <= plot_l)
+                if 'south' in direction:
+                    model.Add(center_z2 >= plot_l)
+
+        logger.info(f"[ZONE] Public rooms={pub_count} | Service rooms={srv_count} | Private rooms={priv_count} (soft defaults)")
         # ────────────────────────────────────────────
         # PHASE 3 — Required Door Graph (HARD vs SOFT)
         # Only strictly required structural adjacencies (attached bath ↔ bedroom,
         # open flow kitchen ↔ dining, stair ↔ landing) are encoded as HARD shared walls.
         # Access relationships (room ↔ corridor/lobby/foyer) are solved via soft walking-distance objectives.
         # ────────────────────────────────────────────
-        processed_edges = set()
-        hard_touch_count = 0
-        direct_door_count = 0
-        soft_count = 0
-        for r_id, rv in room_vars.items():
-            for conn in rv['connections']:
-                intent = conn.get('intent', 'standard')
-                if intent == 'proximity':
+        relation_counts = {
+            "structural_touch": 0, "direct_access": 0, "open_flow": 0,
+            "adjacent_hard": 0, "adjacent_soft": 0, "near": 0,
+            "reachable": 0, "separated": 0, "directional": 0,
+        }
+        encoded_relation_ids = set()
+        if candidate is not None:
+            relations = list(candidate.relations_by_id.values())
+            for relation in relations:
+                kind = relation.kind
+                if kind == "direction":
+                    relation_counts["directional"] += 1
                     continue
-                target_type = conn.get('target_room', '')
-                target_room_id = conn.get('target_room_id', '')
-                if not target_type and not target_room_id:
+                if kind == "near":
+                    relation_counts["near"] += 1
                     continue
-
-                target_id = target_room_id if target_room_id in room_vars and target_room_id != r_id else None
-                if not target_id:
-                    for tid, trv in room_vars.items():
-                        if trv['type'] == target_type and tid != r_id:
-                            target_id = tid
-                            break
-                if not target_id:
+                if kind == "reachable":
+                    relation_counts["reachable"] += 1
                     continue
-
-                edge = frozenset([r_id, target_id])
-                if edge in processed_edges:
+                if kind == "separated":
+                    relation_counts["separated"] += 1
+                    if relation.is_hard and relation.target_room_id:
+                        if relation.source_room_id not in room_vars or relation.target_room_id not in room_vars:
+                            raise RuntimeError(
+                                f"candidate={candidate.candidate_id} relation={relation.relation_id} references missing CP room IDs"
+                            )
+                        a, b = room_vars[relation.source_room_id], room_vars[relation.target_room_id]
+                        gap = to_cp(max(1.0, relation.required_overlap_ft))
+                        sides = [model.NewBoolVar(f"sep_{relation.relation_id}_{index}") for index in range(4)]
+                        model.Add(a['x_end'] + gap <= b['x']).OnlyEnforceIf(sides[0])
+                        model.Add(b['x_end'] + gap <= a['x']).OnlyEnforceIf(sides[1])
+                        model.Add(a['z_end'] + gap <= b['z']).OnlyEnforceIf(sides[2])
+                        model.Add(b['z_end'] + gap <= a['z']).OnlyEnforceIf(sides[3])
+                        model.AddBoolOr(sides)
+                        encoded_relation_ids.add(relation.relation_id)
                     continue
-                processed_edges.add(edge)
+                if kind == "adjacent" and not relation.is_hard:
+                    relation_counts["adjacent_soft"] += 1
+                    continue
+                if kind == "open_flow" and not relation.is_hard:
+                    relation_counts["open_flow"] += 1
+                    continue
+                if not relation.target_room_id:
+                    continue
+                if relation.source_room_id not in room_vars or relation.target_room_id not in room_vars:
+                    raise RuntimeError(
+                        f"candidate={candidate.candidate_id} relation={relation.relation_id} references missing CP room IDs"
+                    )
+                if relation.source_room_id == relation.target_room_id:
+                    raise RuntimeError(
+                        f"candidate={candidate.candidate_id} relation={relation.relation_id} is self-referential"
+                    )
+                if not relation.needs_shared_wall:
+                    continue
+                required_overlap = max(0.1, relation.required_overlap_ft)
+                self._add_touch_constraint(
+                    model,
+                    room_vars[relation.source_room_id], room_vars[relation.target_room_id],
+                    relation.source_room_id, relation.target_room_id,
+                    min_overlap_ft=required_overlap,
+                )
+                encoded_relation_ids.add(relation.relation_id)
+                if kind in {"direct_access", "exclusive_access"}:
+                    relation_counts["direct_access"] += 1
+                    if kind == "exclusive_access":
+                        relation_counts["structural_touch"] += 1
+                elif kind == "open_flow":
+                    relation_counts["open_flow"] += 1
+                elif kind == "adjacent":
+                    relation_counts["adjacent_hard"] += 1
+            candidate.encoded_relation_ids = encoded_relation_ids
+            required_encoded = {
+                relation.relation_id for relation in candidate.relations_by_id.values()
+                if relation.needs_shared_wall or (relation.is_hard and relation.kind == "separated")
+            }
+            if required_encoded != encoded_relation_ids:
+                raise InternalInvariantError(
+                    f"candidate={candidate.candidate_id}: hard relation encoding mismatch "
+                    f"missing={sorted(required_encoded - encoded_relation_ids)} "
+                    f"unexpected={sorted(encoded_relation_ids - required_encoded)}"
+                )
+        else:
+            # Backwards-compatible compilation for edit/template paths. Fresh
+            # generation always supplies the authoritative candidate contract.
+            processed_edges = set()
+            for r_id, rv in room_vars.items():
+                for conn in rv['connections']:
+                    intent = conn.get('intent', 'standard')
+                    key = {
+                        "proximity": "near", "separation": "separated",
+                        "open_flow": "open_flow", "adjacent": "adjacent_soft",
+                    }.get(intent)
+                    if key:
+                        relation_counts[key] += 1
+                        continue
+                    target_id = conn.get('target_room_id')
+                    if target_id not in room_vars or target_id == r_id:
+                        continue
+                    edge = frozenset((r_id, target_id))
+                    if edge in processed_edges:
+                        continue
+                    processed_edges.add(edge)
+                    self._add_touch_constraint(model, rv, room_vars[target_id], r_id, target_id, min_overlap_ft=3.0)
+                    relation_counts["direct_access"] += 1
 
-                trv = room_vars[target_id]
-                t_a = rv['type'].lower()
-                t_b = trv['type'].lower()
-
-                # Determine edge relation type
-                is_direct_door = intent in {"direct_door", "standard", "attached"} or (("bath" in t_a or "toilet" in t_a) and "bed" in t_b) or (("bath" in t_b or "toilet" in t_b) and "bed" in t_a)
-                is_stair_landing = "stair" in t_a or "stair" in t_b
-                is_open_flow = intent == "open_flow"
-
-                if is_direct_door or is_stair_landing or is_open_flow:
-                    min_overlap = 1.0 if floor_data.get('relaxed_recovery') else (1.5 if is_open_flow else 3.0)
-                    self._add_touch_constraint(model, rv, trv, r_id, target_id, min_overlap_ft=min_overlap)
-                    if is_direct_door:
-                        direct_door_count += 1
-                    else:
-                        hard_touch_count += 1
-                else:
-                    soft_count += 1
-
+        logger.info("[RELATION COMPILE]")
+        for key, value in relation_counts.items():
+            logger.info("[RELATION COMPILE] %s=%s", key, value)
         logger.info(
-            f"[CP-SAT] {hard_touch_count} structural-touch edges, "
-            f"{direct_door_count} direct-door edges, "
-            f"{soft_count} soft proximity edges encoded as HARD constraints."
+            "[CP-SAT EDGE AUDIT] requested=%s encoded=%s",
+            sum(1 for relation in candidate.relations_by_id.values() if relation.needs_shared_wall) if candidate else relation_counts["direct_access"],
+            len(encoded_relation_ids) if candidate else relation_counts["direct_access"],
         )
 
         # ────────────────────────────────────────────
         # PHASE 4 — Forbidden Adjacencies (HARD)
         # ────────────────────────────────────────────
-        HARD_FORBIDDEN_SANITATION = {
-            frozenset({"kitchen", "bathroom"}),
-            frozenset({"kitchen", "toilet"}),
-            frozenset({"kitchen", "attached_bathroom"}),
-            frozenset({"kitchen", "common_bathroom"}),
-        }
-
         all_ids = list(room_vars.keys())
+        hard_forbidden_pairs = {
+            frozenset(str(value).lower() for value in pair)
+            for pair in floor_data.get('hard_forbidden_pairs', [])
+            if isinstance(pair, (list, tuple, set)) and len(pair) == 2
+        }
         forbidden_count = 0
         for i in range(len(all_ids)):
             for j in range(i + 1, len(all_ids)):
@@ -374,9 +458,7 @@ class CPSolver:
                 t_b = room_vars[id_b]['type']
                 pair_set = frozenset({t_a, t_b})
 
-                # Sanitation prohibitions remain HARD even during relaxation!
-                is_forbidden = (pair_set in FORBIDDEN_PAIRS and not floor_data.get('relaxed_recovery')) or (pair_set in HARD_FORBIDDEN_SANITATION)
-                if is_forbidden:
+                if pair_set in hard_forbidden_pairs:
                     a, b = room_vars[id_a], room_vars[id_b]
                     # Force ≥ 1 grid-unit gap in at least one direction
                     s1 = model.NewBoolVar(f'fsep_l_{id_a}_{id_b}')
@@ -506,6 +588,22 @@ class CPSolver:
                 model.AddHint(rv['x'], max(0, plot_w // 2 - rv['min_dim'] // 2))
                 model.AddHint(rv['z'], max(0, plot_l // 2 - rv['min_dim'] // 2))
 
+            for constraint in rv.get('direction_constraints', []):
+                direction = str(constraint.get('value', '')).lower().replace('-', '_')
+                strength = str(constraint.get('strength', 'preference')).lower()
+                origin = str(constraint.get('origin', 'architectural_default')).lower()
+                base_weight = {'hard': 80, 'strong': 25, 'preference': 8}.get(strength, 8)
+                if origin == 'user':
+                    base_weight *= 3
+                if 'east' in direction:
+                    obj_terms.append(base_weight * (plot_w * 2 - cx))
+                if 'west' in direction:
+                    obj_terms.append(base_weight * cx)
+                if 'north' in direction:
+                    obj_terms.append(base_weight * cz)
+                if 'south' in direction:
+                    obj_terms.append(base_weight * (plot_l * 2 - cz))
+
             for conn in rv['connections']:
                 tt = conn.get('target_room', '')
                 wt = conn.get('weight', 5)
@@ -530,8 +628,12 @@ class CPSolver:
                 dz = model.NewIntVar(0, plot_l * 2, f'dz_{r_id}_{tid}')
                 model.AddAbsEquality(dx, cx - cx2)
                 model.AddAbsEquality(dz, cz - cz2)
-                obj_terms.append(wt * dx)
-                obj_terms.append(wt * dz)
+                if conn.get('intent') == 'separation':
+                    obj_terms.append(-wt * dx)
+                    obj_terms.append(-wt * dz)
+                else:
+                    obj_terms.append(wt * dx)
+                    obj_terms.append(wt * dz)
 
         # Recovery asks only for the first valid complete plan. Optimizing all
         # pairwise walking distances can consume the whole deadline without
@@ -578,8 +680,17 @@ class CPSolver:
                 })
 
             # ── PHASE 7 — Post-Solve Validation ──
-            validation = self._validate(resolved)
+            if candidate is not None:
+                candidate.set_rectangles({
+                    room["id"]: SolvedRect(room["x"], room["z"], room["width"], room["length"])
+                    for room in resolved
+                })
+                candidate.assert_encoded_edges_realized()
+                logger.info("[SOLVER INVARIANT] all encoded hard edges realized candidate_id=%s", candidate.candidate_id)
+            validation = self._validate(resolved, hard_forbidden_pairs, validate_reachability=candidate is None)
             floor_data['resolved_rooms'] = resolved
+            if candidate is not None:
+                floor_data['candidate'] = candidate
             floor_data['validation'] = validation
 
             if not validation['passed']:
@@ -607,6 +718,12 @@ class CPSolver:
                     logger.info("[RELAXATION] Shrinking rooms to architectural minimums and retrying...")
                     floor_data_relaxed = dict(floor_data)
                     floor_data_relaxed['rooms'] = relaxed_specs
+                    if candidate is not None:
+                        relaxed_candidate = copy.deepcopy(candidate)
+                        relaxed_candidate.rooms_by_id = {
+                            str(room['id']): room for room in relaxed_specs
+                        }
+                        floor_data_relaxed['candidate'] = relaxed_candidate
                     floor_data_relaxed['relaxed_recovery'] = True
                     result = self._solve_single_topology(floor_data_relaxed, attempt + 1, topology_type)
                     if 'resolved_rooms' in result:
@@ -809,7 +926,7 @@ class CPSolver:
 
         model.AddBoolOr([c1, c2, c3, c4])
 
-    def _validate(self, rooms):
+    def _validate(self, rooms, hard_forbidden_pairs=None, validate_reachability=True):
         """BFS reachability + forbidden-adjacency + door-feasibility post-check."""
         errors = []
 
@@ -820,9 +937,13 @@ class CPSolver:
                 sw = self._shared_wall(a, b)
                 if sw > 0.01:
                     # Check forbidden
-                    if frozenset({a['type'], b['type']}) in FORBIDDEN_PAIRS:
+                    if frozenset({a['type'], b['type']}) in (hard_forbidden_pairs or set()):
                         errors.append(f"FORBIDDEN: {a['id']} ({a['type']}) touches {b['id']} ({b['type']})")
-                    if sw >= MIN_DOOR_WALL_FT:
+                    # Standard doors can downscale on a 2–4 ft shared segment;
+                    # open-flow and structural edges retain the wider check
+                    # below. Using 4 ft for graph reachability rejected valid
+                    # bathroom/corridor doors after CP had guaranteed 3 ft.
+                    if sw >= 2.0:
                         adj[a['id']].add(b['id'])
                         adj[b['id']].add(a['id'])
 
@@ -850,7 +971,7 @@ class CPSolver:
 
         # BFS from living_room — every room must be reachable
         starts = [r['id'] for r in rooms if r['type'] == 'living_room']
-        if starts:
+        if validate_reachability and starts:
             visited = set(starts)
             q = deque(starts)
             while q:
@@ -885,6 +1006,43 @@ class CPSolver:
             return max(0.0, e - s)
 
         return 0.0
+
+
+def score_layout(nodes: List[Any], plot_w: float, plot_l: float) -> float:
+    """Calculate architectural quality score (0.0 to 100.0) for a solved floor layout."""
+    if not nodes:
+        return 0.0
+
+    total_area = sum(n.rect.width * n.rect.length for n in nodes)
+    plot_area = plot_w * plot_l
+
+    # 1. Compactness (ratio of building footprint to plot area)
+    compactness = min(1.0, total_area / max(1.0, plot_area * 0.75))
+
+    # 2. Corridor Area Penalty
+    corridor_area = sum(n.rect.width * n.rect.length for n in nodes if "corridor" in getattr(n, "type", "").lower() or "passage" in getattr(n, "type", "").lower())
+    corridor_ratio = corridor_area / max(1.0, total_area)
+    corridor_penalty = max(0.0, (corridor_ratio - 0.15) * 2.0)
+
+    # 3. Zoning Quality (Public rooms at front z <= 0.6*l, Private rooms at rear)
+    zoning_score = 0.0
+    for n in nodes:
+        t = getattr(n, "type", "").lower()
+        if t in {"foyer", "living_room", "dining_room"}:
+            if n.rect.z + n.rect.length <= plot_l * 0.60:
+                zoning_score += 1.0
+        elif "bedroom" in t or "bath" in t:
+            if n.rect.z >= plot_l * 0.30:
+                zoning_score += 1.0
+    zoning_quality = min(1.0, zoning_score / max(1.0, float(len(nodes))))
+
+    # Total score formula (0 to 100)
+    score = (
+        compactness * 30.0 +
+        zoning_quality * 40.0 +
+        (1.0 - min(1.0, corridor_penalty)) * 30.0
+    )
+    return round(max(0.0, min(100.0, score)), 2)
 
 
 # ───────────────────────────────────────────────

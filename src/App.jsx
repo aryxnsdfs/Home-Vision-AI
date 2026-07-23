@@ -10,6 +10,7 @@ export default function App() {
   const rooms = useProjectStore(s => (s.project.floors ? s.project.floors[s.project.current_floor_index || 0].rooms : []));
   const onboardingDone = useProjectStore(s => s.onboardingDone);
   const showSetupModal = useProjectStore(s => s.showSetupModal);
+  const resultStale = useProjectStore(s => s.resultStale);
   const showOnboarding = (!onboardingDone && rooms.length === 0) || showSetupModal;
 
   // NOTE: cost presets/materials are derived client-side (PACKAGE_PRESETS) and
@@ -19,7 +20,8 @@ export default function App() {
   return (
     <main className="relative h-screen w-screen overflow-hidden bg-slate-950 text-white">
       {showOnboarding && <ProjectSetupModal />}
-      <SceneCanvas />
+      {!resultStale && <SceneCanvas />}
+      {resultStale && <div className="fixed inset-0 z-0 bg-slate-950" aria-label="Waiting for a validated design" />}
       <FloatingOverlay />
       <GenerationOverlay />
       <AnalysisModal />

@@ -25,15 +25,22 @@ def generate_architecture_task(request_data: dict, job_id: str):
     logger.info(f"[WORKER] Starting architecture job {job_id}")
     
     def emit_fn(msg_dict: dict):
-        redis_client.publish(job_id, json.dumps(msg_dict))
+        redis_client.publish(job_id, json.dumps({"job_id": job_id, **msg_dict}))
         
     try:
-        req = GenerateRequest(**request_data)
-        _stream_generate_work(req, emit_fn)
+        req = GenerateRequest(**{**request_data, "job_id": job_id})
+        result = _stream_generate_work(req, emit_fn)
+        if result is None:
+            raise RuntimeError("Generation pipeline returned no validated layout")
+        if not result.get("success", True):
+            raise RuntimeError(result.get("error", "Architecture generation failed"))
+        return result
     except Exception as e:
         logger.error(f"[WORKER] Job {job_id} failed: {e}")
         emit_fn({
+            "error": str(e),
             "success": False,
+            "validation_passed": False,
             "status": "generation_failed",
             "error_code": "INVALID_LAYOUT",
             "message": str(e)

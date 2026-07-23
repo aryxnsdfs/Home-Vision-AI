@@ -323,8 +323,12 @@ def validate_circulation_access(nodes: List[RoomNode]) -> Dict[str, Any]:
             break
 
     if not entrance_node:
+        entrance_node = next((n for n in nodes if _canon(n.type) in {"foyer", "entrance"}), None)
+    if not entrance_node:
+        entrance_node = next((n for n in nodes if _canon(n.type) in {"living_room", "living"}), None)
+    if not entrance_node:
         entrance_node = next(
-            (n for n in nodes if _canon(n.type) in {"foyer", "entrance", "living_room", "corridor"}),
+            (n for n in nodes if _canon(n.type) in {"corridor", "hallway", "passage"}),
             nodes[0] if nodes else None
         )
 
@@ -571,8 +575,58 @@ def split_duplex_specs(
 
     _connect_stair_to_public_core(ground)
     _connect_stair_to_public_core(first)
+    sanitize_foyer_and_hub_connections(ground)
+    sanitize_foyer_and_hub_connections(first)
 
     return ground, first
+
+
+def sanitize_foyer_and_hub_connections(floor_specs: List[Dict[str, Any]]) -> None:
+    """Invariant: Foyer must NOT act as a universal hub (max 3 connections: Entrance, Living Room, optional Dining).
+    Private rooms (bedrooms/bathrooms) MUST NOT connect directly to Foyer; they connect to Living Room or Private Lobby / Corridor."""
+    foyer = next((r for r in floor_specs if _canon(r.get("type", "")) == "foyer"), None)
+    if not foyer:
+        return
+    
+    living = next((r for r in floor_specs if _canon(r.get("type", "")) in {"living_room", "living"}), None)
+    private_hub = next((r for r in floor_specs if _canon(r.get("type", "")) in {"corridor", "hallway", "lobby", "passage"}), None)
+    
+    target_hub = private_hub or living
+    if not target_hub:
+        return
+
+    # Filter out direct connections from Foyer to private rooms, bathrooms, kitchen
+    foyer_conns = foyer.get("connections", [])
+    new_foyer_conns = []
+    
+    for c in foyer_conns:
+        target_t = _canon(c.get("target_room", ""))
+        if target_t in {"living_room", "living", "dining_room", "dining", "entrance"}:
+            new_foyer_conns.append(c)
+        else:
+            # Re-route connection from Foyer to Living Room / Private Lobby
+            if target_hub:
+                target_hub_conns = target_hub.setdefault("connections", [])
+                if not any(tc.get("target_room_id") == c.get("target_room_id") for tc in target_hub_conns):
+                    target_hub_conns.append(c)
+                    
+    foyer["connections"] = new_foyer_conns
+    
+    # Also update reverse connections on room objects pointing to foyer
+    for r in floor_specs:
+        rt = _canon(r.get("type", ""))
+        if rt not in {"foyer", "living_room", "living", "dining_room", "dining"}:
+            new_conns = []
+            for c in r.get("connections", []):
+                if str(c.get("target_room_id", "")) == str(foyer.get("id")) or _canon(c.get("target_room", "")) == "foyer":
+                    if target_hub:
+                        c_copy = copy.deepcopy(c)
+                        c_copy["target_room"] = target_hub.get("type")
+                        c_copy["target_room_id"] = target_hub.get("id")
+                        new_conns.append(c_copy)
+                else:
+                    new_conns.append(c)
+            r["connections"] = new_conns
 
 
 # Features that must NEVER appear unless the user explicitly requested them

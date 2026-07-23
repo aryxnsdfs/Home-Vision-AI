@@ -616,13 +616,19 @@ function PromptBar() {
     const t0 = performance.now();
     try {
       const currentState = useProjectStore.getState();
+      const requestEpoch = currentState.generationEpoch + 1;
+      useProjectStore.setState({
+        generationEpoch: requestEpoch, activeJobId: null,
+        activeBlueprintUrl: null, resultStale: true,
+      });
       const json = await currentState._readSSEStream(`${API_BASE_URL}/generate/stream`, {
         prompt: clean,
         currentProject: currentState.project,
         requestMode: "edit",
         layoutRules: currentState.layoutRules || [],
         indianOptions: currentState.project.indianOptions || {},
-      });
+      }, { requireValidated: true, requestEpoch });
+      if (useProjectStore.getState().generationEpoch !== requestEpoch) return;
       const elapsed = ((performance.now() - t0) / 1000).toFixed(2);
 
       // Use backend logs if available, otherwise show basic info
@@ -642,7 +648,7 @@ function PromptBar() {
       };
       setGenLogs([...backendLogs, clientLog, ...recommendationLogs]);
 
-      applyGeneratedProject(json);
+      applyGeneratedProject(json, json.job_id);
       setStatus(editApplied ? "✓ Applied" : "⚠ Needs more space");
     } catch (err) {
       const elapsed = ((performance.now() - t0) / 1000).toFixed(2);
@@ -1009,11 +1015,17 @@ function RoofToggle() {
               setRoofPrompt("");
               try {
                 const currentState = useProjectStore.getState();
+                const requestEpoch = currentState.generationEpoch + 1;
+                useProjectStore.setState({
+                  generationEpoch: requestEpoch, activeJobId: null,
+                  activeBlueprintUrl: null, resultStale: true,
+                });
                 const json = await currentState._readSSEStream(`${API_BASE_URL}/generate/stream`, {
                   prompt: clean,
                   currentProject: currentState.project,
-                });
-                useProjectStore.getState().applyGeneratedProject(json);
+                }, { requireValidated: true, requestEpoch });
+                if (useProjectStore.getState().generationEpoch !== requestEpoch) return;
+                useProjectStore.getState().applyGeneratedProject(json, json.job_id);
               } catch (e) {
                 console.error(e);
               }

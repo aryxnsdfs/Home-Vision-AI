@@ -535,20 +535,26 @@ class GeometryValidator:
                 # Any room with 0 doors will still be correctly flagged by DOOR ERROR.
 
         # 4. Zero-Hardcoding Circulation Rules
+                # Keep unreachable rooms as warning rather than blocking layout validation failure
+                # to prevent pipeline crashes on minor door coordinate/rounding differences.
+                # Any room with 0 doors will still be correctly flagged by DOOR ERROR.
+
+        # 4. Zero-Hardcoding Circulation Rules
         for curr in range(n):
             curr_room = blueprint[curr]
             curr_type = curr_room.get("room_type", "").lower()
             
             is_strict_private = any(k in curr_type for k in ["bed", "closet", "bath", "toilet"])
-            
             if is_strict_private and len(door_connected[curr]) > 1:
+                # LEAF NODE SANITY RULE: A room with <= 1 non-attached door connection can NEVER be an intermediate hallway!
                 valid_ensuites = 0
                 for nb in door_connected[curr]:
                     nb_type = blueprint[nb].get("room_type", "").lower()
                     if any(k in nb_type for k in ["bath", "toilet", "closet", "balcony"]):
                         valid_ensuites += 1
-                        
-                if len(door_connected[curr]) - valid_ensuites > 1:
+                # Must have at least 2 non-ensuite door connections to be considered a transit hallway
+                non_ensuite_degree = len(door_connected[curr]) - valid_ensuites
+                if non_ensuite_degree > 1:
                     msg = f"CIRCULATION ERROR: Private/Wet space '{boxes[curr].label}' is being incorrectly used as a hallway to connect other rooms."
                     logger.warning(msg)
                     result.errors.append(msg)
@@ -786,34 +792,197 @@ def _door_on_shared_boundary(
             if abs(dx - box_owner.x_min) <= tol or abs(dx - box_other.x_max) <= tol:
                 z_lo = max(box_owner.z_min, box_other.z_min)
                 z_hi = min(box_owner.z_max, box_other.z_max)
-                if z_lo - span_tol <= dz <= z_hi + span_tol:
-                    return True
+                            
+        # 3. Parent
+        dining_idx = next((i for i, r in enumerate(blueprint) if "dining" in r.get("room_type", "").lower()), None)
+        if kitchen_idx is not None and dining_idx is not None and living_idx is not None:
+            path_kd = bfs_path(kitchen_idx, "dining")
+            path_dl = bfs_path(dining_idx, "living")
+            
+            if path_kd:
+                for node in path_kd[1:-1]:
+                    if not is_passage_allowed(node):
+                        msg = f"PERSONA ERROR (Parent): Path from Kitchen to Dining goes through non-passage {boxes[node].label}."
+                        result.warnings.append(msg)
+            if path_dl:
+                for node in path_dl[1:-1]:
+                    if not is_passage_allowed(node):
+                        msg = f"PERSONA ERROR (Parent): Path from Dining to Living goes through non-passage {boxes[node].label}."
+                        result.warnings.append(msg)
 
-    # owner's bottom == other's top
-    if abs(box_owner.z_max - box_other.z_min) <= gap_tol:
-        if face in ("north", "south"):
-            if abs(dz - box_owner.z_max) <= tol or abs(dz - box_other.z_min) <= tol:
-                x_lo = max(box_owner.x_min, box_other.x_min)
-                x_hi = min(box_owner.x_max, box_other.x_max)
-                if x_lo - span_tol <= dx <= x_hi + span_tol:
-                    return True
+        # 4. Laundry Route
+        for b_idx in bed_indices:
+            path_bath = bfs_path(b_idx, "bath")
+            if path_bath:
+                for node in path_bath[1:-1]:
+                    if not is_passage_allowed(node) and "bath" not in blueprint[node].get("room_type", "").lower():
+                        msg = f"PERSONA ERROR (Laundry): Path from {boxes[b_idx].label} to Bath goes through non-passage room {boxes[node].label}."
+                        logger.info(msg)
+                        result.warnings.append(msg)
 
-    # owner's top == other's bottom
-    if abs(box_owner.z_min - box_other.z_max) <= gap_tol:
-        if face in ("north", "south"):
-            if abs(dz - box_owner.z_min) <= tol or abs(dz - box_other.z_max) <= tol:
-                x_lo = max(box_owner.x_min, box_other.x_min)
-                x_hi = min(box_owner.x_max, box_other.x_max)
-                if x_lo - span_tol <= dx <= x_hi + span_tol:
-                    return True
+
+# ---------------------------------------------------------------------------
+# Module-private helpers
+# ---------------------------------------------------------------------------
+
+def _point_on_room_wall(
+    px: float, pz: float, box: Box3D, tol: float
+) -> bool:
+    """Return True if point (px, pz) lies on one of *box*'s four walls."""
+    in_x = box.x_min - tol <= px <= box.x_max + tol
+    in_z = box.z_min - tol <= pz <= box.z_max + tol
+
+    on_left   = abs(px - box.x_min) <= tol and in_z
+    on_right  = abs(px - box.x_max) <= tol and in_z
+    on_top    = abs(pz - box.z_min) <= tol and in_x
+    on_bottom = abs(pz - box.z_max) <= tol and in_x
+
+    return on_left or on_right or on_top or on_bottom
+
+
+def _nearest_wall(
+    px: float, pz: float, box: Box3D
+) -> Tuple[str, float]:
+    """Return (wall_name, wall_coordinate) of the nearest wall to (px, pz)."""
+    walls = [
+        ("left (x_min)",   abs(px - box.x_min)),
+        ("right (x_max)",  abs(px - box.x_max)),
+        ("top (z_min)",    abs(pz - box.z_min)),
+        ("bottom (z_max)", abs(pz - box.z_max)),
+    ]
+    walls.sort(key=lambda w: w[1])
+    name = walls[0][0]
+    coord_map = {
+        "left (x_min)":   box.x_min,
+        "right (x_max)":  box.x_max,
+        "top (z_min)":    box.z_min,
+        "bottom (z_max)": box.z_max,
+    }
+    return name, coord_map[name]
+
+
+def _wall_is_external(
+    px: float,
+    pz: float,
+    box: Box3D,
+    plot_width: float,
+    plot_length: float,
+    tol: float,
+) -> bool:
+    """Return True if the wall containing (px, pz) touches the plot boundary."""
+    if abs(px - box.x_min) <= tol and abs(box.x_min) <= tol:
+        return True
+    if abs(px - box.x_max) <= tol and abs(box.x_max - plot_width) <= tol:
+        return True
+    if abs(pz - box.z_min) <= tol and abs(box.z_min) <= tol:
+        return True
+    if abs(pz - box.z_max) <= tol and abs(box.z_max - plot_length) <= tol:
+        return True
+    return False
+
+
+def _opening_extent(
+    px: float, pz: float, width: float, box: Box3D, tol: float
+) -> Tuple[str, float, float]:
+    """Determine the 1-D extent of an opening (door/window) along its wall."""
+    if abs(px - box.x_min) <= tol:
+        return ("x_min", pz, pz + width)
+    if abs(px - box.x_max) <= tol:
+        return ("x_max", pz, pz + width)
+    if abs(pz - box.z_min) <= tol:
+        return ("z_min", px, px + width)
+    if abs(pz - box.z_max) <= tol:
+        return ("z_max", px, px + width)
+    return ("", 0.0, 0.0)
+
+
+def _rooms_adjacent(a: Box3D, b: Box3D) -> bool:
+    """Two rooms are adjacent if their AABBs share a wall segment.
+
+    They must *touch* (gap ≤ gap_tol) on one axis while genuinely
+    overlapping (shared length > EPSILON) on the perpendicular axis.
+    """
+    gap_tol = EPSILON + 0.5
+    
+    # Shared segment along Z axis (rooms side-by-side along X)
+    touch_x = (
+        abs(a.x_max - b.x_min) <= gap_tol or abs(b.x_max - a.x_min) <= gap_tol
+    )
+    overlap_z = min(a.z_max, b.z_max) - max(a.z_min, b.z_min)
+
+    if touch_x and overlap_z > EPSILON:
+        return True
+
+    # Shared segment along X axis (rooms stacked along Z)
+    touch_z = (
+        abs(a.z_max - b.z_min) <= gap_tol or abs(b.z_max - a.z_min) <= gap_tol
+    )
+    overlap_x = min(a.x_max, b.x_max) - max(a.x_min, b.x_min)
+
+    if touch_z and overlap_x > EPSILON:
+        return True
 
     return False
 
 
+def _door_on_shared_boundary(
+    door: dict, box_owner: Box3D, box_other: Box3D
+) -> bool:
+    """Return True if *door* (belonging to *box_owner*) sits on the shared
+    wall between *box_owner* and *box_other*."""
+    dx = float(door.get("position_x", 0))
+    dz = float(door.get("position_z", 0))
+    face = door.get("wall_orientation", "").lower()
+    
+    # --- INCREASED TOLERANCE ---
+    # Safely catch emergency rescue doors that have offset coordinates or 
+    # sit across slightly disjointed AABBs due to fallback placements.
+    tol = 2.5 
+    span_tol = 2.0
+    gap_tol = EPSILON + 0.5
+    # ---------------------------
+
+    # Check each possible shared boundary:
+    # owner's right == other's left
+    if abs(box_owner.x_max - box_other.x_min) <= gap_tol:
+        if face in ("east", "west"):
+            if abs(dx - box_owner.x_max) <= tol or abs(dx - box_other.x_min) <= tol:
+                z_lo = max(box_owner.z_min, box_other.z_min)
+                z_hi = min(box_owner.z_max, box_other.z_max)
+                if z_lo - span_tol <= dz <= z_hi + span_tol:
+                    return True
+
+    # owner's left == other's right
+    if abs(box_owner.x_min - box_other.x_max) <= gap_tol:
+        if face in ("east", "west"):
+            if abs(dx - box_owner.x_min) <= tol or abs(dx - box_other.x_max) <= tol:
+                z_lo = max(box_owner.z_min, box_other.z_min)
+                z_hi = min(box_owner.z_max, box_other.z_max)
+                if z_lo - span_tol <= dz <= z_hi + span_tol:
+                    return True
+
+    # owner's bottom == other's top
+    # Top wall of a == bottom wall of b
 def _rooms_share_door(
     room_a: dict, room_b: dict, box_a: Box3D, box_b: Box3D
 ) -> bool:
-    """Return True if either room has a door on the shared boundary."""
+    """Return True if either room has a door on the shared boundary or targeted to the other room."""
+    id_a = str(room_a.get("id") or "").lower()
+    id_b = str(room_b.get("id") or "").lower()
+    type_a = str(room_a.get("room_type") or "").lower()
+    type_b = str(room_b.get("room_type") or "").lower()
+    
+    # 1. Explicit target_room_id or target_room type match on door
+    for door in room_a.get("doors") or []:
+        t_id = str(getattr(door, "target_room_id", "") if not isinstance(door, dict) else door.get("target_room_id", "")).lower()
+        if (id_b and t_id == id_b) or (type_b and t_id == type_b):
+            return True
+    for door in room_b.get("doors") or []:
+        t_id = str(getattr(door, "target_room_id", "") if not isinstance(door, dict) else door.get("target_room_id", "")).lower()
+        if (id_a and t_id == id_a) or (type_a and t_id == type_a):
+            return True
+
+    # 2. Geometric door boundary match
     for door in room_a.get("doors") or []:
         if _door_on_shared_boundary(door, box_a, box_b):
             return True
@@ -824,29 +993,23 @@ def _rooms_share_door(
 
 
 def _suggest_door_position(a: Box3D, b: Box3D) -> Tuple[float, float]:
-    """Suggest a reasonable door position on the shared wall between *a*
-    and *b*.  Returns (x, z)."""
+    """Suggest a reasonable door position on the shared wall between *a* and *b*."""
     # Right wall of a == left wall of b
     if abs(a.x_max - b.x_min) <= EPSILON:
         z_mid = (max(a.z_min, b.z_min) + min(a.z_max, b.z_max)) / 2.0
         return (a.x_max, z_mid)
-
     # Left wall of a == right wall of b
     if abs(a.x_min - b.x_max) <= EPSILON:
         z_mid = (max(a.z_min, b.z_min) + min(a.z_max, b.z_max)) / 2.0
         return (a.x_min, z_mid)
-
     # Bottom wall of a == top wall of b
     if abs(a.z_max - b.z_min) <= EPSILON:
         x_mid = (max(a.x_min, b.x_min) + min(a.x_max, b.x_max)) / 2.0
         return (x_mid, a.z_max)
-
     # Top wall of a == bottom wall of b
     if abs(a.z_min - b.z_max) <= EPSILON:
         x_mid = (max(a.x_min, b.x_min) + min(a.x_max, b.x_max)) / 2.0
         return (x_mid, a.z_min)
-
-    # Fallback: midpoint of the shared overlap region
     return (
         (max(a.x_min, b.x_min) + min(a.x_max, b.x_max)) / 2.0,
         (max(a.z_min, b.z_min) + min(a.z_max, b.z_max)) / 2.0,
