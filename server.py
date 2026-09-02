@@ -17,6 +17,7 @@ No external API calls. All processing is local.
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import json
 import logging
 import math
@@ -657,12 +658,42 @@ def automatically_repair_program(prompt: str, slm_result: dict, requested_floors
             room_counts[t] = room_counts.get(t, 0) + 1
 
     # 4. Enforce BHK Count (Step 2)
+    #
+    # BHK counts every sleeping room, so the audit has to see each "*bedroom"
+    # variant the planner may emit (guest_bedroom, kids_bedroom, ...). Counting
+    # only the two canonical keys left those variants sitting in room_counts on
+    # top of the corrected total, so a 3BHK request came back with 4 bedrooms
+    # and run_semantic_gate rejected the whole layout.
+    bedroom_keys = [t for t in room_counts if "bedroom" in t]
     if bhk > 0:
-        current_bedrooms = room_counts.get("bedroom", 0) + room_counts.get("master_bedroom", 0)
-        if current_bedrooms != bhk:
+        current_bedrooms = sum(room_counts[t] for t in bedroom_keys)
+        if current_bedrooms != bhk or room_counts.get("master_bedroom", 0) != 1:
             logger.info(f"[SEMANTIC REPAIR] Corrected bedrooms {current_bedrooms} → {bhk}")
-            room_counts["master_bedroom"] = 1 if bhk >= 1 else 0
-            room_counts["bedroom"] = max(0, bhk - 1)
+            # Keep the named variants the prompt actually asked for, then fill
+            # the remaining slots with generic bedrooms.
+            kept = ["master_bedroom"]
+            for key in sorted(bedroom_keys):
+                if key in ("bedroom", "master_bedroom") or len(kept) >= bhk:
+                    continue
+                if key.replace("_", " ") in prompt_lower:
+                    kept.extend([key] * min(room_counts[key], bhk - len(kept)))
+            for key in bedroom_keys:
+                room_counts.pop(key, None)
+            for key in kept:
+                room_counts[key] = room_counts.get(key, 0) + 1
+            remaining = bhk - len(kept)
+            if remaining > 0:
+                room_counts["bedroom"] = remaining
+    elif len(bedroom_keys) > 1 or room_counts.get("master_bedroom", 0) > 1:
+        # No explicit BHK: still collapse the variants onto one master plus
+        # generic bedrooms so the gate's substring count stays consistent.
+        total_bedrooms = sum(room_counts[t] for t in bedroom_keys)
+        if total_bedrooms:
+            for key in bedroom_keys:
+                room_counts.pop(key, None)
+            room_counts["master_bedroom"] = 1
+            if total_bedrooms > 1:
+                room_counts["bedroom"] = total_bedrooms - 1
 
     # 5. Merge Unrequested Duplicate Singletons (Step 3)
     for singleton in SINGLETON_ROOM_TYPES:
@@ -737,28 +768,140 @@ def enforce_floor_intent(prompt: str, slm_result: dict, requested_floors: int = 
     return automatically_repair_program(prompt, slm_result, requested_floors)
 
 
-def run_semantic_gate(intent: dict, room_specs: list) -> Tuple[bool, list]:
+CIRCULATION_TYPES = {"corridor", "circulation", "hallway", "foyer", "lobby", "passage", "entrance_lobby"}
+
+
+def ensure_circulation(room_specs: list) -> list:
+    """Give a floor a dedicated circulation space when its program needs one.
+
+    Without one, CP-SAT has nowhere to route access and the realized doors end
+    up threading through a bedroom or bathroom — which geometry validation
+    rejects as "private space used as a hallway", failing the whole request.
+    A corridor was only ever guaranteed for multi-floor programs, so
+    single-floor plans failed intermittently depending on the planner's output.
+    """
+    specs = [item for item in (room_specs or []) if isinstance(item, dict)]
+    types = [canonical_type(item.get("type")) for item in specs]
+    if any(t in CIRCULATION_TYPES for t in types):
+        return specs
+    private_count = sum(
+        1 for t in types
+        if "bedroom" in t or "bath" in t or "toilet" in t or t in {"study_room", "pooja_room"}
+    )
+    # Two private destinations can hang off the living room directly; beyond
+    # that the plan needs somewhere to actually walk.
+    if private_count < 3:
+        return specs
+    logger.info("[CIRCULATION] Added corridor for %d private rooms with no circulation space", private_count)
+    return specs + [{"type": "corridor", "name": "Corridor", "confidence": 100, "required": True,
+                     "provenance": "building_requirement"}]
+
+
+def fit_program_to_plot(
+    room_specs: list, plot_width: float, plot_length: float, floors: int = 1,
+) -> Tuple[list, list]:
+    """Drop optional rooms until the program's minimum area fits the plot.
+
+    CP-SAT reports plain infeasibility when the planner proposes more rooms
+    than the buildable footprint can hold, and the pipeline then raised — the
+    user saw no house at all. Shedding the lowest-value optional rooms first
+    yields a real, buildable plan for the rooms that were actually requested.
+
+    Returns the surviving specs plus user-facing notes about what was dropped.
+    """
+    from layout_engine import get_min_area
+
+    specs = [item for item in (room_specs or []) if isinstance(item, dict)]
+    if not specs:
+        return specs, []
+
+    # Match the envelope CP-SAT actually solves in. The engine targets 75%
+    # site coverage, and a program that fills that slab to the brim leaves no
+    # width for corridors — the solver then either reports infeasible or
+    # routes circulation through a bedroom, which validation rejects. Reserve
+    # the remaining slack for circulation instead.
+    coverage = float(os.getenv("PROGRAM_FIT_COVERAGE", "0.75"))
+    slack = _FIT_SLACK.get()
+    if slack is None:
+        slack = float(os.getenv("PROGRAM_FIT_SLACK", "0.88"))
+    budget = max(1.0, float(plot_width) * float(plot_length) * coverage * max(1, int(floors)) * slack)
+
+    def required_area(items):
+        return sum(get_min_area(item.get("type", "room")) for item in items if not item.get("is_outdoor"))
+
+    if required_area(specs) <= budget:
+        return specs, []
+
+    # Sheddable last-to-first: pure suggestions before anything the prompt or
+    # the BHK contract actually asked for. Bedrooms are never shed — dropping
+    # one would silently change the BHK the user requested.
+    def shed_rank(item):
+        room_type = canonical_type(item.get("type"))
+        provenance = str(item.get("provenance", ""))
+        if "bedroom" in room_type:
+            return None
+        if room_type in {"kitchen", "living_room"} or "bath" in room_type or "toilet" in room_type:
+            return None
+        if room_type in {"corridor", "hallway", "passage", "lobby", "staircase", "stairwell"}:
+            return None
+        if provenance == "gemini_suggestion" or not item.get("required", True):
+            return 0
+        return 1  # explicit but non-essential; only shed as a last resort
+
+    order = sorted(
+        (i for i, item in enumerate(specs) if shed_rank(specs[i]) is not None),
+        key=lambda i: (shed_rank(specs[i]), -get_min_area(specs[i].get("type", "room"))),
+    )
+    dropped, kept_flags = [], [True] * len(specs)
+    for index in order:
+        if required_area([s for s, keep in zip(specs, kept_flags) if keep]) <= budget:
+            break
+        kept_flags[index] = False
+        dropped.append(canonical_type(specs[index].get("type")))
+
+    survivors = [s for s, keep in zip(specs, kept_flags) if keep]
+    notes = []
+    if dropped:
+        pretty = ", ".join(sorted({d.replace("_", " ") for d in dropped}))
+        logger.info(
+            "[PROGRAM FIT] Dropped %s to fit %.0f sq ft buildable area (was %.0f sq ft required)",
+            pretty, budget, required_area(specs),
+        )
+        notes.append(
+            f"Plot is tight for the full program, so {pretty} was left out to keep "
+            f"every requested room at a usable size."
+        )
+    return survivors, notes
+
+
+def run_semantic_gate(intent: dict, room_specs: list, specs_by_floor: dict = None) -> Tuple[bool, list]:
     errors = []
     requested_bhk = intent.get("bhk")
     if requested_bhk:
         actual_bedrooms = sum(1 for r in room_specs if "bedroom" in canonical_type(r.get("type", "") if isinstance(r, dict) else str(r)))
         if actual_bedrooms != requested_bhk:
             errors.append(f"BHK mismatch: requested {requested_bhk}, generated {actual_bedrooms}")
-    
+
     floor_policy = intent.get("floor_policy", "flexible")
     if floor_policy == "ground_only" and intent.get("floors", 1) > 1:
         errors.append("Additional floor was generated without user permission")
 
     SINGLETONS = {"foyer", "living_room", "dining_room", "kitchen", "staircase", "family_lounge"}
-    type_counts = {}
-    for r in room_specs:
-        t = canonical_type(r.get("type", "") if isinstance(r, dict) else str(r))
-        if t in SINGLETONS:
-            type_counts[t] = type_counts.get(t, 0) + 1
-    
-    duplicates = [t for t, count in type_counts.items() if count > 1]
+    # "One of these per home" is really "one per floor": a duplex needs a
+    # staircase on each level, and counting them across floors rejected every
+    # multi-storey layout as having unrequested duplicates.
+    floor_groups = specs_by_floor if specs_by_floor else {0: room_specs}
+    duplicates = set()
+    for specs in floor_groups.values():
+        type_counts = {}
+        for r in specs or []:
+            t = canonical_type(r.get("type", "") if isinstance(r, dict) else str(r))
+            if t in SINGLETONS:
+                type_counts[t] = type_counts.get(t, 0) + 1
+        duplicates.update(t for t, count in type_counts.items() if count > 1)
+
     if duplicates:
-        errors.append(f"Unrequested duplicate rooms: {duplicates}")
+        errors.append(f"Unrequested duplicate rooms: {sorted(duplicates)}")
 
     is_valid = len(errors) == 0
     if is_valid:
@@ -5191,7 +5334,62 @@ def _noop_emit(*_args, **_kwargs):
     pass
 
 
+# Per-request packing tightness for fit_program_to_plot. A ContextVar keeps
+# concurrent in-process generations isolated from each other.
+_FIT_SLACK: contextvars.ContextVar = contextvars.ContextVar("program_fit_slack", default=None)
+
+
 def _stream_generate_work(req: "GenerateRequest", emit_fn: Callable) -> None:
+    """Generate a plan, simplifying the program rather than failing outright.
+
+    A program the solver cannot place — five bedrooms that no corridor can
+    reach, a roster that fills the slab with no width left to walk — used to
+    surface as a hard error and no house at all. Each retry packs the plot
+    less tightly, so more optional rooms are shed and the graph the solver has
+    to satisfy gets simpler. The user gets a smaller real house instead of
+    nothing.
+    """
+    rounds = [0.88, 0.68]
+    # A retry re-runs the whole pipeline, so cap the total wall clock: a user
+    # waiting on a failing prompt should get the error, not four more minutes
+    # of silence.
+    retry_deadline = time.monotonic() + float(os.getenv("RELAXATION_BUDGET_SECONDS", "240"))
+    for index, slack in enumerate(rounds):
+        final_round = index + 1 >= len(rounds) or time.monotonic() > retry_deadline
+        state = {"error": None}
+
+        def guarded_emit(msg: dict, _final=final_round, _state=state):
+            # The pipeline reports failure by emitting an error event rather
+            # than raising, so intercept it: on a non-final round it is a
+            # retry signal, not something the client should ever see.
+            if not _final and msg.get("error"):
+                _state["error"] = msg.get("error")
+                return
+            emit_fn(msg)
+
+        token = _FIT_SLACK.set(slack)
+        try:
+            result = _stream_generate_work_impl(req, guarded_emit)
+        except Exception as exc:  # noqa: BLE001 - retried or re-raised below
+            if final_round:
+                raise
+            state["error"] = str(exc)
+            result = None
+        finally:
+            _FIT_SLACK.reset(token)
+
+        if final_round or state["error"] is None:
+            return result
+
+        logger.warning(
+            "[RELAXATION] Generation failed at slack %.2f (%s); retrying with a simpler program.",
+            slack, str(state["error"])[:160],
+        )
+        emit_fn({"stage": 3, "label": "Generating Room Layout...",
+                 "substage": "Simplifying the room program to fit the plot..."})
+
+
+def _stream_generate_work_impl(req: "GenerateRequest", emit_fn: Callable) -> None:
     """Run full generate-plan logic, pushing SSE dicts to emit_fn."""
     generation_started = time.monotonic()
     generation_budget_seconds = max(10.0, float(os.getenv("GENERATION_BUDGET_SECONDS", "600")))
@@ -5309,7 +5507,11 @@ def _stream_generate_work(req: "GenerateRequest", emit_fn: Callable) -> None:
 
         slm_result = None
         if getattr(req, "analysis_id", None):
-            cached_data = redis_client.get(f"analysis:{req.analysis_id}")
+            try:
+                cached_data = redis_client.get(f"analysis:{req.analysis_id}")
+            except Exception as exc:  # noqa: BLE001 - cache miss, not a failure
+                logger.warning("[API] Analysis cache unavailable (%s); re-extracting prompt.", exc)
+                cached_data = None
             if cached_data:
                 slm_result = json.loads(cached_data)
                 logger.info(f"[API] Restored analysis_id {req.analysis_id} from Redis.")
@@ -5840,12 +6042,6 @@ def _stream_generate_work(req: "GenerateRequest", emit_fn: Callable) -> None:
         elif re.search(r"\bground\s*\+\s*first\s*\+\s*second\b", prompt_lower):
             floors = max(floors, 3)
 
-        # Wire topology on the final list of rooms to guarantee graph/door semantics!
-        from cloud_extractor import auto_wire_topology
-        bathroom_reqs = (slm_result or {}).get("bathroom_requirements")
-        layout_params["rooms"] = auto_wire_topology(layout_params["rooms"], ai_categories=slm_result or {}, bathroom_requirements=bathroom_reqs)
-        layout_params["rooms"] = apply_prompt_proximities(layout_params["rooms"], req.prompt)
-
         plot_w = layout_params.get("plot_width") or req.width or 40.0
         plot_l = layout_params.get("plot_length") or req.length or 40.0
         buildable_plot_area = plot_w * plot_l * 0.85
@@ -5857,6 +6053,36 @@ def _stream_generate_work(req: "GenerateRequest", emit_fn: Callable) -> None:
             floors = max(floors, min(3, needed_floors))
             logger.info(f"[VERTICAL ESCALATION] Total required room area ({total_required_area:.0f} sq ft) exceeds buildable plot area ({buildable_plot_area:.0f} sq ft). Auto-escalating to {floors}-story layout.")
             layout_params["floors"] = floors
+
+        # Settle the room roster before wiring. Circulation has to exist so the
+        # corridor takes part in the access graph, and rooms the plot cannot
+        # hold have to be gone before any relation references them — editing
+        # the roster afterwards leaves dangling edges that fail hard-relation
+        # encoding. When Gemini supplied a floor schedule that schedule is the
+        # source of truth downstream, so settle it per level; each level gets
+        # the whole footprint to itself.
+        program_fit_notes: List[str] = []
+        if explicit_program:
+            for level in list(explicit_program):
+                level_specs = ensure_circulation(explicit_program[level])
+                level_specs, level_notes = fit_program_to_plot(level_specs, plot_w, plot_l, 1)
+                explicit_program[level] = level_specs
+                program_fit_notes.extend(level_notes)
+            layout_params["rooms"] = [
+                spec for level in sorted(explicit_program) for spec in explicit_program[level]
+            ]
+        else:
+            layout_params["rooms"] = ensure_circulation(layout_params["rooms"])
+            layout_params["rooms"], program_fit_notes = fit_program_to_plot(
+                layout_params["rooms"], plot_w, plot_l, floors,
+            )
+
+        # Wire topology on the final list of rooms to guarantee graph/door semantics!
+        from cloud_extractor import auto_wire_topology
+        bathroom_reqs = (slm_result or {}).get("bathroom_requirements")
+        layout_params["rooms"] = auto_wire_topology(layout_params["rooms"], ai_categories=slm_result or {}, bathroom_requirements=bathroom_reqs)
+        layout_params["rooms"] = apply_prompt_proximities(layout_params["rooms"], req.prompt)
+
 
         if explicit_program:
             validated_program: Dict[int, List[Dict]] = {}
@@ -6056,6 +6282,10 @@ def _stream_generate_work(req: "GenerateRequest", emit_fn: Callable) -> None:
         bp0 = None
         logger.info("[ZERO-STATIC] Bypassing Gemini Stage 2 coordinates (slow/redundant). Routing directly to high-speed CP Solver.")
 
+        for note in program_fit_notes:
+            if note not in warnings:
+                warnings.append(note)
+
         # ─── SEMANTIC GATE VERIFICATION ───
         intent_info = {
             "bhk": layout_params.get("bhk", bhk_val),
@@ -6063,7 +6293,10 @@ def _stream_generate_work(req: "GenerateRequest", emit_fn: Callable) -> None:
             "floors": floors
         }
         all_planned_rooms = [r for specs in floor_specs_by_level.values() for r in specs] if floor_specs_by_level else floor_0_rooms
-        gate_ok, gate_errors = run_semantic_gate(intent_info, all_planned_rooms)
+        gate_ok, gate_errors = run_semantic_gate(
+            intent_info, all_planned_rooms,
+            specs_by_floor=floor_specs_by_level if floor_specs_by_level else {0: floor_0_rooms},
+        )
         if not gate_ok:
             raise RuntimeError("Semantic gate failed: " + "; ".join(gate_errors))
 
@@ -6979,6 +7212,125 @@ redis_client = redis.Redis.from_url(REDIS_URL)
 import redis.asyncio as aioredis
 async_redis_client = aioredis.from_url(REDIS_URL)
 
+
+# ---------------------------------------------------------------------------
+# Job streaming: Celery when the queue is live, in-process otherwise.
+#
+# Both stream endpoints used to hard-depend on Redis pub/sub plus a running
+# Celery worker. With either missing the endpoint raised before a single byte
+# was streamed, so the UI reported a failed generation for a pipeline that was
+# perfectly healthy. Generation now degrades to running inside the API process
+# rather than failing outright.
+# ---------------------------------------------------------------------------
+
+QUEUE_FIRST_EVENT_TIMEOUT = float(os.getenv("QUEUE_FIRST_EVENT_TIMEOUT", "12"))
+QUEUE_STALL_TIMEOUT = float(os.getenv("QUEUE_STALL_TIMEOUT", "300"))
+
+
+def queue_available() -> bool:
+    """True when Redis answers and at least one Celery worker is consuming."""
+    try:
+        redis_client.ping()
+    except Exception as exc:  # noqa: BLE001 - any failure means "no queue"
+        logger.warning("[QUEUE] Redis unavailable (%s); running generation in-process.", exc)
+        return False
+    try:
+        from celery_worker import app as celery_app
+        if not celery_app.control.ping(timeout=1.0):
+            logger.warning("[QUEUE] No Celery worker responded; running generation in-process.")
+            return False
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("[QUEUE] Celery unreachable (%s); running generation in-process.", exc)
+        return False
+    return True
+
+
+async def _inline_job_stream(work_fn, req, job_id: str):
+    """Run the blocking pipeline in a worker thread, streaming its emissions."""
+    loop = asyncio.get_running_loop()
+    queue: asyncio.Queue = asyncio.Queue()
+    _DONE = object()
+
+    reported = _threading.Event()
+
+    def emit_fn(msg_dict: dict):
+        if msg_dict.get("done") or msg_dict.get("error"):
+            reported.set()
+        loop.call_soon_threadsafe(queue.put_nowait, {"job_id": job_id, **msg_dict})
+
+    def run():
+        try:
+            result = work_fn(req, emit_fn)
+            if result is None:
+                raise RuntimeError("Generation pipeline returned no validated layout")
+            if not result.get("success", True):
+                raise RuntimeError(result.get("error", "Architecture generation failed"))
+        except Exception as exc:  # noqa: BLE001 - surfaced to the client below
+            logger.error("[INLINE JOB] %s failed: %s", job_id, exc)
+            # The pipeline may already have emitted its own terminal event;
+            # a second one would only race the first in the reader.
+            if not reported.is_set():
+                loop.call_soon_threadsafe(queue.put_nowait, {
+                    "job_id": job_id, "error": str(exc), "success": False,
+                    "validation_passed": False, "status": "generation_failed",
+                    "error_code": "INVALID_LAYOUT", "message": str(exc),
+                })
+        finally:
+            loop.call_soon_threadsafe(queue.put_nowait, _DONE)
+
+    _threading.Thread(target=run, name=f"inline-job-{job_id[:8]}", daemon=True).start()
+
+    while True:
+        item = await queue.get()
+        if item is _DONE:
+            break
+        yield _sse(item)
+        if item.get("done") or item.get("error"):
+            break
+
+
+async def _queued_job_stream(task, work_fn, req, job_id: str):
+    """Stream worker events, falling back in-process if the worker never answers."""
+    pubsub = async_redis_client.pubsub()
+    await pubsub.subscribe(job_id)
+    try:
+        task.delay(req.dict(), job_id)
+        first = True
+        deadline = time.monotonic() + QUEUE_FIRST_EVENT_TIMEOUT
+        while True:
+            message = await pubsub.get_message(ignore_subscribe_messages=True, timeout=1.0)
+            if message is None:
+                if time.monotonic() < deadline:
+                    continue
+                if first:
+                    # The worker never picked the job up. Do the work here so a
+                    # dead queue does not read as a failed generation.
+                    logger.warning("[QUEUE] Worker silent for job %s; running in-process.", job_id)
+                    async for chunk in _inline_job_stream(work_fn, req, job_id):
+                        yield chunk
+                    return
+                logger.error("[QUEUE] Worker stalled mid-job %s; aborting.", job_id)
+                yield _sse({
+                    "job_id": job_id, "error": "Generation worker stopped responding",
+                    "success": False, "status": "generation_failed",
+                    "error_code": "WORKER_TIMEOUT",
+                    "message": "Generation worker stopped responding",
+                })
+                return
+            first = False
+            deadline = time.monotonic() + QUEUE_STALL_TIMEOUT
+            msg_dict = json.loads(message["data"].decode("utf-8"))
+            yield _sse(msg_dict)
+            if msg_dict.get("done") or msg_dict.get("error"):
+                return
+    finally:
+        try:
+            await pubsub.unsubscribe()
+            await pubsub.close()
+        except Exception:  # noqa: BLE001 - teardown must not mask a result
+            pass
+
+
 QUESTION_LIBRARY = {
     "road_side": {
         "question": "Which side of the plot faces the main road?",
@@ -7013,8 +7365,13 @@ async def analyze_prompt(req: GenerateRequest):
                     "options": QUESTION_LIBRARY[key]["options"]
                 })
                 
-        # Save session to Redis (expire in 1 hour)
-        redis_client.set(f"analysis:{analysis_id}", json.dumps(slm_result), ex=3600)
+        # Cache the session for the follow-up generate call. Redis is an
+        # optimisation here, not a requirement — the prompt is re-extracted
+        # during generation anyway, so a missing cache must not fail the call.
+        try:
+            redis_client.set(f"analysis:{analysis_id}", json.dumps(slm_result), ex=3600)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("[API] Analysis cache unavailable (%s); continuing without it.", exc)
         
         return {
             "analysis_id": analysis_id,
@@ -7030,26 +7387,15 @@ async def analyze_prompt(req: GenerateRequest):
 async def generate_plan_stream(req: GenerateRequest):
     job_id = str(uuid.uuid4())
     req.job_id = job_id
-    logger.info(f"[API] Received architecture generation request. Queuing job {job_id}...")
+    logger.info(f"[API] Received architecture generation request. Job {job_id}...")
 
-    pubsub = async_redis_client.pubsub()
-    await pubsub.subscribe(job_id)
-
-    from celery_worker import generate_architecture_task
-    generate_architecture_task.delay(req.dict(), job_id)
-
-    async def _stream():
-        try:
-            async for message in pubsub.listen():
-                if message['type'] == 'message':
-                    data = message['data'].decode('utf-8')
-                    msg_dict = json.loads(data)
-                    yield _sse(msg_dict)
-                    if msg_dict.get('done') or msg_dict.get('error'):
-                        break
-        finally:
-            await pubsub.unsubscribe()
-            await pubsub.close()
+    if queue_available():
+        from celery_worker import generate_architecture_task
+        _stream = lambda: _queued_job_stream(  # noqa: E731
+            generate_architecture_task, _stream_generate_work, req, job_id,
+        )
+    else:
+        _stream = lambda: _inline_job_stream(_stream_generate_work, req, job_id)  # noqa: E731
 
     return StreamingResponse(
         _stream(),
@@ -7060,26 +7406,15 @@ async def generate_plan_stream(req: GenerateRequest):
 @app.post('/api/template/stream')
 async def generate_template_stream(req: TemplateRequest):
     job_id = str(uuid.uuid4())
-    logger.info(f"[API] Received template generation request ({req.template}). Queuing job {job_id}...")
+    logger.info(f"[API] Received template generation request ({req.template}). Job {job_id}...")
 
-    pubsub = async_redis_client.pubsub()
-    await pubsub.subscribe(job_id)
-
-    from celery_worker import generate_template_task
-    generate_template_task.delay(req.dict(), job_id)
-
-    async def _stream():
-        try:
-            async for message in pubsub.listen():
-                if message['type'] == 'message':
-                    data = message['data'].decode('utf-8')
-                    msg_dict = json.loads(data)
-                    yield _sse(msg_dict)
-                    if msg_dict.get('done') or msg_dict.get('error'):
-                        break
-        finally:
-            await pubsub.unsubscribe()
-            await pubsub.close()
+    if queue_available():
+        from celery_worker import generate_template_task
+        _stream = lambda: _queued_job_stream(  # noqa: E731
+            generate_template_task, _stream_template_work, req, job_id,
+        )
+    else:
+        _stream = lambda: _inline_job_stream(_stream_template_work, req, job_id)  # noqa: E731
 
     return StreamingResponse(
         _stream(),

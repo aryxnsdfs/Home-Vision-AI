@@ -18,3 +18,5 @@ venv/
 .venv/
 venv_linux/
 .env
+
+public/blueprints/

@@ -14,6 +14,7 @@ OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", os.getenv("GOOGLE_API_KEY", ""))
 
 from geometry_validator import GeometryValidator
+from llm_pool import generate_json, has_llm_credentials
 
 # ---------------------------------------------------------------------------
 # 1. Pydantic Schemas
@@ -91,15 +92,6 @@ def modify_validated_blueprint(
     plot_width: float,
     plot_length: float,
 ) -> Dict[str, Any]:
-    try:
-        from google import genai
-    except ImportError:
-        logger.error("google-genai not installed.")
-        return {}
-
-    # This uses the new SDK, clearing your deprecation warning for this call
-    client = genai.Client(api_key=GEMINI_API_KEY, http_options=genai.types.HttpOptions(timeout=20000))
-    
     user_content = (
         f"Request: {prompt}\n"
         f"CURRENT BLUEPRINT:\n{json.dumps(current_blueprint, indent=2)}\n"
@@ -107,18 +99,13 @@ def modify_validated_blueprint(
         f"Update the room roster and connections. Provide approximate coordinates for any new rooms."
     )
 
-    response = client.models.generate_content(
-        model='gemini-2.5-flash',
+    result = generate_json(
         contents=user_content,
-        config=genai.types.GenerateContentConfig(
-            system_instruction=MODIFICATION_SYSTEM_PROMPT,
-            response_mime_type="application/json",
-            response_schema=BlueprintOnlyResponse,
-            temperature=0.1,
-        ),
+        system_instruction=MODIFICATION_SYSTEM_PROMPT,
+        response_schema=BlueprintOnlyResponse,
+        temperature=0.1,
+        stage="blueprint-modification",
     )
-
-    result = json.loads(response.text)
     logger.info("[GEMINI] Extracted topological blueprint in a single fast pass.")
     return result
 
@@ -222,7 +209,7 @@ def generate_furniture_manifest(room_specs: List[Dict[str, Any]], user_prompt: s
     semantic asset name and measured footprint, so a new user-created room
     does not require a code change or a catalog entry.
     """
-    if not room_specs or not GEMINI_API_KEY:
+    if not room_specs or not has_llm_credentials():
         return {}
     normalized = []
     for room in room_specs:
@@ -235,8 +222,6 @@ def generate_furniture_manifest(room_specs: List[Dict[str, Any]], user_prompt: s
     if cache_key in _FURNITURE_CACHE:
         return _FURNITURE_CACHE[cache_key]
     try:
-        from google import genai
-        client = genai.Client(api_key=GEMINI_API_KEY, http_options=genai.types.HttpOptions(timeout=20000))
         system_prompt = """You are a professional interior-space planner for a low-poly 3D home generator.
 For EVERY supplied room, create a complete context-aware furniture and object manifest.
 Room types are open-ended; infer the correct contents from the room name and user request.
@@ -246,17 +231,13 @@ one or two essential assets per room. For example, a gym should use recognizable
 as a treadmill and exercise bike, not generic boxes. Do not invent rooms and do not omit any
 supplied room. Return only JSON matching the schema."""
         contents = json.dumps({"user_request": user_prompt, "rooms": normalized})
-        response = client.models.generate_content(
-            model="gemini-2.5-flash",
+        parsed = generate_json(
             contents=contents,
-            config=genai.types.GenerateContentConfig(
-                system_instruction=system_prompt,
-                response_mime_type="application/json",
-                response_schema=GeneratedFurnitureResponse,
-                temperature=0.2,
-            ),
+            system_instruction=system_prompt,
+            response_schema=GeneratedFurnitureResponse,
+            temperature=0.2,
+            stage="furniture-manifest",
         )
-        parsed = json.loads(response.text)
         result: Dict[str, List[Dict[str, Any]]] = {}
         for room in parsed.get("rooms", []):
             room_type = str(room.get("room_type", "")).strip().lower().replace(" ", "_")
@@ -313,27 +294,16 @@ Output a strict JSON 'Program' listing the exact rooms to build, their minimum v
 
 def generate_cultural_program(prompt: str, emit_fn: Callable = None) -> dict:
     """Stage 1: Dynamic Cultural & Architectural Planner."""
-    try:
-        from google import genai
-    except ImportError:
-        return {}
-
-    client = genai.Client(api_key=GEMINI_API_KEY, http_options=genai.types.HttpOptions(timeout=20000))
     if emit_fn:
         emit_fn({"stage": 1, "label": "AI Planning Requirements...", "substage": "Inferring cultural context and room program..."})
-    
-    response = client.models.generate_content(
-        model='gemini-2.5-flash',
+
+    program = generate_json(
         contents=f"User request: {prompt}",
-        config=genai.types.GenerateContentConfig(
-            system_instruction=CULTURAL_PLANNER_PROMPT,
-            response_mime_type="application/json",
-            response_schema=ProgramResponse,
-            temperature=0.3,
-        ),
+        system_instruction=CULTURAL_PLANNER_PROMPT,
+        response_schema=ProgramResponse,
+        temperature=0.3,
+        stage="cultural-program",
     )
-    import json
-    program = json.loads(response.text)
     
     # Post-process to strictly enforce deduplication (LLMs often hallucinate extras)
     prompt_lower = prompt.lower()
@@ -421,14 +391,6 @@ def generate_master_blueprint(
     emit_fn: Optional[Callable] = None,
 ) -> Dict[str, Any]:
     """Call Gemini to generate a complete master blueprint with exact coordinates."""
-    try:
-        from google import genai
-    except ImportError:
-        logger.error("google-genai not installed. Cannot generate master blueprint.")
-        return {}
-
-    client = genai.Client(api_key=GEMINI_API_KEY, http_options=genai.types.HttpOptions(timeout=20000))
-
     if corrections:
         # Self-correction pass
         error_text = "\n".join(f"  {i+1}. {e}" for i, e in enumerate(corrections))
@@ -464,20 +426,15 @@ def generate_master_blueprint(
                       "substage": "Gemini is calculating room coordinates..."})
 
     t0 = time.time()
-    response = client.models.generate_content(
-        model='gemini-2.5-flash',
+    result = generate_json(
         contents=user_content,
-        config=genai.types.GenerateContentConfig(
-            system_instruction=sys_prompt,
-            response_mime_type="application/json",
-            response_schema=BlueprintOnlyResponse,
-            temperature=0.2,
-        ),
+        system_instruction=sys_prompt,
+        response_schema=BlueprintOnlyResponse,
+        temperature=0.2,
+        stage="master-blueprint",
     )
     elapsed = time.time() - t0
     logger.info(f"[GEMINI] Blueprint generated in {elapsed:.2f}s")
-
-    result = json.loads(response.text)
     logger.info(f"[GEMINI] Received {len(result.get('master_blueprint', []))} rooms in blueprint")
     return result
 
@@ -574,9 +531,6 @@ class QueryRouter:
         """Gemini 1.5 Flash Heavy Reasoning Lane with Pydantic JSON Schema enforcement"""
         logger.info("[ROUTER] Routing to Gemini Heavy Lane (1M+ context & Native Schema)")
         try:
-            from google import genai
-            client = genai.Client(api_key=GEMINI_API_KEY, http_options=genai.types.HttpOptions(timeout=20000))
-            
             sys_prompt = """You are an Architectural Program Compiler.
 
 Your job is to convert a user's natural-language building request into a strict machine-readable architectural planning contract.
@@ -655,20 +609,19 @@ Return strict JSON matching the schema only."""
             else:
                 user_content = user_prompt
                 
-            response = client.models.generate_content(
-                model='gemini-2.5-flash',
+            return generate_json(
                 contents=user_content,
-                config=genai.types.GenerateContentConfig(
-                    system_instruction=sys_prompt,
-                    response_mime_type="application/json",
-                    response_schema=HouseDesignRequest,
-                    temperature=0.1
-                )
+                system_instruction=sys_prompt,
+                response_schema=HouseDesignRequest,
+                temperature=0.1,
+                stage="program-compiler",
             )
-            return json.loads(response.text)
         except Exception as e:
+            # An empty program here used to be rendered as a generic fallback
+            # house. The request must fail loudly instead so the caller can
+            # report a real error rather than silently shipping a wrong plan.
             logger.error(f"Gemini Extraction Failed: {e}")
-            return {"intent": "CREATE", "target_rooms": [], "bhk": 0, "style": "", "materials": []}
+            raise RuntimeError(f"Architectural program extraction failed: {e}") from e
 
     @staticmethod
     def _fast_lane_groq(user_prompt: str, vocabulary: dict) -> Dict[str, Any]:
