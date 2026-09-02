@@ -771,6 +771,35 @@ def enforce_floor_intent(prompt: str, slm_result: dict, requested_floors: int = 
 CIRCULATION_TYPES = {"corridor", "circulation", "hallway", "foyer", "lobby", "passage", "entrance_lobby"}
 
 
+def wire_program_by_floor(explicit_program: dict, ai_categories: dict, bathroom_requirements: Any) -> dict:
+    """Wire each floor's access graph against that floor's own circulation.
+
+    auto_wire_topology picks a single hub for whatever list it is handed.
+    Given every floor at once it hung the upper floor's bedrooms off the
+    ground-floor corridor; solving a floor in isolation then dropped those
+    edges and the upper floor came back with no doors on any room at all.
+    """
+    from cloud_extractor import auto_wire_topology
+
+    wired_program = {}
+    for level in sorted(explicit_program):
+        specs = [dict(spec) for spec in explicit_program[level] if isinstance(spec, dict)]
+        if level:
+            # Namespace upper-floor ids so a per-floor hub cannot collide with
+            # the identically named ground-floor room.
+            counts: Dict[str, int] = {}
+            for spec in specs:
+                if spec.get("id"):
+                    continue
+                room_type = canonical_type(spec.get("type")) or "room"
+                counts[room_type] = counts.get(room_type, 0) + 1
+                spec["id"] = f"f{level}-{room_type}-{counts[room_type]}"
+        wired_program[level] = auto_wire_topology(
+            specs, ai_categories=ai_categories, bathroom_requirements=bathroom_requirements,
+        )
+    return wired_program
+
+
 def ensure_circulation(room_specs: list) -> list:
     """Give a floor a dedicated circulation space when its program needs one.
 
@@ -6080,7 +6109,13 @@ def _stream_generate_work_impl(req: "GenerateRequest", emit_fn: Callable) -> Non
         # Wire topology on the final list of rooms to guarantee graph/door semantics!
         from cloud_extractor import auto_wire_topology
         bathroom_reqs = (slm_result or {}).get("bathroom_requirements")
-        layout_params["rooms"] = auto_wire_topology(layout_params["rooms"], ai_categories=slm_result or {}, bathroom_requirements=bathroom_reqs)
+        if explicit_program:
+            explicit_program = wire_program_by_floor(explicit_program, slm_result or {}, bathroom_reqs)
+            layout_params["rooms"] = [
+                spec for level in sorted(explicit_program) for spec in explicit_program[level]
+            ]
+        else:
+            layout_params["rooms"] = auto_wire_topology(layout_params["rooms"], ai_categories=slm_result or {}, bathroom_requirements=bathroom_reqs)
         layout_params["rooms"] = apply_prompt_proximities(layout_params["rooms"], req.prompt)
 
 

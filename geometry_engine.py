@@ -48,17 +48,30 @@ class CPSolver:
     def _generate_candidate_envelopes(self, plot_w_ft: float, plot_l_ft: float, target_area: float) -> list:
         import math
         envelopes = []
+        seen = set()
         aspects = [1.0, 1.2, 0.8, 1.5, 0.66]
-        for aspect in aspects:
-            w = math.sqrt(target_area * aspect)
-            l = target_area / max(1.0, w)
-            if w <= plot_w_ft and l <= plot_l_ft:
-                min_x = (plot_w_ft - w) / 2
-                max_x = min_x + w
-                min_z = (plot_l_ft - l) / 2
-                max_z = min_z + l
-                envelopes.append((min_x, min_z, max_x, max_z))
-        
+        plot_area = max(1.0, plot_w_ft * plot_l_ft)
+
+        # An envelope sized to the bare sum of room minimums leaves no width
+        # for walls or circulation, so a roomy plot could still come back
+        # infeasible. Try the snug envelopes first (they give tighter, better
+        # layouts when they fit), then progressively roomier ones before
+        # falling back to the whole plot.
+        for scale in (1.0, 1.3, 1.6):
+            area = min(target_area * scale, plot_area)
+            for aspect in aspects:
+                w = math.sqrt(area * aspect)
+                l = area / max(1.0, w)
+                if w <= plot_w_ft and l <= plot_l_ft:
+                    min_x = (plot_w_ft - w) / 2
+                    max_x = min_x + w
+                    min_z = (plot_l_ft - l) / 2
+                    max_z = min_z + l
+                    key = (round(min_x, 2), round(min_z, 2), round(max_x, 2), round(max_z, 2))
+                    if key not in seen:
+                        seen.add(key)
+                        envelopes.append((min_x, min_z, max_x, max_z))
+
         # Add full plot fallback
         envelopes.append((0.0, 0.0, plot_w_ft, plot_l_ft))
         return envelopes
