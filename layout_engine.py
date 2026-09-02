@@ -459,11 +459,41 @@ def align_duplex_floors(
     if stair0:
         rect = Rect(stair0.rect.x, stair0.rect.z, stair0.rect.width, stair0.rect.length)
         stair1 = next((n for n in floor1 if n.type == "staircase"), None)
+
+        def _would_overlap(candidate: Rect) -> List[str]:
+            hits = []
+            for node in floor1:
+                if node is stair1 or node.type == "staircase":
+                    continue
+                other = node.rect
+                dx = min(candidate.x + candidate.width, other.x + other.width) - max(candidate.x, other.x)
+                dz = min(candidate.z + candidate.length, other.z + other.length) - max(candidate.z, other.z)
+                if dx > 0.05 and dz > 0.05:
+                    hits.append(node.id)
+            return hits
+
         if stair1:
-            stair1.rect = rect
-        else:
+            # The solver is normally handed this rectangle as a fixed cell, so
+            # the overwrite is a no-op. When it is not honoured — the stair was
+            # deduped, or the spec never carried the pin — forcing the lower
+            # rect on top of a solved floor drops the stair straight through
+            # the corridor and the whole floor fails validation. CP-SAT's own
+            # placement is non-overlapping, so keep it and accept a stair that
+            # is not perfectly stacked rather than losing the house.
+            collisions = _would_overlap(rect)
+            if collisions:
+                logger.warning(
+                    "[DUPLEX ALIGN] Keeping solved upper staircase at (%.2f, %.2f); "
+                    "stacking it over the lower flight would overlap %s.",
+                    stair1.rect.x, stair1.rect.z, ", ".join(collisions),
+                )
+            else:
+                stair1.rect = rect
+        elif not _would_overlap(rect):
             floor1.append(RoomNode(id="staircase-f1", type="staircase", name="Staircase",
                                    rect=rect, wallThicknessIn=6.0, floorColor="#e5e7eb"))
+        else:
+            logger.warning("[DUPLEX ALIGN] No room above the lower staircase; upper flight not added.")
 
     # The upper-floor solver receives this staircase as a fixed rectangle, so
     # its other rooms are already arranged around it.  Do not stretch a
@@ -1728,9 +1758,28 @@ class LayoutEngine:
                 str(spec.get("id")): tuple(spec["fixed_rect"])
                 for spec in rooms_spec if isinstance(spec, dict) and spec.get("id") and spec.get("fixed_rect")
             }
+            # This fallback lays rooms out without reserving the fixed cells,
+            # so restoring an anchor blindly drops it on top of whatever the
+            # corridor layout put there — the upper floor then fails overlap
+            # validation and the whole request dies. Restore an anchor only
+            # where the space is actually free.
             for node in fallback:
-                if node.id in fixed_by_id:
-                    node.rect = Rect(*fixed_by_id[node.id])
+                if node.id not in fixed_by_id:
+                    continue
+                target = Rect(*fixed_by_id[node.id])
+                clashes = [
+                    other.id for other in fallback
+                    if other is not node
+                    and min(target.x + target.width, other.rect.x + other.rect.width) - max(target.x, other.rect.x) > 0.05
+                    and min(target.z + target.length, other.rect.z + other.rect.length) - max(target.z, other.rect.z) > 0.05
+                ]
+                if clashes:
+                    logger.warning(
+                        "[FALLBACK ANCHOR] Keeping %s at its laid-out position; the fixed rect overlaps %s.",
+                        node.id, ", ".join(clashes),
+                    )
+                    continue
+                node.rect = target
             return fallback
         return safe_corridor_layout(rooms_spec, self.plot_width, self.plot_length, self.theme)
         relationship_owned_spaces = {

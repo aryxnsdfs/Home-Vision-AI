@@ -771,6 +771,35 @@ def enforce_floor_intent(prompt: str, slm_result: dict, requested_floors: int = 
 CIRCULATION_TYPES = {"corridor", "circulation", "hallway", "foyer", "lobby", "passage", "entrance_lobby"}
 
 
+def rewire_floor_access(
+    specs: list, prompt: str, ai_categories: dict, bathroom_requirements: Any, level: int,
+) -> list:
+    """Rebuild one floor's access graph from its final room membership.
+
+    Wiring happens early, but the room roster keeps changing afterwards:
+    vertical escalation and the floor balancer move rooms between levels, the
+    padder adds one, and prune_optional_suggestions removes some. Every one of
+    those leaves connections pointing at a room that is no longer on the floor.
+    On an upper floor that meant every door referenced the ground-floor hub, so
+    the level came back with no doors at all and the whole request failed.
+
+    Re-wiring here — after bind_room_roles has settled identity — guarantees the
+    graph matches the rooms the solver will actually place.
+    """
+    from cloud_extractor import auto_wire_topology
+
+    if not specs:
+        return specs
+    wired = auto_wire_topology(
+        [dict(spec) for spec in specs if isinstance(spec, dict)],
+        ai_categories=ai_categories,
+        bathroom_requirements=bathroom_requirements,
+    )
+    for spec in wired:
+        spec.setdefault("floor_index", level)
+    return apply_prompt_proximities(wired, prompt)
+
+
 def wire_program_by_floor(explicit_program: dict, ai_categories: dict, bathroom_requirements: Any) -> dict:
     """Wire each floor's access graph against that floor's own circulation.
 
@@ -828,6 +857,7 @@ def ensure_circulation(room_specs: list) -> list:
 
 def fit_program_to_plot(
     room_specs: list, plot_width: float, plot_length: float, floors: int = 1,
+    coverage_override: Optional[float] = None,
 ) -> Tuple[list, list]:
     """Drop optional rooms until the program's minimum area fits the plot.
 
@@ -849,7 +879,12 @@ def fit_program_to_plot(
     # width for corridors — the solver then either reports infeasible or
     # routes circulation through a bedroom, which validation rejects. Reserve
     # the remaining slack for circulation instead.
-    coverage = float(os.getenv("PROGRAM_FIT_COVERAGE", "0.75"))
+    # An upper floor is measured against the ground-floor slab, which is
+    # already the buildable footprint, so it passes coverage_override=1.0
+    # instead of having the site coverage deducted a second time.
+    coverage = coverage_override if coverage_override is not None else float(
+        os.getenv("PROGRAM_FIT_COVERAGE", "0.75")
+    )
     slack = _FIT_SLACK.get()
     if slack is None:
         slack = float(os.getenv("PROGRAM_FIT_SLACK", "0.88"))
@@ -6287,6 +6322,11 @@ def _stream_generate_work_impl(req: "GenerateRequest", emit_fn: Callable) -> Non
                 logger.info("[PIPELINE] Injected corridor-core to distribute private space circulation.")
 
         from intent_compiler import annotate_room_provenance, bind_room_roles, prune_optional_suggestions
+        # Room membership per floor is only final here, after escalation, the
+        # balancer and the padder have finished shuffling rooms. Give each
+        # floor its own circulation before identity is assigned, then rebuild
+        # its access graph once the roster can no longer change.
+        floor_0_rooms = ensure_circulation(floor_0_rooms)
         floor_0_rooms = prune_optional_suggestions(
             annotate_room_provenance(floor_0_rooms, req.prompt, slm_result or {}, bhk_val),
             req.prompt,
@@ -6295,9 +6335,13 @@ def _stream_generate_work_impl(req: "GenerateRequest", emit_fn: Callable) -> Non
             req.prompt, slm_result or {}, floor_0_rooms,
             bhk=bhk_val, floor_index=0, program_id="ground-floor-program",
         )
+        floor_0_rooms = rewire_floor_access(
+            floor_0_rooms, req.prompt, slm_result or {}, bathroom_reqs, 0,
+        )
         if floor_specs_by_level:
             floor_specs_by_level[0] = floor_0_rooms
         if first_spec:
+            first_spec = ensure_circulation(first_spec)
             first_spec = prune_optional_suggestions(
                 annotate_room_provenance(first_spec, req.prompt, slm_result or {}, bhk_val),
                 req.prompt,
@@ -6305,6 +6349,9 @@ def _stream_generate_work_impl(req: "GenerateRequest", emit_fn: Callable) -> Non
             first_spec = bind_room_roles(
                 req.prompt, slm_result or {}, first_spec,
                 bhk=bhk_val, floor_index=1, program_id="first-floor-program",
+            )
+            first_spec = rewire_floor_access(
+                first_spec, req.prompt, slm_result or {}, bathroom_reqs, 1,
             )
             if floor_specs_by_level:
                 floor_specs_by_level[1] = first_spec
@@ -6630,39 +6677,84 @@ def _stream_generate_work_impl(req: "GenerateRequest", emit_fn: Callable) -> Non
                     )
                     trace(f"Floor 1 allowed slab bounds={tuple(round(value, 2) for value in slab_bounds)}")
 
+                    # An upper floor may only build on the slab the ground
+                    # floor actually covers, which is smaller than the plot the
+                    # program was sized against. Fitting it to the plot left
+                    # CP-SAT squeezing rooms into 3ft strips, or routing
+                    # circulation through a bedroom. Re-fit to the real slab,
+                    # then rebuild the access graph for the surviving rooms.
+                    slab_w = max(1.0, slab_bounds[2] - slab_bounds[0])
+                    slab_l = max(1.0, slab_bounds[3] - slab_bounds[1])
+                    floor_1_rooms, f1_fit_notes = fit_program_to_plot(
+                        floor_1_rooms, slab_w, slab_l, 1,
+                        coverage_override=float(os.getenv("UPPER_FLOOR_COVERAGE", "0.85")),
+                    )
+                    if f1_fit_notes:
+                        floor_1_rooms = rewire_floor_access(
+                            floor_1_rooms, req.prompt, slm_result or {}, bathroom_reqs, 1,
+                        )
+                        floor_1_rooms = sort_spec_by_generation_order(floor_1_rooms)
+                        for note in f1_fit_notes:
+                            if note not in warnings:
+                                warnings.append(note)
+
                     floor1_bp = None
                     if master_bp:
                         floor1_bp = [b for b in master_bp if b.get("floor_number", 0) == 1]
                     
-                    generated_nodes_1 = engine.generate(
-                        floor_1_rooms,
-                        blocked_zones=blocked_zones,
-                        restrict_slots=True,
-                        master_blueprint=floor1_bp if floor1_bp else None,
-                        plot_info={"allowed_bounds": slab_bounds},
-                    )
-                    apply_requested_room_names(generated_nodes_1, floor_1_rooms)
+                    def _solve_floor_1(specs):
+                        """Solve and finish the upper floor for one room roster."""
+                        nodes = engine.generate(
+                            specs,
+                            blocked_zones=blocked_zones,
+                            restrict_slots=True,
+                            master_blueprint=floor1_bp if floor1_bp else None,
+                            plot_info={"allowed_bounds": slab_bounds},
+                        )
+                        apply_requested_room_names(nodes, specs)
+                        align_duplex_floors(generated_nodes_0, nodes,
+                                            make_void=bool(indian_opts.get("double_height") or indian_opts.get("void")))
+                        enforce_requested_only(nodes, _req_types)
+                        program_errors = floor_program_fidelity_errors(nodes, specs, 1)
+                        program_errors.extend(upper_floor_containment_errors(generated_nodes_0, nodes, 1))
+                        ArchitecturalRules.optimize_wet_walls(nodes)
+                        AdjacencyResolver(nodes, open_rooms=layout_params.get("open_rooms", [])).resolve()
+                        bridge_staircase_grid_seam(nodes)
+                        WindowPlacer(nodes, engine.plot_width, engine.plot_length,
+                                     setback_x=engine.setback_x, setback_z=engine.setback_z).place_windows()
+                        for item in nodes:
+                            item.doors = [door for door in item.doors if not getattr(door, "is_main", False)]
+                        return nodes, program_errors
 
-                    align_duplex_floors(generated_nodes_0, generated_nodes_1,
-                                        make_void=bool(indian_opts.get("double_height") or indian_opts.get("void")))
-                    enforce_requested_only(generated_nodes_1, _req_types)
-                    hard_program_errors = floor_program_fidelity_errors(generated_nodes_1, floor_1_rooms, 1)
-                    hard_program_errors.extend(upper_floor_containment_errors(generated_nodes_0, generated_nodes_1, 1))
+                    generated_nodes_1, hard_program_errors = _solve_floor_1(floor_1_rooms)
+                    val_1 = GeometryValidator.validate_post_placement(generated_nodes_1)
+
+                    if (hard_program_errors or not val_1.is_valid) and any(
+                        spec.get("fixed_rect") for spec in floor_1_rooms
+                    ):
+                        # Pinning the upper staircase over the lower one can
+                        # over-constrain CP-SAT, which then falls back to a
+                        # heuristic layout that ignores the pin anyway. A
+                        # continuous flight is worth less than a floor that
+                        # exists, so re-solve once and let the solver place it.
+                        logger.info("[PIPELINE] Floor 1 invalid with the staircase pinned; re-solving unpinned.")
+                        unpinned = copy.deepcopy(floor_1_rooms)
+                        for spec in unpinned:
+                            if "staircase" in canonical_type(spec.get("type")):
+                                spec.pop("fixed_rect", None)
+                        retry_nodes, retry_errors = _solve_floor_1(unpinned)
+                        retry_val = GeometryValidator.validate_post_placement(retry_nodes)
+                        if not retry_errors and retry_val.is_valid:
+                            floor_1_rooms = unpinned
+                            generated_nodes_1, hard_program_errors, val_1 = retry_nodes, retry_errors, retry_val
+
                     if hard_program_errors:
                         raise RuntimeError(" ".join(hard_program_errors))
                     trace(
                         f"Floor 1 generated: requested={type_counts(floor_1_rooms)}; "
                         f"realized={type_counts(generated_nodes_1)}; bounds={node_bounds(generated_nodes_1)}"
                     )
-                    ArchitecturalRules.optimize_wet_walls(generated_nodes_1)
-                    AdjacencyResolver(generated_nodes_1, open_rooms=layout_params.get("open_rooms", [])).resolve()
-                    bridge_staircase_grid_seam(generated_nodes_1)
-                    WindowPlacer(generated_nodes_1, engine.plot_width, engine.plot_length,
-                                 setback_x=engine.setback_x, setback_z=engine.setback_z).place_windows()
-                    for node in generated_nodes_1:
-                        node.doors = [door for door in node.doors if not getattr(door, "is_main", False)]
 
-                    val_1 = GeometryValidator.validate_post_placement(generated_nodes_1)
                     if not val_1.is_valid:
                         logger.warning(f"[PIPELINE] Floor 1 validation failed on attempt {attempt + 1}: {val_1.errors}")
                         if attempt < max_attempts - 1:
