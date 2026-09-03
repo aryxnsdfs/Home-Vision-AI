@@ -775,7 +775,10 @@ Output ONLY valid JSON. No markdown code blocks."""
     @classmethod
     def route(cls, user_prompt: str, vocabulary: dict, current_floorplan: Optional[dict] = None) -> Dict[str, Any]:
         """Traffic cop routing logic."""
-        logger.info("[ROUTER] Routing directly to Gemini Heavy Lane (Groq disabled)")
+        # Says nothing about the Groq fallback in llm_pool, which sits a layer
+        # below this and does run - the message predates it and read as though
+        # the fallback were switched off.
+        logger.info("[ROUTER] Routing to the heavy extraction lane")
         return cls._heavy_lane_gemini(user_prompt, vocabulary, current_floorplan)
 
 # -------------------------------------------------------------

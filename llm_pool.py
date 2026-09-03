@@ -210,19 +210,80 @@ def _classify(exc: BaseException) -> str:
     return "fatal"
 
 
-def _cooldown(key: str) -> None:
+# A key that is rate limited comes back in a minute. A key whose daily quota is
+# spent, or whose prepaid credits are gone, does not - and re-discovering that
+# costs a 20 second timeout per key per restart, which is why the first request
+# after a deploy sat for minutes with nothing in the log while six dead keys
+# were tried ahead of a provider that answers in three seconds.
+_EXHAUSTED_PATTERNS = (
+    "credits are depleted",
+    "exceeded your current quota",
+    "generaterequestsperday",
+    "free_tier_requests",
+)
+_KEY_EXHAUSTED_SECONDS = float(os.getenv("LLM_KEY_EXHAUSTED_SECONDS", str(6 * 3600)))
+_DISABLED_FILE = os.path.join(_CACHE_DIR, "disabled_keys.json") if _CACHE_DIR else ""
+
+
+def _load_disabled() -> None:
+    if not _DISABLED_FILE or not os.path.exists(_DISABLED_FILE):
+        return
+    try:
+        with io.open(_DISABLED_FILE, encoding="utf-8") as handle:
+            stored = json.load(handle)
+        now = time.time()
+        with _lock:
+            for key, until in stored.items():
+                if float(until) > now:
+                    _disabled_keys[key] = float(until)
+    except Exception:  # noqa: BLE001 - a corrupt file just means no memory
+        pass
+
+
+def _save_disabled() -> None:
+    if not _DISABLED_FILE:
+        return
+    try:
+        os.makedirs(_CACHE_DIR, exist_ok=True)
+        with _lock:
+            snapshot = dict(_disabled_keys)
+        tmp = _DISABLED_FILE + ".tmp"
+        with io.open(tmp, "w", encoding="utf-8") as handle:
+            json.dump(snapshot, handle)
+        os.replace(tmp, _DISABLED_FILE)
+    except Exception:  # noqa: BLE001 - never fail a call over bookkeeping
+        pass
+
+
+def _cooldown(key: str, reason: str = "") -> None:
+    spent = any(pattern in (reason or "").lower() for pattern in _EXHAUSTED_PATTERNS)
+    seconds = _KEY_EXHAUSTED_SECONDS if spent else _KEY_COOLDOWN_SECONDS
     with _lock:
-        _disabled_keys[key] = time.time() + _KEY_COOLDOWN_SECONDS
-    logger.warning("[LLM POOL] Key %s parked for %.0fs", _mask(key), _KEY_COOLDOWN_SECONDS)
+        _disabled_keys[key] = time.time() + seconds
+    logger.warning("[LLM POOL] Key %s parked for %.0fs%s", _mask(key), seconds,
+                   " (quota spent, not a rate limit)" if spent else "")
+    _save_disabled()
 
 
-def _live_keys(keys: List[str]) -> List[str]:
+_load_disabled()
+
+
+def _live_keys(keys: List[str], fall_back_to_spent: bool = True) -> List[str]:
+    """Keys not currently parked.
+
+    When every key is parked the caller normally tries them anyway - a stale
+    429 must never be the reason a user gets no house at all. That is right
+    when this provider is the only one there is, and wrong when another
+    provider is configured: eight spent keys at a 20 second timeout each is
+    several minutes of silence in front of a fallback that answers in three
+    seconds. Pass fall_back_to_spent=False when there is somewhere else to go.
+    """
     now = time.time()
     with _lock:
         live = [k for k in keys if _disabled_keys.get(k, 0.0) <= now]
-    # Every key is cooling down: ignore the cooldown rather than give up, a
-    # stale 429 must never be the reason a user gets no house at all.
-    return live or keys
+    if live or not fall_back_to_spent:
+        return live
+    return keys
 
 
 def _rotated(keys: List[str]) -> List[str]:
@@ -444,7 +505,13 @@ def generate_json(
         logger.info("[LLM POOL] %s served from cache", stage)
         return copy.deepcopy(cached)
 
-    for key in _rotated(_live_keys(gemini_keys())):
+    # If Groq is configured there is somewhere better to go than a spent key.
+    has_fallback = bool(groq_keys() or openai_keys())
+    gemini_pool = _rotated(_live_keys(gemini_keys(), fall_back_to_spent=not has_fallback))
+    if not gemini_pool and gemini_keys():
+        logger.info("[LLM POOL] %s skipping %d spent Gemini key(s); going straight to the fallback.",
+                    stage, len(gemini_keys()))
+    for key in gemini_pool:
         for attempt in range(max(1, attempts_per_key)):
             try:
                 result = _call_gemini(
@@ -461,14 +528,14 @@ def generate_json(
                 logger.warning("[LLM POOL] %s Gemini key %s failed (%s): %s",
                                stage, _mask(key), kind, str(exc)[:200])
                 if kind == "key_fatal":
-                    _cooldown(key)
+                    _cooldown(key, str(exc))
                     break
                 if kind == "fatal":
                     break
                 if attempt + 1 < attempts_per_key:
                     time.sleep(min(4.0, 0.6 * (2 ** attempt)) + random.uniform(0, 0.3))
                 else:
-                    _cooldown(key)
+                    _cooldown(key, str(exc))
 
     groq_pool = _rotated(_live_keys(groq_keys()))
     if groq_pool:
@@ -491,7 +558,7 @@ def generate_json(
                                stage, model, _mask(key), kind, str(exc)[:160])
                 if kind == "key_fatal":
                     # An exhausted or invalid key is exhausted for every model.
-                    _cooldown(key)
+                    _cooldown(key, str(exc))
                     served = True
                     break
         if served:
@@ -511,7 +578,7 @@ def generate_json(
             errors.append(f"openai/{_mask(key)}: {exc}")
             logger.warning("[LLM POOL] %s OpenAI key %s failed: %s", stage, _mask(key), str(exc)[:200])
             if _classify(exc) == "key_fatal":
-                _cooldown(key)
+                _cooldown(key, str(exc))
 
     detail = " | ".join(errors[-4:]) or "no API keys configured"
     raise RuntimeError(f"All LLM providers failed for {stage}: {detail}")
