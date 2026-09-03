@@ -269,21 +269,25 @@ _load_disabled()
 
 
 def _live_keys(keys: List[str], fall_back_to_spent: bool = True) -> List[str]:
-    """Keys not currently parked.
+    """Every key, with the ones not parked first.
 
-    When every key is parked the caller normally tries them anyway - a stale
-    429 must never be the reason a user gets no house at all. That is right
-    when this provider is the only one there is, and wrong when another
-    provider is configured: eight spent keys at a 20 second timeout each is
-    several minutes of silence in front of a fallback that answers in three
-    seconds. Pass fall_back_to_spent=False when there is somewhere else to go.
+    Parked keys are deprioritised, never dropped. Measured: a key whose quota
+    is spent refuses in about half a second, so trying all eight costs roughly
+    four seconds - cheap enough that Gemini should always get first refusal,
+    and important because a key parked after a daily quota reset is healthy
+    again and must not be passed over in favour of a fallback.
+
+    The minutes of silence this was blamed for came from somewhere else: two
+    attempts against the *same* key on a retryable 503, each waiting out a 20
+    second timeout.
     """
     now = time.time()
     with _lock:
         live = [k for k in keys if _disabled_keys.get(k, 0.0) <= now]
-    if live or not fall_back_to_spent:
+        parked = [k for k in keys if _disabled_keys.get(k, 0.0) > now]
+    if not fall_back_to_spent:
         return live
-    return keys
+    return live + parked
 
 
 def _rotated(keys: List[str]) -> List[str]:
@@ -505,12 +509,9 @@ def generate_json(
         logger.info("[LLM POOL] %s served from cache", stage)
         return copy.deepcopy(cached)
 
-    # If Groq is configured there is somewhere better to go than a spent key.
-    has_fallback = bool(groq_keys() or openai_keys())
-    gemini_pool = _rotated(_live_keys(gemini_keys(), fall_back_to_spent=not has_fallback))
-    if not gemini_pool and gemini_keys():
-        logger.info("[LLM POOL] %s skipping %d spent Gemini key(s); going straight to the fallback.",
-                    stage, len(gemini_keys()))
+    # Gemini always gets first refusal, parked keys included but tried last: a
+    # park is a hint about ordering, not a verdict, and a daily quota resets.
+    gemini_pool = _live_keys(gemini_keys())
     for key in gemini_pool:
         for attempt in range(max(1, attempts_per_key)):
             try:
@@ -532,10 +533,16 @@ def generate_json(
                     break
                 if kind == "fatal":
                     break
-                if attempt + 1 < attempts_per_key:
+                # Retrying the same key twice through a 20 second timeout is
+                # what turned a busy model into minutes of silence. With other
+                # keys still untried, move on and come back to this one only if
+                # they all fail too.
+                more_keys_untried = key != gemini_pool[-1]
+                if attempt + 1 < attempts_per_key and not more_keys_untried:
                     time.sleep(min(4.0, 0.6 * (2 ** attempt)) + random.uniform(0, 0.3))
                 else:
                     _cooldown(key, str(exc))
+                    break
 
     groq_pool = _rotated(_live_keys(groq_keys()))
     if groq_pool:
