@@ -17,6 +17,7 @@ This module centralises those calls so a stage gets:
 
 from __future__ import annotations
 
+import copy
 import itertools
 import json
 import logging
@@ -25,11 +26,15 @@ import random
 import re
 import threading
 import time
+from collections import OrderedDict
 from typing import Any, Dict, List, Optional, Type
 
 logger = logging.getLogger("homevision")
 
-DEFAULT_GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+# Track the current flash alias rather than a pinned version: gemini-2.5-flash
+# already returns 404 "no longer available to new users" on newer keys, and the
+# alias also benchmarked fastest and extracted the most rooms.
+DEFAULT_GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-flash-latest")
 DEFAULT_OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 
 # Transient conditions worth spending another key/attempt on.  Anything else
@@ -47,6 +52,36 @@ _KEY_FATAL_PATTERNS = (
 )
 
 _lock = threading.Lock()
+_cache: "OrderedDict[tuple, tuple]" = OrderedDict()
+_CACHE_MAX = int(os.getenv("LLM_CACHE_ENTRIES", "128"))
+_CACHE_TTL = float(os.getenv("LLM_CACHE_TTL_SECONDS", "900"))
+
+
+def _cache_get(key: tuple):
+    if _CACHE_MAX <= 0:
+        return None
+    with _lock:
+        entry = _cache.get(key)
+        if entry is None:
+            return None
+        expires, value = entry
+        if time.time() > expires:
+            _cache.pop(key, None)
+            return None
+        _cache.move_to_end(key)
+        return value
+
+
+def _cache_put(key: tuple, value: Dict[str, Any]) -> None:
+    if _CACHE_MAX <= 0 or not isinstance(value, dict):
+        return
+    with _lock:
+        _cache[key] = (time.time() + _CACHE_TTL, copy.deepcopy(value))
+        _cache.move_to_end(key)
+        while len(_cache) > _CACHE_MAX:
+            _cache.popitem(last=False)
+
+
 _counter = itertools.count()
 _disabled_keys: Dict[str, float] = {}  # key -> unix ts when it may be retried
 _KEY_COOLDOWN_SECONDS = float(os.getenv("LLM_KEY_COOLDOWN_SECONDS", "300"))
@@ -164,6 +199,18 @@ def _call_gemini(
         "response_mime_type": "application/json",
         "temperature": temperature,
     }
+    # Gemini 2.5 Flash thinks before answering by default, which added several
+    # seconds to every stage. These calls fill a strict JSON schema rather than
+    # reason open-endedly, so the thinking pass buys little and costs a lot of
+    # the user's wall clock. Set GEMINI_THINKING_BUDGET to re-enable it.
+    thinking_budget = int(os.getenv("GEMINI_THINKING_BUDGET", "0"))
+    try:
+        from google.genai import types as _genai_types
+        config_kwargs["thinking_config"] = _genai_types.ThinkingConfig(
+            thinking_budget=thinking_budget,
+        )
+    except Exception:  # noqa: BLE001 - older SDKs have no thinking control
+        pass
     if system_instruction:
         config_kwargs["system_instruction"] = system_instruction
     if response_schema is not None:
@@ -231,6 +278,17 @@ def generate_json(
     model = model or DEFAULT_GEMINI_MODEL
     errors: List[str] = []
 
+    # A generation that relaxes and retries re-runs the whole pipeline, and the
+    # extraction is identical every round — paying for it again was several
+    # seconds of the user's wall clock for a byte-identical answer. Repeat
+    # prompts benefit too.
+    schema_name = getattr(response_schema, "__name__", "") if response_schema else ""
+    cache_key = (model, stage, schema_name, system_instruction, contents, round(temperature, 3))
+    cached = _cache_get(cache_key)
+    if cached is not None:
+        logger.info("[LLM POOL] %s served from cache", stage)
+        return copy.deepcopy(cached)
+
     for key in _rotated(_live_keys(gemini_keys())):
         for attempt in range(max(1, attempts_per_key)):
             try:
@@ -240,6 +298,7 @@ def generate_json(
                 )
                 if attempt or errors:
                     logger.info("[LLM POOL] %s recovered on Gemini key %s", stage, _mask(key))
+                _cache_put(cache_key, result)
                 return result
             except Exception as exc:  # noqa: BLE001 - provider errors are opaque
                 kind = _classify(exc)
@@ -264,6 +323,7 @@ def generate_json(
                 response_schema, temperature, timeout_ms / 1000.0,
             )
             logger.info("[LLM POOL] %s served by OpenAI fallback", stage)
+            _cache_put(cache_key, result)
             return result
         except Exception as exc:  # noqa: BLE001
             errors.append(f"openai/{_mask(key)}: {exc}")

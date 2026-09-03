@@ -857,7 +857,8 @@ def ensure_circulation(room_specs: list) -> list:
 
 def fit_program_to_plot(
     room_specs: list, plot_width: float, plot_length: float, floors: int = 1,
-    coverage_override: Optional[float] = None,
+    coverage_override: Optional[float] = None, max_rooms: Optional[int] = None,
+    prompt: str = "",
 ) -> Tuple[list, list]:
     """Drop optional rooms until the program's minimum area fits the plot.
 
@@ -893,32 +894,91 @@ def fit_program_to_plot(
     def required_area(items):
         return sum(get_min_area(item.get("type", "room")) for item in items if not item.get("is_outdoor"))
 
-    if required_area(specs) <= budget:
+    # A zone also has a frontage limit, not just an area limit: the fallback
+    # layout splits the available width evenly, so a slab that can only front
+    # a handful of rooms turns nine of them into 3 ft slivers that geometry
+    # validation throws away. Shed against whichever limit binds first.
+    frontage_capacity = None
+    if max_rooms is not None:
+        frontage_capacity = max(1, int(max_rooms))
+
+    # A big program can fit on area and still be unplaceable: past roughly a
+    # dozen rooms on one floor the solver cannot realize a door for every one
+    # of them, and the request failed with everything intact rather than
+    # anything at all. On the last relaxation round, trade the least important
+    # extras for a plan that exists.
+    if _FIT_SLACK.get() is not None and (_FIT_SLACK.get() or 1.0) <= 0.7:
+        crowding_cap = int(os.getenv("FINAL_ROUND_MAX_ROOMS", "11"))
+        frontage_capacity = min(frontage_capacity or crowding_cap, crowding_cap)
+
+    if required_area(specs) <= budget and (
+        frontage_capacity is None or len(specs) <= frontage_capacity
+    ):
         return specs, []
 
     # Sheddable last-to-first: pure suggestions before anything the prompt or
     # the BHK contract actually asked for. Bedrooms are never shed — dropping
     # one would silently change the BHK the user requested.
-    def shed_rank(item):
+    # Surplus bathrooms are the last thing to go and only when the floor keeps
+    # one; losing a bathroom is a smaller failure than losing the whole floor.
+    bathroom_indices = [
+        i for i, item in enumerate(specs)
+        if any(token in canonical_type(item.get("type")) for token in ("bath", "toilet", "washroom"))
+    ]
+    surplus_bathrooms = set(bathroom_indices[1:])
+
+    # On every round but the last, rooms named in the prompt are untouchable.
+    final_round = (_FIT_SLACK.get() or 1.0) <= 0.7
+    prompt_text = re.sub(r"[^a-z0-9]+", " ", str(prompt or "").lower())
+
+    def named_in_prompt(room_type: str) -> bool:
+        label = room_type.replace("_", " ").strip()
+        if not label:
+            return False
+        if re.search(rf"\b{re.escape(label)}s?\b", prompt_text):
+            return True
+        # Match on the distinctive word of a compound type, which can sit at
+        # either end: "study room" is asked for as "a study", "swimming pool"
+        # as "a pool", "home office" as "an office". Generic nouns carry no
+        # signal on their own.
+        generic = {"room", "area", "space", "zone", "hall"}
+        return any(
+            len(word) > 3 and word not in generic
+            and re.search(rf"\b{re.escape(word)}s?\b", prompt_text)
+            for word in label.split()
+        )
+
+    def shed_rank(index, item):
         room_type = canonical_type(item.get("type"))
         provenance = str(item.get("provenance", ""))
         if "bedroom" in room_type:
             return None
-        if room_type in {"kitchen", "living_room"} or "bath" in room_type or "toilet" in room_type:
-            return None
+        if named_in_prompt(room_type):
+            # A room the prompt actually named is untouchable until the last
+            # round, and even then it goes only after every space the user
+            # never mentioned. Shedding a requested gym while keeping a
+            # model-invented store room is the wrong trade.
+            return None if not final_round else 3
         if room_type in {"corridor", "hallway", "passage", "lobby", "staircase", "stairwell"}:
             return None
+        if room_type in {"kitchen", "living_room"}:
+            return None
+        if any(token in room_type for token in ("bath", "toilet", "washroom")):
+            return 2 if index in surplus_bathrooms else None
         if provenance == "gemini_suggestion" or not item.get("required", True):
             return 0
         return 1  # explicit but non-essential; only shed as a last resort
 
     order = sorted(
-        (i for i, item in enumerate(specs) if shed_rank(specs[i]) is not None),
-        key=lambda i: (shed_rank(specs[i]), -get_min_area(specs[i].get("type", "room"))),
+        (i for i, item in enumerate(specs) if shed_rank(i, specs[i]) is not None),
+        key=lambda i: (shed_rank(i, specs[i]), -get_min_area(specs[i].get("type", "room"))),
     )
     dropped, kept_flags = [], [True] * len(specs)
     for index in order:
-        if required_area([s for s, keep in zip(specs, kept_flags) if keep]) <= budget:
+        survivors = [s for s, keep in zip(specs, kept_flags) if keep]
+        area_ok = required_area(survivors) <= budget
+        frontage_ok = frontage_capacity is None or len(survivors) <= frontage_capacity
+        if area_ok and frontage_ok:
             break
         kept_flags[index] = False
         dropped.append(canonical_type(specs[index].get("type")))
@@ -6129,7 +6189,9 @@ def _stream_generate_work_impl(req: "GenerateRequest", emit_fn: Callable) -> Non
         if explicit_program:
             for level in list(explicit_program):
                 level_specs = ensure_circulation(explicit_program[level])
-                level_specs, level_notes = fit_program_to_plot(level_specs, plot_w, plot_l, 1)
+                level_specs, level_notes = fit_program_to_plot(
+                    level_specs, plot_w, plot_l, 1, prompt=req.prompt,
+                )
                 explicit_program[level] = level_specs
                 program_fit_notes.extend(level_notes)
             layout_params["rooms"] = [
@@ -6138,7 +6200,7 @@ def _stream_generate_work_impl(req: "GenerateRequest", emit_fn: Callable) -> Non
         else:
             layout_params["rooms"] = ensure_circulation(layout_params["rooms"])
             layout_params["rooms"], program_fit_notes = fit_program_to_plot(
-                layout_params["rooms"], plot_w, plot_l, floors,
+                layout_params["rooms"], plot_w, plot_l, floors, prompt=req.prompt,
             )
 
         # Wire topology on the final list of rooms to guarantee graph/door semantics!
@@ -6412,8 +6474,23 @@ def _stream_generate_work_impl(req: "GenerateRequest", emit_fn: Callable) -> Non
         valid_layout_candidates = []
         selected_topology_name = ""
 
+        # Geometry search dominates wall clock. Give the whole phase a budget:
+        # keep exploring Pareto alternatives while there is time, but never
+        # make the user wait on alternatives once a usable layout exists.
+        import geometry_engine as _geometry_engine
+        geometry_budget = float(os.getenv("GEOMETRY_BUDGET_SECONDS", "8"))
+        geometry_deadline = time.monotonic() + geometry_budget
+        _geometry_deadline_token = _geometry_engine.SOLVE_DEADLINE.set(geometry_deadline)
+
         for attempt in range(max_attempts):
             require_generation_budget("geometry planning", 9.0 if floors > 1 else 4.5)
+            over_budget = time.monotonic() > geometry_deadline
+            if attempt and over_budget and (valid_layout_candidates or attempt >= 2):
+                logger.info(
+                    "[BUDGET] Stopping topology search after %d/%d attempts with %d valid layout(s).",
+                    attempt, max_attempts, len(valid_layout_candidates),
+                )
+                break
             selected_topology = topology_candidates[attempt]
             selected_topology_name = selected_topology.name
             floor_0_rooms = copy.deepcopy(selected_topology.rooms)
@@ -6685,9 +6762,14 @@ def _stream_generate_work_impl(req: "GenerateRequest", emit_fn: Callable) -> Non
                     # then rebuild the access graph for the surviving rooms.
                     slab_w = max(1.0, slab_bounds[2] - slab_bounds[0])
                     slab_l = max(1.0, slab_bounds[3] - slab_bounds[1])
+                    # The fallback layout fronts private rooms along the slab
+                    # width, so that width caps how many rooms can be usable.
+                    min_frontage = float(os.getenv("MIN_ROOM_FRONTAGE_FT", "8"))
                     floor_1_rooms, f1_fit_notes = fit_program_to_plot(
                         floor_1_rooms, slab_w, slab_l, 1,
                         coverage_override=float(os.getenv("UPPER_FLOOR_COVERAGE", "0.85")),
+                        max_rooms=max(2, int(slab_w // min_frontage) + 1),
+                        prompt=req.prompt,
                     )
                     if f1_fit_notes:
                         floor_1_rooms = rewire_floor_access(
@@ -6801,6 +6883,8 @@ def _stream_generate_work_impl(req: "GenerateRequest", emit_fn: Callable) -> Non
         else:
             emit(6, "Generating Electrical Layout...", "Switch positions · lighting · power")
             emit(7, "Generating Plumbing Layout...", "Water supply · drainage · bathroom services")
+
+        _geometry_engine.SOLVE_DEADLINE.reset(_geometry_deadline_token)
 
         if not valid_layout_candidates:
             raise RuntimeError("All topology candidates failed geometry or realized-door validation.")

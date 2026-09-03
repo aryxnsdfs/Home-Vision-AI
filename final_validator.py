@@ -175,6 +175,22 @@ def validate_final_layout(
         if role == "attached" and owner in candidate.rooms_by_id and graph.get(room_id, set()) == {owner}:
             attached_exception_ids.add(room_id)
             attached_by_owner.setdefault(owner, set()).add(room_id)
+            continue
+        # A bathroom whose only realized door is into a single bedroom simply
+        # is an ensuite, whatever the program labelled it. Rejecting that as
+        # "private room used as transit" threw away otherwise valid layouts,
+        # so recognise the arrangement from the geometry itself.
+        neighbours = graph.get(room_id, set())
+        if is_bathroom(room.get("type", "")) and len(neighbours) == 1:
+            only_neighbour = next(iter(neighbours))
+            neighbour = candidate.rooms_by_id.get(only_neighbour, {})
+            if "bedroom" in str(neighbour.get("type", "")).lower():
+                logger.info(
+                    "[ENSUITE INFERRED] %s opens only into %s; treating it as that bedroom's ensuite.",
+                    room_id, only_neighbour,
+                )
+                attached_exception_ids.add(room_id)
+                attached_by_owner.setdefault(only_neighbour, set()).add(room_id)
     for relation in candidate.relations_by_id.values():
         if relation.kind == "exclusive_access" and relation.target_room_id:
             room = candidate.rooms_by_id.get(relation.source_room_id, {})

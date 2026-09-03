@@ -1,8 +1,10 @@
 import logging
 import math
 import os
+import contextvars
+import time
 import copy
-from typing import List, Any, Dict
+from typing import List, Any, Dict, Optional
 from ortools.sat.python import cp_model
 from collections import deque
 from layout_engine import ROOM_MINIMUMS, _DEFAULT_MIN
@@ -24,6 +26,22 @@ FORBIDDEN_PAIRS = {
 MIN_DOOR_WALL_FT = 4.0
 
 COORD_SCALE = 4  # quarter-foot precision
+
+# Geometry search is the dominant cost of a generation: a single request could
+# burn 47s across 13 solves, each allowed its full 8s, because every envelope
+# and every retry paid the worst-case price. The server sets a deadline for the
+# whole geometry phase and the search trims itself to fit.
+SOLVE_DEADLINE: contextvars.ContextVar = contextvars.ContextVar("cp_solve_deadline", default=None)
+
+
+def solve_time_remaining() -> Optional[float]:
+    deadline = SOLVE_DEADLINE.get()
+    return None if deadline is None else deadline - time.monotonic()
+
+
+def solve_deadline_passed() -> bool:
+    remaining = solve_time_remaining()
+    return remaining is not None and remaining <= 0
 
 def to_cp(value: float) -> int:
     return int(round(value * COORD_SCALE))
@@ -109,7 +127,20 @@ class CPSolver:
         envelopes = self._generate_candidate_envelopes(plot_w_ft, plot_l_ft, total_min_area) if not allowed_bounds else [allowed_bounds]
         
         last_exception = None
-        for env in envelopes:
+        index = 0
+        while index < len(envelopes):
+            # Past the first envelope, stop spending the user's wall clock on
+            # near-identical alternatives once the budget is gone — but never
+            # skip the whole-plot envelope at the end. That is the one that
+            # rescues a room-heavy program, so jump to it rather than give up.
+            if index and index < len(envelopes) - 1 and solve_deadline_passed():
+                logger.info(
+                    "[BUDGET] Skipping envelopes %d-%d; trying the full-plot fallback.",
+                    index, len(envelopes) - 2,
+                )
+                index = len(envelopes) - 1
+            env = envelopes[index]
+            index += 1
             floor_data_env = dict(floor_data)
             floor_data_env['allowed_bounds'] = env
             try:
@@ -662,10 +693,21 @@ class CPSolver:
         # edges. Four seconds returned UNKNOWN on otherwise feasible 40x80
         # plots and forced a lossy legacy fallback. Eight seconds still keeps
         # the complete request inside the 30-second product budget.
-        configured_limit = float(os.getenv("CP_SOLVER_TIMEOUT_SECONDS", "8"))
+        # A feasible layout is normally found in well under a second; the long
+        # solves are the ones that were going to fail anyway. Capping each
+        # solve lets the search try more envelopes inside the same budget.
+        configured_limit = float(os.getenv("CP_SOLVER_TIMEOUT_SECONDS", "4"))
         if floor_data.get('relaxed_recovery'):
             configured_limit = float(os.getenv("CP_RECOVERY_TIMEOUT_SECONDS", "4"))
         solver_limit = max(1.0, min(8.0, configured_limit))
+        remaining = solve_time_remaining()
+        if remaining is not None:
+            # Past the budget this is a last-chance rescue solve, so it still
+            # gets a workable allowance — starving it to a fraction of a second
+            # just converts a slow success into a fast failure.
+            rescue = float(os.getenv("CP_SOLVER_RESCUE_SECONDS", "3"))
+            solver_limit = max(rescue, min(solver_limit, remaining)) if remaining <= 0 else \
+                max(1.0, min(solver_limit, remaining))
         solver.parameters.max_time_in_seconds = solver_limit
         # Set random seed to explore different search spaces
         solver.parameters.random_seed = attempt
@@ -742,8 +784,8 @@ class CPSolver:
                     if 'resolved_rooms' in result:
                         return result
 
-            max_attempts = max(3, int(os.getenv("CP_SOLVER_MAX_ATTEMPTS", "3")))
-            if attempt + 1 < max_attempts:
+            max_attempts = max(1, int(os.getenv("CP_SOLVER_MAX_ATTEMPTS", "3")))
+            if attempt + 1 < max_attempts and not solve_deadline_passed():
                 logger.info(f"[RETRY] Re-solving with perturbed weights (attempt {attempt + 1})…")
                 return self._solve_single_topology(floor_data, attempt + 1, topology_type)
 

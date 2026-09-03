@@ -15,6 +15,13 @@ from typing import Any, Dict, Iterable, List, Tuple
 OUTDOOR_TYPES = {
     "balcony", "garden", "landscape", "parking", "garage",
     "portico", "veranda", "patio", "flat_terrace", "terrace", "roof_garden",
+    # Water and open-air leisure features are site elements, not rooms. Left
+    # indoors they entered the corridor graph and had to satisfy shared-wall
+    # and door rules, which made whole layouts infeasible — asking for a
+    # swimming pool could cost the user the entire house.
+    "swimming_pool", "pool", "plunge_pool", "lap_pool", "jacuzzi",
+    "deck", "sit_out", "sitout", "lawn", "courtyard_garden", "terrace_garden",
+    "kitchen_garden", "play_area", "childrens_play_area", "driveway", "carport",
 }
 ROOFTOP_TYPES = {"terrace", "flat_terrace", "roof_garden", "rooftop_garden"}
 BASEMENT_TYPES = {"basement", "cellar", "lower_ground", "lower_ground_floor"}

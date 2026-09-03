@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import re
 import copy
+import dataclasses
 from dataclasses import replace
 import logging
 from typing import Any, Dict, Iterable, List, Optional
@@ -708,11 +709,17 @@ def compile_intent(
                     constraint.relation_id, original_source,
                 )
                 continue
-            raise InternalInvariantError(
-                f"program={program_id}: relation={constraint.relation_id} "
-                f"original_selector={original_source!r} attempted_resolved_id='' missing source; "
-                f"available_canonical_room_ids={available}"
+            # The planner sometimes attributes a constraint to the user that
+            # names a room the program never contains (a "master_bathroom"
+            # that was canonicalised into an attached bath). Losing one
+            # adjacency preference is far better than losing the house; the
+            # room program itself is still enforced by the semantic gate.
+            logger.warning(
+                "[RELATION DROPPED] program=%s relation=%s source=%r does not resolve to any "
+                "room in the program; available=%s",
+                program_id, constraint.relation_id, original_source, available,
             )
+            continue
         if constraint.target and not target_ids:
             if constraint.origin != ConstraintOrigin.USER:
                 if constraint.kind == ConstraintKind.REACHABLE and entry_room_id:
@@ -729,11 +736,12 @@ def compile_intent(
                     )
                     continue
         if constraint.target and not target_ids:
-            raise InternalInvariantError(
-                f"program={program_id}: relation={constraint.relation_id} "
-                f"original_selector={original_target!r} attempted_resolved_id='' missing target; "
-                f"available_canonical_room_ids={available}"
+            logger.warning(
+                "[RELATION DROPPED] program=%s relation=%s target=%r does not resolve to any "
+                "room in the program; available=%s",
+                program_id, constraint.relation_id, original_target, available,
             )
+            continue
 
         pairs: List[tuple[str, Optional[str]]]
         if not constraint.target:
@@ -789,39 +797,57 @@ def assert_relation_endpoints(
     *,
     candidate_id: str = "",
 ) -> None:
-    """Assert that the topology contract contains exact canonical room IDs."""
+    """Drop contract relations that no longer name a room on this floor.
+
+    Rooms move between floors and get pruned after the contract is compiled,
+    which used to abort the whole request. A relation whose endpoint is gone is
+    simply no longer meaningful, so it is dropped and reported.
+    """
     room_ids = {str(room.get("id")) for room in rooms}
     available = sorted(room_ids)
     owner = candidate_id or contract.program_id or "topology-program"
+    live_relations = []
     for relation in contract.constraints:
         if relation.source not in room_ids:
-            raise InternalInvariantError(
-                f"candidate/program={owner}: relation={relation.relation_id} "
-                f"original_selector={relation.original_source_selector or relation.source!r} "
-                f"attempted_resolved_id={relation.source!r} missing source; "
-                f"available_canonical_room_ids={available}"
+            logger.warning(
+                "[RELATION DROPPED] %s: relation=%s source=%r is not on this floor; available=%s",
+                owner, relation.relation_id,
+                relation.original_source_selector or relation.source, available,
             )
+            continue
         if relation.target and relation.target not in room_ids:
-            raise InternalInvariantError(
-                f"candidate/program={owner}: relation={relation.relation_id} "
-                f"original_selector={relation.original_target_selector or relation.target!r} "
-                f"attempted_resolved_id={relation.target!r} missing target; "
-                f"available_canonical_room_ids={available}"
+            logger.warning(
+                "[RELATION DROPPED] %s: relation=%s target=%r is not on this floor; available=%s",
+                owner, relation.relation_id,
+                relation.original_target_selector or relation.target, available,
             )
-            
+            continue
+        live_relations.append(relation)
+    contract.constraints = live_relations
+
+    
+    # Group constraints get the same treatment: narrow the group to the rooms
+    # actually present, and drop it once it no longer refers to anything.
+    live_groups = []
     for grp in contract.group_constraints:
-        for rid in grp.resolved_source_room_ids:
-            if rid not in room_ids:
-                raise InternalInvariantError(
-                    f"candidate/program={owner}: group_constraint={grp.id} "
-                    f"missing resolved source room {rid!r}"
-                )
-        for rid in grp.resolved_target_room_ids:
-            if rid not in room_ids:
-                raise InternalInvariantError(
-                    f"candidate/program={owner}: group_constraint={grp.id} "
-                    f"missing resolved target room {rid!r}"
-                )
+        source_ids = [rid for rid in grp.resolved_source_room_ids if rid in room_ids]
+        target_ids = [rid for rid in grp.resolved_target_room_ids if rid in room_ids]
+        if len(source_ids) != len(grp.resolved_source_room_ids) or                 len(target_ids) != len(grp.resolved_target_room_ids):
+            logger.warning(
+                "[GROUP CONSTRAINT NARROWED] %s: group=%s kept %d/%d sources and %d/%d targets "
+                "present on this floor",
+                owner, grp.id, len(source_ids), len(grp.resolved_source_room_ids),
+                len(target_ids), len(grp.resolved_target_room_ids),
+            )
+        if not source_ids or (grp.resolved_target_room_ids and not target_ids):
+            continue
+        # GroupSpatialConstraint is frozen, so narrow it by rebuilding.
+        live_groups.append(dataclasses.replace(
+            grp,
+            resolved_source_room_ids=tuple(source_ids),
+            resolved_target_room_ids=tuple(target_ids),
+        ))
+    contract.group_constraints = live_groups
 
 
 def apply_contract_to_room_specs(
