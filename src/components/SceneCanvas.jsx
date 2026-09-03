@@ -381,20 +381,58 @@ function SiteLayer({ areas, accent, showLabels = true }) {
             {assets.map((item, assetIndex) => {
               const assetType = String(item?.type || "").toLowerCase();
               const key = `${area?.id || type}-${assetType || "asset"}-${assetIndex}`;
+              const ax = Number(item?.x || 0) * SCALE;
+              const az = Number(item?.z || 0) * SCALE;
+              const aw = Math.max(0.04, Number(item?.width || 1) * SCALE);
+              const al = Math.max(0.04, Number(item?.length || 1) * SCALE);
+
               if (assetType === "car") {
                 return (
-                  <CarModel
-                    key={key}
-                    x={Number(item?.x || 0) * SCALE}
-                    z={Number(item?.z || 0) * SCALE}
-                    accent={accent}
-                    isSelected={false}
-                    onClick={() => {}}
-                  />
+                  <CarModel key={key} x={ax} z={az} accent={accent} isSelected={false} onClick={() => {}} />
                 );
               }
+
+              // Everything else out here is a marking on the ground, not an
+              // object in a room. Sending these through the furniture renderer
+              // drew a 9x18 ft parking bay as a solid furniture-coloured box
+              // standing outside the house.
+              if (/light|lamp|bollard/.test(assetType)) {
+                return (
+                  <mesh key={key} castShadow position={[ax, 0.16, az]}>
+                    <cylinderGeometry args={[0.03, 0.04, 0.32, 8]} />
+                    <meshStandardMaterial color="#94a3b8" roughness={0.5} metalness={0.2} emissive="#1e293b" />
+                  </mesh>
+                );
+              }
+              if (/tree|plant|shrub|hedge/.test(assetType)) {
+                return (
+                  <mesh key={key} castShadow position={[ax, 0.14, az]}>
+                    <sphereGeometry args={[Math.max(0.08, Math.min(aw, al) * 0.5), 10, 8]} />
+                    <meshStandardMaterial color="#3f7a45" roughness={0.9} />
+                  </mesh>
+                );
+              }
+
+              const markingColor = /bay|slot/.test(assetType)
+                ? "#8fa0b4"
+                : /path|walk|drive/.test(assetType)
+                  ? "#6b7688"
+                  : "#7c879a";
               return (
-                <ManifestFurniture key={key} item={item} isSelected={false} accent={accent} onClick={() => {}} />
+                <mesh
+                  key={key}
+                  receiveShadow
+                  rotation={[-Math.PI / 2, 0, 0]}
+                  position={[ax, 0.035, az]}
+                >
+                  <planeGeometry args={[aw, al]} />
+                  <meshStandardMaterial
+                    color={markingColor}
+                    roughness={0.9}
+                    transparent
+                    opacity={/bay|slot/.test(assetType) ? 0.35 : 0.6}
+                  />
+                </mesh>
               );
             })}
             {showLabels && (

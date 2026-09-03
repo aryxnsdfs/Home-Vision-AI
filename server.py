@@ -1202,6 +1202,38 @@ def trim_surplus_bedrooms(
     return trimmed, remaining
 
 
+def _guarantee_bathrooms(specs, prompt: str = "", bhk: int = 0, only_if_none_anywhere=None):
+    """Make sure a bathroom is in the program before anything sheds rooms.
+
+    The contract check at the end of assembly restores a missing bathroom, but
+    by then fit_program_to_plot has already balanced the program against the
+    plot, so adding one back pushed the count over what could be placed and the
+    request failed outright. Stating the requirement up front lets the shed drop
+    a gym instead of the plumbing.
+    """
+    from intent_compiler import requested_bathroom_count
+
+    items = [item for item in (specs or []) if isinstance(item, dict)]
+    if only_if_none_anywhere is not None:
+        pool = [item for item in only_if_none_anywhere if isinstance(item, dict)]
+        if any(_program_room_class(item.get("type")) == "bathroom" for item in pool):
+            return items
+
+    have = sum(1 for item in items if _program_room_class(item.get("type")) == "bathroom")
+    wanted = requested_bathroom_count(prompt) or 1
+    if have >= wanted:
+        return items
+
+    for index in range(have, wanted):
+        items.append({
+            "type": "bathroom",
+            "name": "Bathroom" if not index else f"Bathroom {index + 1}",
+            "confidence": 100, "required": True, "provenance": "building_requirement",
+        })
+    logger.info("[PROGRAM] Added %d bathroom(s) the brief requires before fitting.", wanted - have)
+    return items
+
+
 def program_contract(
     specs: Iterable[Dict[str, Any]], prompt: str = "", bhk: int = 0,
 ) -> "collections.Counter":
@@ -1288,11 +1320,17 @@ def reconcile_against_contract(
     restored_outdoor: List[Dict[str, Any]] = []
     notes: List[str] = []
     surplus: "collections.Counter" = collections.Counter()
+    essential = {_program_room_class("bathroom"), _program_room_class("kitchen")}
     for concept, wanted in contract.items():
         have = realised.get(concept, 0)
         if have > wanted:
             surplus[concept] = have - wanted
-        missing = wanted - have - excused.get(concept, 0)
+        # A room shed on purpose is normally left alone, because the user is
+        # told about it. That cannot apply to the last bathroom or the kitchen:
+        # "plot is tight, so bathroom was left out" is not a house. A building
+        # requirement outranks the shed that removed it.
+        forgiven = 0 if (concept in essential and have == 0) else excused.get(concept, 0)
+        missing = wanted - have - forgiven
         if missing <= 0:
             continue
         notes.append(f"{missing}x {concept.replace('_', ' ')}")
@@ -1372,6 +1410,10 @@ def _program_room_class(value: Any) -> str:
         return "store_room"
     if room_type in {"study", "home_office", "office"}:
         return "study_room"
+    if room_type in {"home_gym", "fitness_room", "exercise_room", "workout_room"}:
+        return "gym"
+    if room_type in {"home_theater", "home_theatre", "media_room", "cinema_room"}:
+        return "home_theater"
     # Spellings of the same room only. A prayer room is deliberately kept
     # separate from a pooja room here - test_room_intelligence pins that, and
     # a program that asked for one must not silently acquire the other.
@@ -6575,6 +6617,20 @@ def _stream_generate_work_impl(req: "GenerateRequest", emit_fn: Callable) -> Non
         program_fit_notes: List[str] = []
         shed_types: List[str] = []
         _SHED_TYPES.set(shed_types)
+
+        # A house needs a bathroom, so put the requirement in before anything
+        # sheds rather than after. Restoring it later, once the shed had already
+        # balanced the program, pushed the room count back over what the plot
+        # could place and the whole request failed instead - the shed has to be
+        # able to see the bathroom and drop a gym rather than the plumbing.
+        layout_params["rooms"] = _guarantee_bathrooms(
+            layout_params["rooms"], req.prompt, bhk_val,
+        )
+        if explicit_program:
+            for level in list(explicit_program):
+                explicit_program[level] = _guarantee_bathrooms(
+                    explicit_program[level], req.prompt, bhk_val, only_if_none_anywhere=layout_params["rooms"],
+                )
         if explicit_program:
             for level in list(explicit_program):
                 level_specs = ensure_circulation(explicit_program[level])

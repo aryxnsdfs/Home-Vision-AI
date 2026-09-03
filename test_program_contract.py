@@ -148,3 +148,39 @@ def test_trim_leaves_other_room_types_alone():
     trimmed, _left = trim_surplus_bedrooms(floors, 1)
     assert _types(trimmed)[0].count("corridor") == 2
     assert _types(trimmed)[0].count("bedroom") == 1
+
+
+def test_a_shed_may_not_remove_the_last_bathroom():
+    # "Plot is tight, so bathroom was left out" is not a house. A deliberate
+    # shed is normally respected because the user is told about it, but a
+    # building requirement outranks it.
+    contract = program_contract([{"type": "kitchen"}], "3BHK house")
+    indoor, _site, _notes, _surplus = reconcile_against_contract(
+        contract,
+        {0: [{"type": "kitchen"}]},
+        [],
+        accounted=["bathroom"],
+    )
+    assert [r["type"] for r in indoor] == ["bathroom"]
+
+
+def test_a_shed_is_still_respected_when_one_bathroom_survives():
+    contract = program_contract([{"type": t} for t in ("kitchen", "bathroom", "bathroom")],
+                                "3BHK with two bathrooms")
+    indoor, _site, _notes, _surplus = reconcile_against_contract(
+        contract,
+        {0: [{"type": "kitchen"}, {"type": "bathroom"}]},
+        [],
+        accounted=["bathroom"],
+    )
+    assert indoor == [], "a surplus bathroom shed on purpose must stay shed"
+
+
+def test_a_home_gym_is_a_gym():
+    # The plan realised it as home_gym and the contract asked for gym, so a
+    # second one was restored beside it.
+    contract = program_contract([{"type": "gym"}, {"type": "bathroom"}], "3BHK with a home gym")
+    indoor, _site, _notes, _surplus = reconcile_against_contract(
+        contract, {0: [{"type": "home_gym"}, {"type": "bathroom"}]}, [],
+    )
+    assert indoor == [], "home_gym and gym must count as one room"
