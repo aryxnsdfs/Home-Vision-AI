@@ -986,6 +986,11 @@ def ensure_circulation(room_specs: list) -> list:
     return specs + extra
 
 
+# Rooms shed on purpose by fit_program_to_plot. The contract check reads this
+# to tell a deliberate drop, which the user is told about, from a silent one.
+_SHED_TYPES: contextvars.ContextVar = contextvars.ContextVar("program_shed_types", default=None)
+
+
 def fit_program_to_plot(
     room_specs: list, plot_width: float, plot_length: float, floors: int = 1,
     coverage_override: Optional[float] = None, max_rooms: Optional[int] = None,
@@ -1124,6 +1129,9 @@ def fit_program_to_plot(
             break
         kept_flags[index] = False
         dropped.append(canonical_type(specs[index].get("type")))
+        recorded = _SHED_TYPES.get()
+        if recorded is not None:
+            recorded.append(canonical_type(specs[index].get("type")))
 
     survivors = [s for s, keep in zip(specs, kept_flags) if keep]
     notes = []
@@ -1138,6 +1146,156 @@ def fit_program_to_plot(
             f"every requested room at a usable size."
         )
     return survivors, notes
+
+
+def trim_surplus_bedrooms(
+    floors: Dict[int, List[Dict[str, Any]]], extra: int,
+) -> Tuple[Dict[int, List[Dict[str, Any]]], int]:
+    """Drop surplus bedrooms, taking them from the floor that actually has them.
+
+    Only bedrooms are ever trimmed. Everywhere else a count above the contract
+    means a later stage added a room on purpose - ensure_circulation puts in the
+    corridors a big program needs - and removing those undoes work the plan
+    depends on. The BHK is the one count the user states outright, so a bedroom
+    over it is the program being wrong rather than the plan.
+
+    Taking from the topmost floor instead removed the bedroom a brief had put
+    upstairs ("two bedrooms downstairs and one master upstairs") and left that
+    storey with nothing to reach, so no topology could be built at all. The
+    master is always kept.
+
+    Returns the floors with the extras gone plus however many could not be
+    removed, which happens when every remaining bedroom is a master.
+    """
+    bedroom = _program_room_class("bedroom")
+
+    def count_bedrooms(specs):
+        return sum(1 for spec in specs or []
+                   if _program_room_class(spec.get("type")) == bedroom)
+
+    trimmed = {level: list(specs or []) for level, specs in (floors or {}).items()}
+    remaining = max(0, int(extra))
+    for level in sorted(trimmed, key=lambda lvl: count_bedrooms(trimmed[lvl]), reverse=True):
+        specs = trimmed[level]
+        for index in range(len(specs) - 1, -1, -1):
+            if remaining <= 0:
+                break
+            if canonical_type(specs[index].get("type")) == "bedroom":
+                specs.pop(index)
+                remaining -= 1
+        if remaining <= 0:
+            break
+    return trimmed, remaining
+
+
+def program_contract(
+    specs: Iterable[Dict[str, Any]], prompt: str = "", bhk: int = 0,
+) -> "collections.Counter":
+    """Everything the finished plan owes the user, counted by concept.
+
+    Three things can put a room in here and they are genuinely different asks,
+    so they are gathered once rather than each growing its own rescue further
+    down the pipeline:
+
+    * the accepted program - the model is not what loses rooms, it returns the
+      gym and the study in every field it fills, and they go missing later in
+      floor assembly, duplex splitting, shedding and pruning;
+    * rooms the brief named that the program somehow does not have, for the
+      runs where the model does drop one;
+    * building requirements, which no program states - a house needs a
+      bathroom whether or not anyone thought to ask for one.
+
+    One contract means one place to compare against, instead of a separate
+    recovery per room type that somebody noticed was missing.
+    """
+    import collections
+    from asset_library import requested_custom_specs, requested_outdoor_specs
+
+    contract = collections.Counter(
+        _program_room_class(spec.get("type"))
+        for spec in (specs or []) if isinstance(spec, dict)
+        and _program_room_class(spec.get("type"))
+    )
+
+    for requested in list(requested_custom_specs(prompt)) + list(requested_outdoor_specs(prompt)):
+        concept = _program_room_class(requested.get("type"))
+        if concept and not contract.get(concept):
+            contract[concept] = 1
+
+    # "3BHK" is the one count the user states outright, so it overrides whatever
+    # the model returned rather than being counted from it. Left to the program,
+    # a 3BHK request came back with four bedrooms and the semantic gate threw
+    # the whole layout away.
+    if bhk and bhk > 0:
+        contract[_program_room_class("bedroom")] = int(bhk)
+
+    from intent_compiler import requested_bathroom_count
+    bath_concept = _program_room_class("bathroom")
+    stated = requested_bathroom_count(prompt)
+    needed = stated if stated else 1
+    if contract.get(bath_concept, 0) < needed:
+        contract[bath_concept] = needed
+
+    return contract
+
+
+def reconcile_against_contract(
+    contract: "collections.Counter",
+    floors: Dict[int, List[Dict[str, Any]]],
+    outdoor_specs: List[Dict[str, Any]],
+    accounted: Iterable[str] = (),
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], List[str]]:
+    """Put back anything the contract promised that no stage owned up to losing.
+
+    Returns the indoor rooms to restore onto the ground floor, the site features
+    to restore alongside it, notes naming both, and any concept the plan has
+    more of than was promised. A room shed on purpose is
+    passed in through ``accounted`` and left alone: those already reach the user
+    as a warning. Everything else went missing silently, which is the case this
+    exists to end.
+    """
+    import collections
+    from asset_library import is_outdoor_type
+
+    realised = collections.Counter()
+    for level_specs in (floors or {}).values():
+        realised.update(
+            _program_room_class(spec.get("type"))
+            for spec in (level_specs or []) if isinstance(spec, dict)
+        )
+    realised.update(
+        _program_room_class(spec.get("type"))
+        for spec in (outdoor_specs or []) if isinstance(spec, dict)
+    )
+
+    excused = collections.Counter(_program_room_class(item) for item in (accounted or ()))
+
+    restored: List[Dict[str, Any]] = []
+    restored_outdoor: List[Dict[str, Any]] = []
+    notes: List[str] = []
+    surplus: "collections.Counter" = collections.Counter()
+    for concept, wanted in contract.items():
+        have = realised.get(concept, 0)
+        if have > wanted:
+            surplus[concept] = have - wanted
+        missing = wanted - have - excused.get(concept, 0)
+        if missing <= 0:
+            continue
+        notes.append(f"{missing}x {concept.replace('_', ' ')}")
+        for index in range(missing):
+            spec = {
+                "type": concept,
+                "name": concept.replace("_", " ").title() + (f" {index + 2}" if index else ""),
+                "confidence": 100, "required": True, "provenance": "explicit_user",
+            }
+            # Parking, a garden or a terrace belongs on the site, not carved out
+            # of the floor plate as if it were a bedroom.
+            if is_outdoor_type(concept):
+                spec["is_outdoor"] = True
+                restored_outdoor.append(spec)
+            else:
+                restored.append(spec)
+    return restored, restored_outdoor, notes, surplus
 
 
 def run_semantic_gate(intent: dict, room_specs: list, specs_by_floor: dict = None) -> Tuple[bool, list]:
@@ -1189,6 +1347,33 @@ def _program_room_class(value: Any) -> str:
         return "corridor"
     if room_type in {"stairwell", "stairs"}:
         return "staircase"
+    # A car goes in the same place whether the model called it a garage, a
+    # carport or parking. Left as three concepts, a check for what the brief
+    # asked for cannot see that the room is already there and adds a second.
+    if room_type in {"garage", "carport", "car_parking", "car_porch", "parking_area"}:
+        return "parking"
+    if room_type in {"utility_room", "utility_area", "laundry", "laundry_room"}:
+        return "utility"
+    if room_type in {"store", "storage", "storage_room", "pantry"}:
+        return "store_room"
+    if room_type in {"study", "home_office", "office"}:
+        return "study_room"
+    # Spellings of the same room only. A prayer room is deliberately kept
+    # separate from a pooja room here - test_room_intelligence pins that, and
+    # a program that asked for one must not silently acquire the other.
+    if room_type in {"pooja", "puja", "puja_room"}:
+        return "pooja_room"
+    # "dining" and "dining_room" are one ask. Counted apart, the contract check
+    # sees the room it wanted as absent and adds a second one beside it.
+    if room_type in {"dining", "dining_area", "dining_hall"}:
+        return "dining_room"
+    # Only true synonyms. A family lounge is NOT a living room: a duplex has a
+    # living room downstairs and a lounge upstairs, and folding them together
+    # made the upstairs one look like a duplicate and lose its place.
+    if room_type in {"living", "living_area", "living_hall"}:
+        return "living_room"
+    if room_type in {"open_kitchen", "modular_kitchen", "kitchenette"}:
+        return "kitchen"
     return room_type
 
 
@@ -6374,6 +6559,8 @@ def _stream_generate_work_impl(req: "GenerateRequest", emit_fn: Callable) -> Non
         # source of truth downstream, so settle it per level; each level gets
         # the whole footprint to itself.
         program_fit_notes: List[str] = []
+        shed_types: List[str] = []
+        _SHED_TYPES.set(shed_types)
         if explicit_program:
             for level in list(explicit_program):
                 level_specs = ensure_circulation(explicit_program[level])
@@ -6436,6 +6623,9 @@ def _stream_generate_work_impl(req: "GenerateRequest", emit_fn: Callable) -> Non
         # Feature flags authorize explicit rooms; they do not remove those
         # rooms from the layout program.
         room_pool = list(layout_params["rooms"])
+        # Freeze what was accepted before floor assembly, duplex splitting,
+        # shedding or pruning get a chance to lose any of it.
+        accepted_contract = program_contract(room_pool, req.prompt, bhk_val)
         room_pool, structural_features = strip_structural(room_pool)
         floor_program = layout_params.get("floor_program") or {}
         has_explicit_schedule = bool(floor_program)
@@ -6499,62 +6689,6 @@ def _stream_generate_work_impl(req: "GenerateRequest", emit_fn: Callable) -> Non
                     logger.info("[SITE RECOVERY] Prompt asked for %s; the program had left it out.", room_type)
                     outdoor_specs.append(dict(requested, is_outdoor=True))
                     existing_outdoor.add(room_type)
-
-            # Same gap on the indoor side as the site features above: a room
-            # the prompt named outright could be missing from every floor of
-            # the program with nothing to put it back, so "a study room near
-            # the bedrooms" quietly produced a house with no study. Add it to
-            # the ground floor and let the normal fitting decide if it stays.
-            ground_specs = list(floor_specs_by_level.get(0) or [])
-            present = {canonical_type(spec.get("type"))
-                       for level_specs in floor_specs_by_level.values()
-                       for spec in level_specs}
-            recovered_any = False
-            for requested in requested_custom_specs(req.prompt):
-                room_type = canonical_type(requested.get("type"))
-                if not room_type or room_type in present:
-                    continue
-                logger.info("[ROOM RECOVERY] Prompt asked for %s; the program had left it out.", room_type)
-                ground_specs.append({
-                    "type": room_type, "name": room_type.replace("_", " ").title(),
-                    # The prompt named it, so it is an explicit user room; it
-                    # only reached here because the extraction lost it.
-                    "confidence": 100, "required": True, "provenance": "explicit_user",
-                })
-                present.add(room_type)
-                recovered_any = True
-
-            # A house with no bathroom anywhere is never right, and a brief
-            # that only names the rooms it cares about ("4BHK duplex with the
-            # kitchen in the southeast...") can produce exactly that. The
-            # repair in automatically_repair_program() rebuilds a room count,
-            # which this path does not use, so guarantee it here as well.
-            from intent_compiler import requested_bathroom_count
-            have_baths = sum(
-                1 for level_specs in floor_specs_by_level.values() for spec in level_specs
-                if any(token in canonical_type(spec.get("type")) for token in ("bath", "toilet", "washroom"))
-            )
-            # A stated count is a requirement; with none stated, a house still
-            # needs at least one. Only ever top up - trimming a surplus is
-            # handled in automatically_repair_program.
-            wanted = requested_bathroom_count(req.prompt) or (0 if have_baths else max(1, min(int(bhk_val or 1), 2)))
-            if wanted > have_baths:
-                logger.info(
-                    "[ROOM RECOVERY] Program has %d bathroom(s), the brief needs %d; adding %d",
-                    have_baths, wanted, wanted - have_baths,
-                )
-                for index in range(have_baths, wanted):
-                    ground_specs.append({
-                        "type": "bathroom", "name": "Bathroom" if not index else f"Bathroom {index + 1}",
-                        "confidence": 100, "required": True, "provenance": "building_requirement",
-                    })
-                recovered_any = True
-
-            if recovered_any:
-                floor_specs_by_level[0] = sort_spec_by_generation_order(auto_wire_topology(
-                    ground_specs, ai_categories=slm_result or {},
-                    bathroom_requirements=(slm_result or {}).get("bathroom_requirements"),
-                ))
 
             # --- AUTOMATIC VERTICAL ESCALATION FOR OVERSIZED GROUND FLOOR ---
             all_ground_rooms = floor_specs_by_level.get(0, [])
@@ -6638,6 +6772,48 @@ def _stream_generate_work_impl(req: "GenerateRequest", emit_fn: Callable) -> Non
                     "connections": []
                 })
                 logger.info("[PIPELINE] Injected corridor-core to distribute private space circulation.")
+
+        # ── PROGRAM CONTRACT ──────────────────────────────────────────────
+        # Both branches above assemble a program their own way, which is why a
+        # fix for a missing room had to be written twice and still only covered
+        # the room types someone had noticed. Check the contract once, here,
+        # where they rejoin. Anything the accepted program promised and no
+        # stage recorded shedding is restored; the shedding notes cover the
+        # rooms that were dropped deliberately, and those already reach the UI.
+        _floors_now = floor_specs_by_level or {0: floor_0_rooms, 1: first_spec}
+        _restored, _restored_outdoor, _restored_notes, _surplus = reconcile_against_contract(
+            accepted_contract, _floors_now, outdoor_specs,
+            accounted=shed_types,
+        )
+        if _restored or _restored_outdoor:
+            logger.info(
+                "[CONTRACT] Restoring %s the program had promised and lost silently.",
+                ", ".join(_restored_notes),
+            )
+            warnings.append(
+                "Restored " + ", ".join(_restored_notes) + " that the layout program had dropped."
+            )
+            if _restored:
+                floor_0_rooms = list(floor_0_rooms) + _restored
+                if floor_specs_by_level:
+                    floor_specs_by_level[0] = floor_0_rooms
+            if _restored_outdoor:
+                outdoor_specs = list(outdoor_specs) + _restored_outdoor
+
+        _extra_bedrooms = _surplus.get(_program_room_class("bedroom"), 0)
+        if _extra_bedrooms > 0:
+            _trim_source = floor_specs_by_level or {0: floor_0_rooms, 1: first_spec}
+            _trimmed, _left = trim_surplus_bedrooms(_trim_source, _extra_bedrooms)
+            if floor_specs_by_level:
+                floor_specs_by_level.update(_trimmed)
+                floor_0_rooms = floor_specs_by_level.get(0, floor_0_rooms)
+            else:
+                floor_0_rooms = _trimmed.get(0, floor_0_rooms)
+                first_spec = _trimmed.get(1, first_spec)
+            logger.info(
+                "[CONTRACT] Program had %d bedroom(s) more than the %s BHK asked for; removed %d.",
+                _extra_bedrooms, bhk_val, _extra_bedrooms - _left,
+            )
 
         from intent_compiler import annotate_room_provenance, bind_room_roles, prune_optional_suggestions
         # Room membership per floor is only final here, after escalation, the
