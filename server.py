@@ -702,9 +702,60 @@ def automatically_repair_program(prompt: str, slm_result: dict, requested_floors
             logger.info(f"[SEMANTIC REPAIR] Merged duplicate {singleton} {room_counts[singleton]} → 1")
             room_counts[singleton] = 1
 
+    # 5a. The same rule, for every other room type. SINGLETON_ROOM_TYPES is a
+    # fixed list and the room vocabulary is deliberately open, so a request for
+    # "a dedicated study room" came back with two studies and nothing caught it.
+    # The cost was not just the spare room: the extra space pushed the program
+    # past what the plot could place, generation fell through to the fallback
+    # layout, and that ignores compass pins entirely - so one invented room
+    # also lost the kitchen its southeast corner.
+    def _asks_for_multiple(room_type: str) -> bool:
+        label = room_type.replace("_", " ").strip()
+        if not label:
+            return False
+        generic = {"room", "area", "space", "zone", "hall"}
+        words = [w for w in label.split() if w not in generic] or label.split()
+        head = words[-1]
+        counts = ("2", "two", "3", "three", "4", "four", "5", "five",
+                  "multiple", "double", "several")
+        for n in counts:
+            if re.search(rf"\b{n}\b[\w\s]{{0,12}}\b{re.escape(head)}", prompt_lower):
+                return True
+        plurals = {head + "s", head + "es"}
+        if head.endswith("y"):
+            plurals.add(head[:-1] + "ies")
+        return any(re.search(rf"\b{re.escape(p)}\b", prompt_lower) for p in plurals)
+
+    # Bedrooms, bathrooms and circulation each have their own count rules above
+    # and below; leave those alone.
+    for r_type in list(room_counts):
+        if room_counts.get(r_type, 0) <= 1:
+            continue
+        if "bedroom" in r_type or any(t in r_type for t in ("bath", "toilet", "washroom")):
+            continue
+        if r_type in {"corridor", "hallway", "passage", "circulation", "lobby"}:
+            continue
+        if _asks_for_multiple(r_type):
+            continue
+        logger.info(
+            "[SEMANTIC REPAIR] Collapsed duplicate %s %s -> 1 (prompt asked for one)",
+            r_type, room_counts[r_type],
+        )
+        room_counts[r_type] = 1
+
     # 5b. Sanity-check Bathrooms for BHK Requests
     total_baths = room_counts.get("bathroom", 0) + room_counts.get("attached_bathroom", 0) + room_counts.get("common_bathroom", 0) + room_counts.get("master_bathroom", 0)
     has_explicit_bath = any(f"{n} bath" in prompt_lower or f"{n} toilet" in prompt_lower for n in ["1", "2", "3", "4", "5", "one", "two", "three", "four", "five"])
+    # A prompt that names only the rooms it cares about ("4BHK with the kitchen
+    # in the southeast...") can come back with no bathroom at all, and nothing
+    # downstream adds one: the checks below only ever trim a surplus. No house
+    # is correct without one, so put the missing minimum back.
+    if total_baths == 0 and (bhk > 0 or room_counts):
+        target_baths = max(1, min(bhk or 1, 2))
+        logger.info("[SEMANTIC REPAIR] Program had no bathroom; adding %d", target_baths)
+        room_counts["bathroom"] = target_baths
+        total_baths = target_baths
+
     if bhk > 0 and not has_explicit_bath and total_baths > min(bhk, 3):
         target_baths = min(bhk, 3)
         logger.info(f"[SEMANTIC REPAIR] Corrected unrequested bathrooms {total_baths} → {target_baths} for {bhk}BHK")
@@ -900,8 +951,25 @@ def ensure_circulation(room_specs: list) -> list:
     # hub is unsatisfiable however much floor area is free, which is why
     # room-heavy plans failed door adjacency on plots less than half full.
     # Scale circulation with the program the way a real plan does.
+    # What fills a corridor's perimeter is every room that opens off it, not
+    # just the bedrooms and bathrooms. Counting only those under-provisioned
+    # crowded programs: a 17 room duplex floor was given two hubs and failed
+    # door adjacency on a plot it used a third of. The public rooms chain
+    # through each other and site features sit outside, so exclude those.
+    from asset_library import is_outdoor_type
+    public_chain = {
+        "living_room", "living", "dining_room", "dining", "kitchen",
+        "open_kitchen", "family_lounge",
+    }
+    attached_count = sum(
+        1 for item, room_type in zip(specs, types)
+        if room_type not in CIRCULATION_TYPES
+        and room_type not in public_chain
+        and not item.get("is_outdoor")
+        and not is_outdoor_type(room_type)
+    )
     per_hub = max(2, int(os.getenv("ROOMS_PER_CIRCULATION_HUB", "6")))
-    needed = max(1, math.ceil(private_count / per_hub))
+    needed = max(1, math.ceil(max(private_count, attached_count) / per_hub))
     if existing >= needed:
         return specs
 
@@ -1032,9 +1100,20 @@ def fit_program_to_plot(
             return 0
         return 1  # explicit but non-essential; only shed as a last resort
 
+    # Which limit actually binds decides what to shed first. When the program
+    # is over its area budget, dropping the biggest room frees the most space
+    # and so sheds the fewest rooms overall. When the plot has room to spare and
+    # only the room count binds, every room costs the same one slot, and
+    # shedding by size means going straight for the gym and the dining room the
+    # user asked for while two small store rooms survive. Take the smallest
+    # first in that case: same slot freed, far less of the request lost.
+    area_binds = required_area(specs) > budget
     order = sorted(
         (i for i, item in enumerate(specs) if shed_rank(i, specs[i]) is not None),
-        key=lambda i: (shed_rank(i, specs[i]), -spec_min_area(specs[i])),
+        key=lambda i: (
+            shed_rank(i, specs[i]),
+            -spec_min_area(specs[i]) if area_binds else spec_min_area(specs[i]),
+        ),
     )
     dropped, kept_flags = [], [True] * len(specs)
     for index in order:
@@ -6398,6 +6477,74 @@ def _stream_generate_work_impl(req: "GenerateRequest", emit_fn: Callable) -> Non
                 if room_type and room_type not in _INTERNAL_OPEN_TYPES and room_type not in existing_outdoor:
                     outdoor_specs.append({"type": room_type, "name": room_type.replace("_", " "), "is_outdoor": True})
                     existing_outdoor.add(room_type)
+
+            # split_site_specs() recovers site features the model forgot to
+            # list, but only the no-floor-schedule path goes through it. A
+            # duplex or any prompt with an explicit floor program came through
+            # here instead, so "parking for two cars" was dropped whenever
+            # Gemini left it out of outdoor_rooms. Apply the same recovery.
+            for requested in requested_outdoor_specs(req.prompt):
+                room_type = canonical_type(requested.get("type"))
+                if room_type and room_type not in _INTERNAL_OPEN_TYPES and room_type not in existing_outdoor:
+                    logger.info("[SITE RECOVERY] Prompt asked for %s; the program had left it out.", room_type)
+                    outdoor_specs.append(dict(requested, is_outdoor=True))
+                    existing_outdoor.add(room_type)
+
+            # Same gap on the indoor side as the site features above: a room
+            # the prompt named outright could be missing from every floor of
+            # the program with nothing to put it back, so "a study room near
+            # the bedrooms" quietly produced a house with no study. Add it to
+            # the ground floor and let the normal fitting decide if it stays.
+            ground_specs = list(floor_specs_by_level.get(0) or [])
+            present = {canonical_type(spec.get("type"))
+                       for level_specs in floor_specs_by_level.values()
+                       for spec in level_specs}
+            recovered_any = False
+            for requested in requested_custom_specs(req.prompt):
+                room_type = canonical_type(requested.get("type"))
+                if not room_type or room_type in present:
+                    continue
+                logger.info("[ROOM RECOVERY] Prompt asked for %s; the program had left it out.", room_type)
+                ground_specs.append({
+                    "type": room_type, "name": room_type.replace("_", " ").title(),
+                    # The prompt named it, so it is an explicit user room; it
+                    # only reached here because the extraction lost it.
+                    "confidence": 100, "required": True, "provenance": "explicit_user",
+                })
+                present.add(room_type)
+                recovered_any = True
+
+            # A house with no bathroom anywhere is never right, and a brief
+            # that only names the rooms it cares about ("4BHK duplex with the
+            # kitchen in the southeast...") can produce exactly that. The
+            # repair in automatically_repair_program() rebuilds a room count,
+            # which this path does not use, so guarantee it here as well.
+            from intent_compiler import requested_bathroom_count
+            have_baths = sum(
+                1 for level_specs in floor_specs_by_level.values() for spec in level_specs
+                if any(token in canonical_type(spec.get("type")) for token in ("bath", "toilet", "washroom"))
+            )
+            # A stated count is a requirement; with none stated, a house still
+            # needs at least one. Only ever top up - trimming a surplus is
+            # handled in automatically_repair_program.
+            wanted = requested_bathroom_count(req.prompt) or (0 if have_baths else max(1, min(int(bhk_val or 1), 2)))
+            if wanted > have_baths:
+                logger.info(
+                    "[ROOM RECOVERY] Program has %d bathroom(s), the brief needs %d; adding %d",
+                    have_baths, wanted, wanted - have_baths,
+                )
+                for index in range(have_baths, wanted):
+                    ground_specs.append({
+                        "type": "bathroom", "name": "Bathroom" if not index else f"Bathroom {index + 1}",
+                        "confidence": 100, "required": True, "provenance": "building_requirement",
+                    })
+                recovered_any = True
+
+            if recovered_any:
+                floor_specs_by_level[0] = sort_spec_by_generation_order(auto_wire_topology(
+                    ground_specs, ai_categories=slm_result or {},
+                    bathroom_requirements=(slm_result or {}).get("bathroom_requirements"),
+                ))
 
             # --- AUTOMATIC VERTICAL ESCALATION FOR OVERSIZED GROUND FLOOR ---
             all_ground_rooms = floor_specs_by_level.get(0, [])

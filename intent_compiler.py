@@ -80,6 +80,26 @@ _COUNT_WORDS = {
 }
 
 
+def requested_bathroom_count(prompt: str) -> Optional[int]:
+    """Return the bathroom count the brief states outright, if it states one.
+
+    "three bathrooms" is a requirement. The extraction routinely came back with
+    fewer, and the only bathroom logic downstream trimmed a surplus, so a house
+    asked for with three could ship with one and nothing noticed.
+    """
+    text = re.sub(r"[^a-z0-9]+", " ", str(prompt or "").lower())
+    pattern = re.compile(
+        r"\b(a|an|one|two|three|four|five|six|seven|eight|nine|ten|\d+)\s+"
+        r"(?:(?:attached|common|shared|full|guest|master)\s+){0,2}"
+        r"(?:bath(?:room)?s?|toilets?|washrooms?)\b"
+    )
+    total = 0
+    for match in pattern.finditer(text):
+        token = match.group(1)
+        total += int(token) if token.isdigit() else _COUNT_WORDS.get(token, 1)
+    return total or None
+
+
 def requested_utility_count(prompt: str) -> Optional[int]:
     """Return an explicit utility count, preserving separately named functions."""
     text = re.sub(r"[^a-z0-9]+", " ", str(prompt or "").lower())
@@ -551,6 +571,74 @@ def reassign_bathroom_owner(
     return result
 
 
+
+# Compass words as they actually appear in a brief, longest first so that
+# "north east" is never read as a bare "north".
+_DIRECTION_ALIASES: List[tuple[str, str]] = [
+    ("north[ -]?east", "north_east"), ("north[ -]?west", "north_west"),
+    ("south[ -]?east", "south_east"), ("south[ -]?west", "south_west"),
+    ("northeastern", "north_east"), ("northwestern", "north_west"),
+    ("southeastern", "south_east"), ("southwestern", "south_west"),
+    ("northern", "north"), ("southern", "south"),
+    ("eastern", "east"), ("western", "west"),
+    ("north", "north"), ("south", "south"), ("east", "east"), ("west", "west"),
+]
+
+
+def recover_prompt_directions(
+    prompt: str, rooms: List[Dict[str, Any]], existing: Iterable[ArchitecturalConstraint]
+) -> List[ArchitecturalConstraint]:
+    """Read compass placements straight out of the brief.
+
+    A direction only ever reached the solver if the model happened to list it
+    in spatial_relations or vastu_specifics, and it does not always do so. The
+    same prompt could come back with "kitchen in the southeast" honoured on one
+    run and silently dropped on the next, which left the placement to chance.
+    The phrasing is regular, so read it directly and fill in what the
+    extraction missed. Only room types with exactly one instance are matched:
+    "the second bedroom" needs an ordinal decision this must not guess at.
+    """
+    text = re.sub(r"\s+", " ", str(prompt or "").lower())
+    if not text:
+        return []
+
+    already = {
+        str(c.source) for c in existing or []
+        if c.kind == ConstraintKind.DIRECTION
+    }
+    by_type_ids: Dict[str, List[str]] = {}
+    for index, room in enumerate(rooms):
+        room_type = _canonical(room.get("type") or room.get("room_type") or "room")
+        by_type_ids.setdefault(room_type, []).append(
+            str(room.get("id") or f"{room_type}-{index + 1}")
+        )
+
+    recovered: List[ArchitecturalConstraint] = []
+    for room_type, ids in by_type_ids.items():
+        if len(ids) != 1 or ids[0] in already or room_type in already:
+            continue
+        label = room_type.replace("_", " ").strip()
+        if not label or room_type in {"corridor", "hallway", "passage", "lobby"}:
+            continue
+        # "pooja room" is written both with and without the trailing noun.
+        head = re.escape(label)
+        if label.endswith(" room"):
+            head = f"{re.escape(label[:-5])}(?: room)?"
+        for pattern, value in _DIRECTION_ALIASES:
+            # "kitchen in the southeast", "master bedroom on the west side"
+            after = rf"\b{head}\b[^.,;]{{0,30}}?\b(?:in|on|at|to|towards?)\s+the\s+{pattern}\b"
+            # "southeast kitchen", "north west pooja room"
+            before = rf"\b{pattern}\b[ -]?(?:side\s+|facing\s+)?{head}\b"
+            if re.search(after, text) or re.search(before, text):
+                recovered.append(ArchitecturalConstraint(
+                    ConstraintKind.DIRECTION, ids[0], value=value,
+                    strength=ConstraintStrength.HARD, origin=ConstraintOrigin.USER,
+                    original_source_selector=label,
+                ))
+                break
+    return recovered
+
+
 def compile_intent(
     prompt: str,
     extraction: Optional[Dict[str, Any]],
@@ -613,6 +701,13 @@ def compile_intent(
                 strength=ConstraintStrength.HARD,
                 origin=ConstraintOrigin.USER,
             ))
+
+    for constraint in recover_prompt_directions(prompt, rooms, constraints):
+        logger.info(
+            "[DIRECTION RECOVERY] '%s' asked for %s in the prompt; the extraction had no such constraint.",
+            constraint.original_source_selector, constraint.value,
+        )
+        constraints.append(constraint)
 
     # Preserve explicit instance ownership for ensuites even when Gemini only
     # put the assignment on the room program.

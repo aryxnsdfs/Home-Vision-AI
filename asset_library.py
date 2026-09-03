@@ -81,13 +81,24 @@ def requested_outdoor_specs(prompt: str) -> List[Dict[str, Any]]:
 
 
 def requested_custom_specs(prompt: str) -> List[Dict[str, Any]]:
-    """Recognize high-value custom rooms before the generic matcher drops them."""
+    """Recognize high-value custom rooms before the generic matcher drops them.
+
+    Room names are open vocabulary and the extraction handles arbitrary ones.
+    This is only a safety net for the handful asked for constantly and
+    expensive to lose: "a study room near the bedrooms" came back with no
+    study often enough to be worth catching deterministically.
+    """
     text = (prompt or "").lower()
     found: List[Dict[str, Any]] = []
     patterns = (
         ("gym", r"\bgym\b|\bhome\s+gym\b|\bfitness\s+(?:room|center|centre)\b|\bworkout\s+room\b|\bexercise\s+room\b|\btraining\s+room\b"),
         ("wedding_hall", r"\bwedding\s+hall\b|\bbanquet\s+hall\b|\bmarriage\s+hall\b"),
         ("home_theater", r"\bhome\s+theat(?:er|re)\b|\bmedia\s+room\b|\bhome\s+cinema\b"),
+        ("study_room", r"\bstudy\s+room\b|\bstudy\b|\bhome\s+office\b"),
+        ("pooja_room", r"\bpooja\s*(?:room)?\b|\bpuja\s*(?:room)?\b|\bprayer\s+room\b|\bmandir\b"),
+        ("utility", r"\butility\s*(?:room|area)?\b|\blaundry\s*(?:room)?\b|\bwash\s+area\b"),
+        ("store_room", r"\bstore\s*room\b|\bstorage\s+room\b|\bpantry\b"),
+        ("library", r"\blibrary\b|\breading\s+room\b"),
     )
     for type_name, pattern in patterns:
         if re.search(pattern, text):

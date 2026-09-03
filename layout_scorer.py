@@ -173,16 +173,24 @@ def score_layout_objectives(
         objectives["plumbing_cost"] = sum(abs(x - cx) + abs(z - cz) for x, z in wet_centers)
 
     # Privacy uses the *actual* door graph, not intended connections.
+    # The graph can still name a room the program shed on a relaxation round,
+    # and indexing by_id blind on that killed the whole request with a
+    # KeyError. An id with no room behind it contributes no cost.
+    def room_type_of(room_id: str) -> str:
+        return str((by_id.get(room_id) or {}).get("type", ""))
+
     for room_id, neighbors in graph.items():
-        zone = room_zone(by_id[room_id].get("type", ""))
+        if room_id not in by_id:
+            continue
+        zone = room_zone(room_type_of(room_id))
         if zone == "private" and len(neighbors) > 1:
             objectives["privacy_cost"] += (len(neighbors) - 1) ** 2 * 12
         if room_id == entry:
-            objectives["privacy_cost"] += sum(room_zone(by_id[n].get("type", "")) == "private" for n in neighbors) * 20
-        if room_zone(by_id[room_id].get("type", "")) == "public":
-            objectives["zoning_cost"] += sum(room_zone(by_id[n].get("type", "")) == "private" for n in neighbors) * 4
-        if "dining" in str(by_id[room_id].get("type", "")).lower():
-            objectives["privacy_cost"] += sum(is_bathroom(by_id[n].get("type", "")) for n in neighbors) * 25
+            objectives["privacy_cost"] += sum(room_zone(room_type_of(n)) == "private" for n in neighbors) * 20
+        if zone == "public":
+            objectives["zoning_cost"] += sum(room_zone(room_type_of(n)) == "private" for n in neighbors) * 4
+        if "dining" in room_type_of(room_id).lower():
+            objectives["privacy_cost"] += sum(is_bathroom(room_type_of(n)) for n in neighbors) * 25
     # Compatibility alias for older UI telemetry. It is a soft score only;
     # hard violations are held separately on LayoutCandidate and never ranked.
     objectives["prompt_violation"] = objectives["user_preference_cost"]

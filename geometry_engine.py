@@ -341,7 +341,14 @@ class CPSolver:
         # constraints are promoted to CP-SAT feasibility rules.
         pub_count, srv_count, priv_count = 0, 0, 0
         hard_direction_count = 0
-        for rv in room_vars.values():
+        # Large enough to dominate compactness and circulation, small enough
+        # that CP-SAT still trades one pin away rather than failing outright.
+        DIRECTION_MISS_PENALTY = int(os.getenv("DIRECTION_MISS_PENALTY", "25000"))
+        # center_x2/center_z2 are twice a centre in quarter-foot units,
+        # so 8 is one foot clear of the midline.
+        DIRECTION_MARGIN = int(os.getenv("DIRECTION_MARGIN_CP", "8"))
+        direction_penalties = []
+        for r_id, rv in room_vars.items():
             rt = rv['type'].lower()
             if rt in {"foyer", "living_room", "dining_room", "living", "dining"}:
                 pub_count += 1
@@ -354,23 +361,38 @@ class CPSolver:
                 if str(constraint.get('strength', '')).lower() != 'hard':
                     continue
                 hard_direction_count += 1
-                # A compass pin confines a room's centre to one half of the
-                # plot. Combined with the door graph that can be infeasible on
-                # a busy program, and a house with the gym on the wrong side
-                # beats no house at all, so a recovery pass drops these.
-                if floor_data.get('relax_directional'):
-                    continue
                 direction = str(constraint.get('value', '')).lower().replace('-', '_')
                 center_x2 = 2 * rv['x'] + rv['w']
                 center_z2 = 2 * rv['z'] + rv['l']
-                if 'east' in direction:
-                    model.Add(center_x2 >= plot_w)
-                if 'west' in direction:
-                    model.Add(center_x2 <= plot_w)
-                if 'north' in direction:
-                    model.Add(center_z2 <= plot_l)
-                if 'south' in direction:
-                    model.Add(center_z2 >= plot_l)
+                # "Kitchen in the southeast" pins a room's centre to one half of
+                # the plot. Several of those at once, plus the door graph, is
+                # routinely infeasible, and a hard constraint then loses the
+                # request entirely: the recovery pass dropped every pin and
+                # placement fell back to luck. Reify each half-plane instead and
+                # price violating it far above the smooth layout objectives, so
+                # the solver honours the compass whenever it possibly can and
+                # breaks it only to keep the house buildable.
+                for axis, expr, limit in (
+                    ('east', center_x2, plot_w), ('west', center_x2, plot_w),
+                    ('north', center_z2, plot_l), ('south', center_z2, plot_l),
+                ):
+                    if axis not in direction:
+                        continue
+                    # One-sided on purpose: the solver may only claim the pin
+                    # is met when the half-plane really holds, and is free to
+                    # give it up and pay the penalty. Reifying both directions
+                    # doubles the constraints for no extra meaning and costs
+                    # enough search time to lose a marginal model to the
+                    # deadline. The margin aims a foot past the midline rather
+                    # than at it, because a room centred exactly on the line
+                    # sits in both halves, and the proportional expansion that
+                    # fills the plot afterwards can nudge it into the wrong one.
+                    placed = model.NewBoolVar(f'dir_{r_id}_{axis}_{hard_direction_count}')
+                    if axis in ('east', 'south'):
+                        model.Add(expr >= limit + DIRECTION_MARGIN).OnlyEnforceIf(placed)
+                    else:
+                        model.Add(expr <= limit - DIRECTION_MARGIN).OnlyEnforceIf(placed)
+                    direction_penalties.append(placed.Not() * DIRECTION_MISS_PENALTY)
 
         logger.info(f"[ZONE] Public rooms={pub_count} | Service rooms={srv_count} | Private rooms={priv_count} (soft defaults)")
         floor_data['_hard_direction_count'] = hard_direction_count
@@ -533,6 +555,7 @@ class CPSolver:
         # PHASE 5 — Soft Objectives
         # ────────────────────────────────────────────
         obj_terms = []
+        obj_terms.extend(direction_penalties)
 
         # Plot coverage is intentionally NOT solved by inflating individual
         # room variables. A single oversized bathroom/service room can satisfy
@@ -645,9 +668,22 @@ class CPSolver:
                 direction = str(constraint.get('value', '')).lower().replace('-', '_')
                 strength = str(constraint.get('strength', 'preference')).lower()
                 origin = str(constraint.get('origin', 'architectural_default')).lower()
-                base_weight = {'hard': 80, 'strong': 25, 'preference': 8}.get(strength, 8)
+                # These weights multiply a coordinate, so they are far larger
+                # than they look: at the old 80 for a hard pin, tripled for a
+                # user request, one compass term reached ~77,000 while the
+                # whole compactness objective is worth a few thousand. Four
+                # pinned rooms then decided the plan on their own, each bulldozed
+                # into its own corner, and the house sprawled. A hard pin is
+                # priced discretely above instead, on whether the room is in
+                # the right half at all. This term stays because the discrete
+                # penalty alone gives the search no gradient: within a four
+                # second budget CP-SAT stops proving optimality, and an
+                # incumbent found without any pull toward the compass simply
+                # never flips those booleans. The pull finds the neighbourhood,
+                # the penalty decides the half.
+                base_weight = {'hard': 25, 'strong': 12, 'preference': 5}.get(strength, 5)
                 if origin == 'user':
-                    base_weight *= 3
+                    base_weight *= 2
                 if 'east' in direction:
                     obj_terms.append(base_weight * (plot_w * 2 - cx))
                 if 'west' in direction:
@@ -691,8 +727,16 @@ class CPSolver:
         # Recovery asks only for the first valid complete plan. Optimizing all
         # pairwise walking distances can consume the whole deadline without
         # ever publishing a feasible incumbent on dense programs.
+        # Dropping the objective entirely, though, also dropped the compass:
+        # a recovery pass placed "kitchen in the southeast" wherever it landed,
+        # which is how a busy program could come back with all three pinned
+        # rooms in the wrong quadrant. Keep just the direction terms - they are
+        # a handful of booleans, nothing like the pairwise distance matrix -
+        # so a recovered plan still answers what was actually asked for.
         if not floor_data.get('relaxed_recovery'):
             model.Minimize(sum(obj_terms))
+        elif direction_penalties:
+            model.Minimize(sum(direction_penalties))
 
         # ────────────────────────────────────────────
         # PHASE 6 — Solve
@@ -775,26 +819,11 @@ class CPSolver:
             logger.info(f"CP Solver did not return a solution (status {status}, attempt {attempt}).")
             floor_data['validation'] = {'passed': False, 'errors': ['Solver infeasible']}
             
-            # First recovery: keep every room, drop the compass pins. These are
-            # placement preferences, not access rules, and they were turning
-            # solvable programs infeasible on plots less than half full.
-            if (
-                'resolved_rooms' not in floor_data
-                and floor_data.get('_hard_direction_count')
-                and not floor_data.get('relax_directional')
-            ):
-                logger.info(
-                    "[RELAXATION] Dropping %d hard directional constraint(s) and retrying...",
-                    floor_data['_hard_direction_count'],
-                )
-                floor_data_free = dict(floor_data)
-                floor_data_free['relax_directional'] = True
-                try:
-                    result = self._solve_single_topology(floor_data_free, attempt, topology_type)
-                    if 'resolved_rooms' in result:
-                        return result
-                except Exception:  # noqa: BLE001 - fall through to the next recovery
-                    pass
+            # Compass pins used to be encoded as hard half-planes and a recovery
+            # pass dropped all of them the moment a solve came back infeasible,
+            # so "kitchen in the southeast" was decided by luck. They are priced
+            # soft constraints now: they can never cause infeasibility, so there
+            # is nothing left here to relax.
 
             # Relaxation pass for slab-constrained upper floors or complex programs
             if 'resolved_rooms' not in floor_data and attempt < 2:
