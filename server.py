@@ -5812,6 +5812,16 @@ def _stream_generate_work_impl(req: "GenerateRequest", emit_fn: Callable) -> Non
             except Exception as slm_e:
                 logger.error("SLM Extraction Failed: %s", slm_e)
                 slm_result = None
+                # Falling through to the keyword parser here hid the real
+                # problem. It cannot honour a brief - it read "4BHK duplex with
+                # a pooja room in the northeast" as a single bedroom - so the
+                # user was told "BHK mismatch: requested 4, generated 1" when
+                # what had actually happened was that every model key was out
+                # of quota. Say so instead.
+                raise RuntimeError(
+                    "The design model is unavailable right now, so the brief could not be "
+                    f"read. Please try again in a few minutes. ({str(slm_e)[:160]})"
+                ) from slm_e
 
         warnings: List[str] = []
 
