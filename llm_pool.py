@@ -170,6 +170,16 @@ def gemini_keys() -> List[str]:
     return keys
 
 
+def groq_keys() -> List[str]:
+    """Groq's free tier allows 1000 requests a day against Gemini's 20, so it is
+    the difference between a site that works and one that does not."""
+    raw = ",".join(filter(None, (
+        os.getenv("GROQ_API_KEYS", ""),
+        os.getenv("GROQ_API_KEY", ""),
+    )))
+    return _split_keys(raw)
+
+
 def openai_keys() -> List[str]:
     raw = " ".join(filter(None, (
         os.getenv("OPENAI_API_KEYS", ""),
@@ -184,7 +194,7 @@ def openai_keys() -> List[str]:
 
 
 def has_llm_credentials() -> bool:
-    return bool(gemini_keys() or openai_keys())
+    return bool(gemini_keys() or groq_keys() or openai_keys())
 
 
 def _mask(key: str) -> str:
@@ -283,6 +293,91 @@ def _call_gemini(
     return _parse_json(response.text)
 
 
+# Groq publishes requests-per-day and tokens-per-minute per *model*, so a model
+# that is rate limited does not mean the account is. 120b first because it is
+# the only one that reliably satisfies the big program schema; the smaller two
+# are there to carry the lighter calls when it is busy.
+DEFAULT_GROQ_MODEL = os.getenv("GROQ_MODEL", "openai/gpt-oss-120b")
+GROQ_MODEL_CHAIN = _split_keys(
+    os.getenv("GROQ_MODELS", "openai/gpt-oss-120b,qwen/qwen3.8-27b,openai/gpt-oss-20b")
+)
+
+
+def _groq_strict_schema(schema: Dict[str, Any]) -> Dict[str, Any]:
+    """Rewrite a Pydantic JSON schema into the form Groq's strict mode accepts.
+
+    Strict mode gives 100% schema adherence, which is what makes Groq a real
+    substitute here rather than a downgrade to hoping for valid JSON. It asks
+    for every property to be listed as required and every object to forbid
+    additional properties; a field that was genuinely optional keeps its
+    optionality by becoming a union with null rather than by being left out.
+    """
+    def walk(node: Any) -> Any:
+        if isinstance(node, list):
+            return [walk(item) for item in node]
+        if not isinstance(node, dict):
+            return node
+
+        out = {key: walk(value) for key, value in node.items()}
+        if out.get("type") == "object" or "properties" in out:
+            props = out.get("properties") or {}
+            optional = [name for name in props if name not in set(out.get("required") or [])]
+            for name in optional:
+                current = props[name]
+                # Already nullable or a union: leave it be.
+                if isinstance(current, dict) and "anyOf" in current:
+                    continue
+                props[name] = {"anyOf": [current, {"type": "null"}]}
+            out["properties"] = props
+            out["required"] = list(props.keys())
+            out["additionalProperties"] = False
+        return out
+
+    return walk(copy.deepcopy(schema))
+
+
+def _call_groq(
+    key: str,
+    model: str,
+    contents: str,
+    system_instruction: str,
+    response_schema: Optional[Type],
+    temperature: float,
+    timeout_s: float,
+) -> Dict[str, Any]:
+    import requests
+
+    payload: Dict[str, Any] = {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": system_instruction or "You are a precise JSON generator."},
+            {"role": "user", "content": contents},
+        ],
+        "temperature": temperature,
+    }
+    if response_schema is not None and hasattr(response_schema, "model_json_schema"):
+        payload["response_format"] = {
+            "type": "json_schema",
+            "json_schema": {
+                "name": getattr(response_schema, "__name__", "response"),
+                "strict": True,
+                "schema": _groq_strict_schema(response_schema.model_json_schema()),
+            },
+        }
+    else:
+        payload["response_format"] = {"type": "json_object"}
+
+    resp = requests.post(
+        "https://api.groq.com/openai/v1/chat/completions",
+        headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
+        json=payload,
+        timeout=timeout_s,
+    )
+    if resp.status_code >= 400:
+        raise RuntimeError(f"Groq {resp.status_code}: {resp.text[:300]}")
+    return _parse_json(resp.json()["choices"][0]["message"]["content"])
+
+
 def _call_openai(
     key: str,
     model: str,
@@ -374,6 +469,33 @@ def generate_json(
                     time.sleep(min(4.0, 0.6 * (2 ** attempt)) + random.uniform(0, 0.3))
                 else:
                     _cooldown(key)
+
+    groq_pool = _rotated(_live_keys(groq_keys()))
+    if groq_pool:
+        logger.info("[LLM POOL] %s falling back to Groq", stage)
+    for key in groq_pool:
+        served = False
+        for model in (GROQ_MODEL_CHAIN or [DEFAULT_GROQ_MODEL]):
+            try:
+                result = _call_groq(
+                    key, model, contents, system_instruction,
+                    response_schema, temperature, timeout_ms / 1000.0,
+                )
+                logger.info("[LLM POOL] %s served by Groq (%s)", stage, model)
+                _cache_put(cache_key, result)
+                return result
+            except Exception as exc:  # noqa: BLE001 - provider errors are opaque
+                kind = _classify(exc)
+                errors.append(f"groq/{model}/{_mask(key)}: {exc}")
+                logger.warning("[LLM POOL] %s Groq %s on key %s failed (%s): %s",
+                               stage, model, _mask(key), kind, str(exc)[:160])
+                if kind == "key_fatal":
+                    # An exhausted or invalid key is exhausted for every model.
+                    _cooldown(key)
+                    served = True
+                    break
+        if served:
+            continue
 
     for key in _rotated(_live_keys(openai_keys())):
         try:
