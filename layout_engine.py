@@ -361,6 +361,17 @@ def compute_shared_walls(rooms: List[RoomNode]) -> List[Dict]:
     return frontend_walls
 
 
+def _depths(limit: float, step: float = 0.5, floor: float = 1.0) -> List[float]:
+    """Growth depths to try, deepest first, down to a depth worth having."""
+    if limit < floor:
+        return []
+    depths, current = [], float(limit)
+    while current >= floor:
+        depths.append(round(current, 2))
+        current -= step
+    return depths
+
+
 def rects_overlap(first: "Rect", second: "Rect", tolerance: float = 0.05) -> bool:
     """Do two rectangles share interior area?
 
@@ -1218,7 +1229,18 @@ class LayoutEngine:
             main.extend(group)
             logger.info("[GEOMETRY] Joined room component with rigid translation dx=%.2f dz=%.2f", dx, dz)
 
-    def _absorb_enclosed_pockets(self, nodes: List[RoomNode], min_pocket_sqft: float = 12.0) -> None:
+    def _absorb_enclosed_pockets(self, nodes: List[RoomNode], min_pocket_sqft: float = 12.0,
+                                 passes: int = 3) -> None:
+        """Run the single-pass absorber until it stops making progress.
+
+        One pass can only take the deepest slice that fits, so an irregular
+        pocket needs a few rounds to be eaten completely.
+        """
+        for _ in range(max(1, passes)):
+            if not self._absorb_pockets_once(nodes, min_pocket_sqft):
+                break
+
+    def _absorb_pockets_once(self, nodes: List[RoomNode], min_pocket_sqft: float) -> bool:
         """Grow a neighbour into any dead space the plan has walled in.
 
         CP-SAT is free to leave gaps between rooms - non-overlap is a hard rule,
@@ -1237,7 +1259,8 @@ class LayoutEngine:
             if not getattr(node, "is_outdoor", False) and node.roof_type != "open"
         ]
         if len(indoor) < 3:
-            return
+            return False
+        absorbed = False
 
         min_x = min(n.rect.x for n in indoor)
         min_z = min(n.rect.z for n in indoor)
@@ -1246,7 +1269,7 @@ class LayoutEngine:
         cols = int(math.ceil(max_x - min_x))
         rows = int(math.ceil(max_z - min_z))
         if cols < 3 or rows < 3:
-            return
+            return False
 
         # A cell counts as occupied when its centre falls inside a room, so two
         # flush rooms never leave a phantom seam between them.
@@ -1307,32 +1330,44 @@ class LayoutEngine:
             gz1 = min_z + max(z for _, z in group) + 1
             pocket = Rect(gx0, gz0, gx1 - gx0, gz1 - gz0)
 
-            best, best_frontage, best_rect = None, 0.0, None
+            # A pocket is rarely a neat rectangle. Growing a room over its whole
+            # bounding box therefore usually overlaps something and gets
+            # rejected, leaving the void in place, so take the deepest extension
+            # that actually fits and let the outer pass come back for the rest.
+            best, best_gain, best_rect = None, 0.0, None
             for node in indoor:
                 r = node.rect
-                grown = None
+                spans = []
                 if abs((r.x + r.width) - pocket.x) < 1.01:            # pocket to the east
-                    grown = Rect(r.x, r.z, (pocket.x + pocket.width) - r.x, r.length)
+                    limit = (pocket.x + pocket.width) - (r.x + r.width)
+                    spans = [(d, Rect(r.x, r.z, r.width + d, r.length)) for d in _depths(limit)]
                 elif abs(r.x - (pocket.x + pocket.width)) < 1.01:     # pocket to the west
-                    grown = Rect(pocket.x, r.z, (r.x + r.width) - pocket.x, r.length)
+                    limit = r.x - pocket.x
+                    spans = [(d, Rect(r.x - d, r.z, r.width + d, r.length)) for d in _depths(limit)]
                 elif abs((r.z + r.length) - pocket.z) < 1.01:         # pocket to the south
-                    grown = Rect(r.x, r.z, r.width, (pocket.z + pocket.length) - r.z)
+                    limit = (pocket.z + pocket.length) - (r.z + r.length)
+                    spans = [(d, Rect(r.x, r.z, r.width, r.length + d)) for d in _depths(limit)]
                 elif abs(r.z - (pocket.z + pocket.length)) < 1.01:    # pocket to the north
-                    grown = Rect(r.x, pocket.z, r.width, (r.z + r.length) - pocket.z)
-                if grown is None:
-                    continue
-                if any(rects_overlap(grown, other.rect) for other in nodes if other is not node):
-                    continue
-                frontage = min(r.width, pocket.width) if grown.length != r.length else min(r.length, pocket.length)
-                if frontage > best_frontage:
-                    best, best_frontage, best_rect = node, frontage, grown
+                    limit = r.z - pocket.z
+                    spans = [(d, Rect(r.x, r.z - d, r.width, r.length + d)) for d in _depths(limit)]
+
+                for depth, grown in spans:
+                    if any(rects_overlap(grown, other.rect) for other in nodes if other is not node):
+                        continue
+                    gain = depth * (r.width if grown.length != r.length else r.length)
+                    if gain > best_gain:
+                        best, best_gain, best_rect = node, gain, grown
+                    break  # _depths is deepest-first, so the first fit is the best
 
             if best is not None and best_rect is not None:
                 logger.info(
                     "  [VOID] Absorbing %.0f sq ft of enclosed dead space into '%s'.",
-                    pocket.width * pocket.length, best.name,
+                    best_gain, best.name,
                 )
                 best.rect = best_rect
+                absorbed = True
+
+        return absorbed
 
     def _close_nearby_wall_seams(self, nodes: List[RoomNode]) -> None:
         """Snap near-coincident room edges together so wall meshes cannot slit."""

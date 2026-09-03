@@ -6640,12 +6640,46 @@ def _stream_generate_work_impl(req: "GenerateRequest", emit_fn: Callable) -> Non
         # Freeze what was accepted before floor assembly, duplex splitting,
         # shedding or pruning get a chance to lose any of it.
         accepted_contract = program_contract(room_pool, req.prompt, bhk_val)
-        room_pool, structural_features = strip_structural(room_pool)
+        room_pool, _structural_features = strip_structural(room_pool)
         floor_program = layout_params.get("floor_program") or {}
         has_explicit_schedule = bool(floor_program)
         floor_specs_by_level: Dict[int, List[Dict]] = {}
+
+        # Site features and a basement come out of the room list the same way
+        # whether or not the model supplied a floor schedule. Only the schedule
+        # itself differed, and that used to be a whole second implementation:
+        # the no-schedule path never got per-floor wiring, the courtyard and
+        # suite relationships, vertical escalation, the floor balancer or the
+        # structural padder, and a fix written in one branch silently missed the
+        # other. Derive the missing schedule instead, and run one assembly.
+        indoor_pool, site_outdoor, basement_specs = split_site_specs(list(room_pool), req.prompt)
+        outdoor_specs: List[Dict] = []
+        first_spec: List[Dict] = []
+        # "Floor membership is already decided", which is true both when the
+        # model supplies a schedule and when one is derived below.
+        schedule_settled = has_explicit_schedule
+
+        if not floor_program:
+            # No level information, so every open-air room is a site feature;
+            # a schedule that names one keeps it as a room on its own level.
+            room_pool = indoor_pool
+            outdoor_specs = site_outdoor
+            if floors > 1:
+                ground_seed, first_seed = split_duplex_specs(room_pool, bhk_val)
+                floor_program = {0: list(ground_seed), 1: list(first_seed)}
+            else:
+                floor_program = {0: list(room_pool)}
+            # split_duplex_specs has already decided floor membership, so the
+            # balancer and the escalation split must not run over the top of it
+            # and re-split what is already split - that put a master bedroom on
+            # both storeys at once.
+            schedule_settled = True
+            logger.info(
+                "[PROGRAM] No floor schedule from the model; derived one for %d floor(s).",
+                len(floor_program),
+            )
+
         if floor_program:
-            outdoor_specs, basement_specs = [], []
             floor_outdoor_types: set[str] = set()
             ai_outdoor_types = {canonical_type(value) for value in (slm_result or {}).get("outdoor_rooms", []) or []}
             for level, specs in floor_program.items():
@@ -6710,12 +6744,19 @@ def _stream_generate_work_impl(req: "GenerateRequest", emit_fn: Callable) -> Non
             if floors > 1 and (f0_min_area > buildable_plot_area or len(floor_specs_by_level.get(1, [])) == 0):
                 ground_spec, first_spec = split_duplex_specs(all_ground_rooms, bhk_val)
                 floor_specs_by_level[0] = sort_spec_by_generation_order(ground_spec)
-                floor_specs_by_level[1] = sort_spec_by_generation_order(first_spec)
+                # Merge rather than assign: an upper floor that already has
+                # rooms would otherwise lose them, and the rooms this split
+                # sends up would join a storey that still lists them below.
+                existing_upper = [
+                    spec for spec in floor_specs_by_level.get(1, [])
+                    if spec not in first_spec
+                ]
+                floor_specs_by_level[1] = sort_spec_by_generation_order(existing_upper + list(first_spec))
                 logger.info(f"[VERTICAL ESCALATION] Split oversized ground floor ({f0_min_area:.0f} sq ft) into Duplex: {len(floor_specs_by_level[0])} ground rooms, {len(floor_specs_by_level[1])} upper rooms.")
 
             # --- ABSOLUTE FAIL-SAFE: PYTHON FLOOR BALANCER ---
             # Skip overriding if Gemini/SLM or the user provided an explicit floor schedule
-            if floors > 1 and len(floor_specs_by_level.get(1, [])) > 0 and not has_explicit_schedule:
+            if floors > 1 and len(floor_specs_by_level.get(1, [])) > 0 and not schedule_settled:
                 from layout_engine import get_min_area
                 
                 f0_area = sum(spec_min_area(r) for r in floor_specs_by_level.get(0, []))
@@ -6766,26 +6807,11 @@ def _stream_generate_work_impl(req: "GenerateRequest", emit_fn: Callable) -> Non
 
             floor_0_rooms = floor_specs_by_level.get(0, [])
             first_spec = floor_specs_by_level.get(1, [])
-            room_pool = [spec for specs in floor_specs_by_level.values() for spec in specs]
-        else:
-            room_pool, outdoor_specs, basement_specs = split_site_specs(room_pool, req.prompt)
-            first_spec: List[Dict] = []
-            if floors > 1:
-                ground_spec, first_spec = split_duplex_specs(room_pool, bhk_val)
-                floor_0_rooms = sort_spec_by_generation_order(ground_spec)
-            else:
-                floor_0_rooms = sort_spec_by_generation_order(room_pool)
 
-            # Distribute private space circulation if room count > 4 and no corridor exists
-            has_corridor = any(canonical_type(r.get("type")) in {"corridor", "hallway", "lobby", "passage"} for r in floor_0_rooms)
-            if len(floor_0_rooms) > 4 and not has_corridor:
-                floor_0_rooms.append({
-                    "type": "corridor",
-                    "id": "corridor-core",
-                    "name": "Corridor",
-                    "connections": []
-                })
-                logger.info("[PIPELINE] Injected corridor-core to distribute private space circulation.")
+        # The ad-hoc corridor this path used to append here is gone:
+        # ensure_circulation runs a few lines below, counts the program properly
+        # and provisions as many hubs as it needs, so the hand-rolled one only
+        # ever risked a duplicate.
 
         # ── PROGRAM CONTRACT ──────────────────────────────────────────────
         # Both branches above assemble a program their own way, which is why a
