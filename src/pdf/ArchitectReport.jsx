@@ -637,6 +637,23 @@ const PLUMBING_LEGEND = [
   { color: "#0891b2", border: true, label: "Tank / Source" },
 ];
 
+// project.rooms mirrors only the floor currently on screen, so a duplex
+// exported while viewing the ground floor produced a blank FIRST FLOOR PLAN.
+// Gather every floor's rooms so the drawing always matches the built house.
+const allProjectRooms = (project) => {
+  const floors = Array.isArray(project?.floors) ? project.floors : null;
+  if (floors && floors.length) {
+    const collected = [];
+    floors.forEach((f, level) => {
+      (f?.rooms || []).forEach((r) => {
+        collected.push(level > 0 && r.isFloor1 === undefined ? { ...r, isFloor1: true } : r);
+      });
+    });
+    if (collected.length) return collected;
+  }
+  return project?.rooms || [];
+};
+
 const combinedBounds = (rooms) => {
   let minX = Infinity, minZ = Infinity, maxX = -Infinity, maxZ = -Infinity;
   rooms.forEach(r => {
@@ -651,7 +668,7 @@ const combinedBounds = (rooms) => {
 };
 
 function VectorBlueprint({ project, mode = "architectural" }) {
-  const rooms = project.rooms || [];
+  const rooms = allProjectRooms(project);
   const floor0 = rooms.filter(r => !r.isFloor1);
   const floor1 = rooms.filter(r => r.isFloor1);
 
@@ -692,7 +709,7 @@ export default function ArchitectReport({ project, snapshot }) {
     side: sanitizeImageSrc(rawShots.side)
   };
   
-  const rooms = project.rooms || [];
+  const rooms = allProjectRooms(project);
   const floor1 = rooms.filter(r => r.isFloor1);
   const actualFloors = floor1.length > 0 ? "GROUND + 1" : "GROUND ONLY";
 

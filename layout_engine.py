@@ -291,9 +291,21 @@ def compute_shared_walls(rooms: List[RoomNode]) -> List[Dict]:
     
     walls_raw = generate_walls_from_aabbs(rooms)
     frontend_walls = []
-    
+
+    # Site elements (verandah pad, garden, parking, pool) still take part in
+    # adjacency and door realization, but they are not masonry: drawing their
+    # boundary produced walls standing away from the building.
+    open_air_ids = {
+        r.id for r in rooms
+        if getattr(r, "is_outdoor", False)
+        or str(getattr(r, "roof_type", "flat")).lower() == "open"
+    }
+
     for w in walls_raw:
         if w.get("suppressed"):
+            continue
+        wall_rooms = set(w.get("room_ids") or [])
+        if wall_rooms and wall_rooms <= open_air_ids:
             continue
             
         x1, z1 = w["x1"], w["z1"]
@@ -809,10 +821,10 @@ def generate_walls_from_aabbs(rooms: List[RoomNode]) -> List[Dict]:
     exterior and interior shared boundaries without infinite extensions.
     """
     walls: List[Dict] = []
-    
+
     v_segments = []
     h_segments = []
-    
+
     for r in rooms:
         rx, rz, rw, rl = r.rect.x, r.rect.z, r.rect.width, r.rect.length
         # Vertical
@@ -2499,6 +2511,32 @@ class AdjacencyResolver:
 # Window Generation
 # ---------------------------------------------------------------------------
 
+def fit_opening_on_segment(wall, room, is_vertical, desired_width, margin=0.35, min_width=1.5):
+    """Return (centre, width) for an opening that fits this wall segment.
+
+    Openings were centred on the midpoint of their wall *segment*. A short
+    segment beside a corner puts that midpoint at the room's edge, so a 4 ft
+    door or window centred there hung a couple of feet out past the building.
+    Fit the opening inside both the segment and the room face, shrinking it if
+    need be, and return None when nothing usable fits.
+    """
+    if is_vertical:
+        lo_raw, hi_raw = sorted((wall["z1"] - room.rect.z, wall["z2"] - room.rect.z))
+        face_span = room.rect.length
+    else:
+        lo_raw, hi_raw = sorted((wall["x1"] - room.rect.x, wall["x2"] - room.rect.x))
+        face_span = room.rect.width
+    lo, hi = max(lo_raw, 0.0), min(hi_raw, face_span)
+    usable = hi - lo
+    width = desired_width
+    if usable < width + 2 * margin:
+        width = min(width, max(0.0, usable - 2 * margin))
+    if width < min_width:
+        return None
+    centre = min(max((lo + hi) / 2.0, lo + width / 2 + margin), hi - width / 2 - margin)
+    return centre, width
+
+
 class WindowPlacer:
     def __init__(self, rooms: List[RoomNode], plot_width: float, plot_length: float,
                  setback_x: float = 0.0, setback_z: float = 0.0):
@@ -2538,8 +2576,13 @@ class WindowPlacer:
                 
                 if is_designated_entrance and not main_door_added:
                     if face == designated_face:
+                        fitted = fit_opening_on_segment(w, r, is_vert, 4.0, min_width=2.5)
+                        if fitted is None:
+                            continue
+                        centre, door_width = fitted
+                        d_x, d_z = (rel_x, centre) if is_vert else (centre, rel_z)
                         r.doors.append(Door(
-                            x=rel_x, z=rel_z, width=4.0, height=7.0, is_main=True, wall_orientation=face,
+                            x=d_x, z=d_z, width=door_width, height=7.0, is_main=True, wall_orientation=face,
                             source="outside", target="foyer", wall_type="exterior", opens_inward=True
                         ))
                         main_door_added = True
@@ -2556,8 +2599,14 @@ class WindowPlacer:
                         cz = (w["z1"] + w["z2"]) / 2.0
                         is_vert = w["orientation"] == "vertical"
                         face = "west" if is_vert and (cx - r.rect.x) < r.rect.width / 2.0 else "east" if is_vert else "north" if (cz - r.rect.z) < r.rect.length / 2.0 else "south"
+                        fitted = fit_opening_on_segment(w, r, is_vert, 4.0, min_width=2.5)
+                        if fitted is None:
+                            continue
+                        centre, door_width = fitted
+                        d_x = (cx - r.rect.x) if is_vert else centre
+                        d_z = centre if is_vert else (cz - r.rect.z)
                         r.doors.append(Door(
-                            x=cx - r.rect.x, z=cz - r.rect.z, width=4.0, height=7.0, is_main=True, wall_orientation=face,
+                            x=d_x, z=d_z, width=door_width, height=7.0, is_main=True, wall_orientation=face,
                             source="outside", target="foyer", wall_type="exterior", opens_inward=True
                         ))
                         main_door_added = True
@@ -2599,13 +2648,28 @@ class WindowPlacer:
                 if r.type not in ["corridor", "hallway", "balcony", "parking", "veranda"]:
                     win_width = 2.0 if ("bath" in r.type or "toilet" in r.type) else 4.0
                     is_vent = ("bath" in r.type or "toilet" in r.type)
-                    
+
                     h = 2.0 if is_vent else 4.0
                     sill = 5.0 if is_vent else 3.0
-                    
+
+                    # The centre above is the midpoint of this wall *segment*,
+                    # which for a short segment by a corner sits at the room's
+                    # edge — a 4 ft window centred there hung ~2 ft out past
+                    # the building. Fit the opening inside the segment it
+                    # belongs to, and inside the room face, or skip it.
+                    fitted = fit_opening_on_segment(w, r, is_vert, win_width)
+                    if fitted is None:
+                        logger.info("    Skipped window on '%s' (%s wall segment too short)", r.name, face)
+                        continue
+                    centre, win_width = fitted
+                    if is_vert:
+                        rel_z = centre
+                    else:
+                        rel_x = centre
+
                     # Prevent clipping by ensuring we don't place a window precisely where the main door was just placed
                     has_door_here = any(d for d in getattr(r, 'doors', []) if d.wall_orientation == face and abs(d.x - rel_x) < 2.0 and abs(d.z - rel_z) < 2.0)
-                    
+
                     if not has_door_here:
                         r.windows.append(Window(x=rel_x, z=rel_z, width=win_width, height=h, sill_height=sill, wall_orientation=face))
                         logger.info(f"    Placed {'ventilator' if is_vent else 'window'} on '{r.name}'")

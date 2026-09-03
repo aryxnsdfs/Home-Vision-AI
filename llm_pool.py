@@ -17,6 +17,7 @@ This module centralises those calls so a stage gets:
 
 from __future__ import annotations
 
+import contextvars
 import copy
 import itertools
 import json
@@ -50,6 +51,11 @@ _KEY_FATAL_PATTERNS = (
     "api key not valid", "api_key_invalid", "invalid api key", "permission denied",
     "unauthorized", "401", "403", "expired", "suspended", "billing",
 )
+
+# A retry after a failed generation must actually re-ask the model. Serving
+# it the cached answer that just failed makes the retry pointless — the
+# relaxation pass sets this for rounds after the first.
+BYPASS_CACHE: contextvars.ContextVar = contextvars.ContextVar("llm_bypass_cache", default=False)
 
 _lock = threading.Lock()
 _cache: "OrderedDict[tuple, tuple]" = OrderedDict()
@@ -284,7 +290,7 @@ def generate_json(
     # prompts benefit too.
     schema_name = getattr(response_schema, "__name__", "") if response_schema else ""
     cache_key = (model, stage, schema_name, system_instruction, contents, round(temperature, 3))
-    cached = _cache_get(cache_key)
+    cached = None if BYPASS_CACHE.get() else _cache_get(cache_key)
     if cached is not None:
         logger.info("[LLM POOL] %s served from cache", stage)
         return copy.deepcopy(cached)

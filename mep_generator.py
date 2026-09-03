@@ -247,8 +247,12 @@ def generate_wiring(layout: Dict[str, Any], options: Dict[str, Any]) -> Dict[str
         
         if doors:
             d = doors[0]
-            door_x_abs = d["x"]
-            door_z_abs = d["z"]
+            # Door coordinates are stored room-local (Room.jsx renders them
+            # inside the room's own transform). Reading them as absolute put
+            # the switchboard at local - room origin once the renderer
+            # converted it back, throwing the wiring outside the house.
+            door_x_abs = rx + d["x"]
+            door_z_abs = rz_val + d["z"]
             if d["wall_orientation"] in ["north", "south"]:
                 sb_x = door_x_abs + d["width"] + 0.3
                 if sb_x > rx + rw: sb_x = door_x_abs - 0.3
@@ -258,6 +262,11 @@ def generate_wiring(layout: Dict[str, Any], options: Dict[str, Any]) -> Dict[str
                 if sb_z > rz_val + rl: sb_z = door_z_abs - 0.3
                 sb_x = door_x_abs
         
+        # Whatever the door geometry suggested, the board belongs on this
+        # room's wall — never past its corner.
+        sb_x = min(max(sb_x, rx + 0.3), rx + rw - 0.3)
+        sb_z = min(max(sb_z, rz_val + 0.3), rz_val + rl - 0.3)
+
         sb_name = f"SB-{(r.get('type', 'room')[:3]).upper()}"
         switchboard = {"type": "switchboard", "label": sb_name, "x": round(sb_x, 2), "z": round(sb_z, 2), "y": 1.2, "is_wiring": True, "circuit": "sub_main"}
         r["mep_nodes"].append(switchboard)

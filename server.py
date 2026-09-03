@@ -5555,6 +5555,10 @@ def _stream_generate_work(req: "GenerateRequest", emit_fn: Callable) -> None:
             emit_fn(msg)
 
         token = _FIT_SLACK.set(slack)
+        # After a failed round, re-ask the model rather than replaying the
+        # cached answer that just produced an unusable program.
+        import llm_pool as _llm_pool
+        bypass_token = _llm_pool.BYPASS_CACHE.set(index > 0)
         try:
             result = _stream_generate_work_impl(req, guarded_emit)
         except Exception as exc:  # noqa: BLE001 - retried or re-raised below
@@ -5564,6 +5568,7 @@ def _stream_generate_work(req: "GenerateRequest", emit_fn: Callable) -> None:
             result = None
         finally:
             _FIT_SLACK.reset(token)
+            _llm_pool.BYPASS_CACHE.reset(bypass_token)
 
         if final_round or state["error"] is None:
             return result
@@ -6165,6 +6170,24 @@ def _stream_generate_work_impl(req: "GenerateRequest", emit_fn: Callable) -> Non
 
         base_rooms: List[Dict] = []
         explicit_program = layout_params.get("floor_program") or {}
+        # A degraded extraction (the model 503s, or answers with a BHK but no
+        # rooms) leaves a floor schedule that is present but empty or has no
+        # bedrooms at all. Trusting it produced a house with zero bedrooms and
+        # a failed semantic gate; fall back to the BHK program instead.
+        if explicit_program:
+            scheduled = [spec for level in explicit_program for spec in (explicit_program[level] or [])]
+            scheduled_beds = sum(
+                1 for spec in scheduled
+                if "bedroom" in canonical_type(spec.get("type") if isinstance(spec, dict) else spec)
+            )
+            if not scheduled or (bhk_val > 0 and scheduled_beds == 0):
+                logger.warning(
+                    "[PROGRAM RECOVERY] Floor schedule had %d room(s) and %d bedroom(s) for a "
+                    "%dBHK request; rebuilding from the BHK program.",
+                    len(scheduled), scheduled_beds, bhk_val,
+                )
+                explicit_program = {}
+                layout_params.pop("floor_program", None)
         if explicit_program:
             explicit_program = apply_floor_bathroom_roles(explicit_program, req.prompt)
             layout_params["floor_program"] = explicit_program
@@ -7713,11 +7736,29 @@ async def generate_template_stream(req: TemplateRequest):
 # MEP generation endpoints
 # ---------------------------------------------------------------------------
 
+def sync_room_mirror(project: dict) -> dict:
+    """Keep project["rooms"] in step with the floor the MEP pass mutated.
+
+    The generators collect rooms out of project["floors"], so the flat
+    project["rooms"] mirror the UI and the PDF blueprint also read stayed on
+    the pre-MEP copy — wiring showed in the 3D view but was missing from the
+    exported drawings and their schedules.
+    """
+    if not isinstance(project, dict):
+        return project
+    floors = project.get("floors")
+    if isinstance(floors, list) and floors:
+        level = int(project.get("current_floor_index", 0) or 0)
+        if 0 <= level < len(floors) and isinstance(floors[level], dict):
+            project["rooms"] = floors[level].get("rooms", project.get("rooms", []))
+    return project
+
+
 @app.post("/api/generate-wiring")
 async def api_generate_wiring(req: MEPRequest):
     try:
         updated_project = mep_generator.generate_wiring(req.project, req.options)
-        return {"status": "success", "project": updated_project}
+        return {"status": "success", "project": sync_room_mirror(updated_project)}
     except Exception as e:
         logger.error(f"Wiring generation failed: {str(e)}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
@@ -7726,7 +7767,7 @@ async def api_generate_wiring(req: MEPRequest):
 async def api_generate_plumbing(req: MEPRequest):
     try:
         updated_project = mep_generator.generate_plumbing(req.project, req.options)
-        return {"status": "success", "project": updated_project}
+        return {"status": "success", "project": sync_room_mirror(updated_project)}
     except Exception as e:
         logger.error(f"Plumbing generation failed: {str(e)}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
