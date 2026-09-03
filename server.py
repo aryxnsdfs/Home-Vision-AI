@@ -1202,35 +1202,47 @@ def trim_surplus_bedrooms(
     return trimmed, remaining
 
 
-def _guarantee_bathrooms(specs, prompt: str = "", bhk: int = 0, only_if_none_anywhere=None):
-    """Make sure a bathroom is in the program before anything sheds rooms.
+def _guarantee_essentials(specs, prompt: str = "", bhk: int = 0, elsewhere=None):
+    """Make sure the rooms a house cannot do without are in the program.
 
-    The contract check at the end of assembly restores a missing bathroom, but
-    by then fit_program_to_plot has already balanced the program against the
-    plot, so adding one back pushed the count over what could be placed and the
-    request failed outright. Stating the requirement up front lets the shed drop
-    a gym instead of the plumbing.
+    A bathroom and a kitchen, added before anything sheds rooms. The contract
+    check at the end of assembly would restore them too, but by then
+    fit_program_to_plot has balanced the program against the plot, so adding one
+    back pushes the count over what can be placed and the whole request fails.
+    Stating the requirement up front lets the shed drop a gym instead.
+
+    ``elsewhere`` is the rest of the building when this is called for one floor:
+    a duplex needs one kitchen, not one per storey, so a room already present on
+    another level counts. The check is per room - looking only for a bathroom
+    there once let a house through with nowhere to cook.
     """
     from intent_compiler import requested_bathroom_count
 
     items = [item for item in (specs or []) if isinstance(item, dict)]
-    if only_if_none_anywhere is not None:
-        pool = [item for item in only_if_none_anywhere if isinstance(item, dict)]
-        if any(_program_room_class(item.get("type")) == "bathroom" for item in pool):
-            return items
+    other = [item for item in (elsewhere or []) if isinstance(item, dict)]
 
-    have = sum(1 for item in items if _program_room_class(item.get("type")) == "bathroom")
-    wanted = requested_bathroom_count(prompt) or 1
-    if have >= wanted:
-        return items
+    def count_of(concept, pool):
+        return sum(1 for item in pool if _program_room_class(item.get("type")) == concept)
 
-    for index in range(have, wanted):
+    here_baths = count_of("bathroom", items)
+    wanted_baths = requested_bathroom_count(prompt) or 1
+    if here_baths + count_of("bathroom", other) < wanted_baths:
+        missing = wanted_baths - here_baths - count_of("bathroom", other)
+        for index in range(missing):
+            items.append({
+                "type": "bathroom",
+                "name": "Bathroom" if not (here_baths + index) else f"Bathroom {here_baths + index + 1}",
+                "confidence": 100, "required": True, "provenance": "building_requirement",
+            })
+        logger.info("[PROGRAM] Added %d bathroom(s) the brief requires before fitting.", missing)
+
+    if not count_of("kitchen", items) and not count_of("kitchen", other):
         items.append({
-            "type": "bathroom",
-            "name": "Bathroom" if not index else f"Bathroom {index + 1}",
+            "type": "kitchen", "name": "Kitchen",
             "confidence": 100, "required": True, "provenance": "building_requirement",
         })
-    logger.info("[PROGRAM] Added %d bathroom(s) the brief requires before fitting.", wanted - have)
+        logger.info("[PROGRAM] Program had no kitchen; adding one before fitting.")
+
     return items
 
 
@@ -6623,14 +6635,19 @@ def _stream_generate_work_impl(req: "GenerateRequest", emit_fn: Callable) -> Non
         # balanced the program, pushed the room count back over what the plot
         # could place and the whole request failed instead - the shed has to be
         # able to see the bathroom and drop a gym rather than the plumbing.
-        layout_params["rooms"] = _guarantee_bathrooms(
-            layout_params["rooms"], req.prompt, bhk_val,
-        )
         if explicit_program:
-            for level in list(explicit_program):
-                explicit_program[level] = _guarantee_bathrooms(
-                    explicit_program[level], req.prompt, bhk_val, only_if_none_anywhere=layout_params["rooms"],
+            for level in sorted(explicit_program):
+                others = [
+                    spec for other_level in explicit_program
+                    if other_level != level for spec in explicit_program[other_level]
+                ]
+                explicit_program[level] = _guarantee_essentials(
+                    explicit_program[level], req.prompt, bhk_val, elsewhere=others,
                 )
+        else:
+            layout_params["rooms"] = _guarantee_essentials(
+                layout_params["rooms"], req.prompt, bhk_val,
+            )
         if explicit_program:
             for level in list(explicit_program):
                 level_specs = ensure_circulation(explicit_program[level])

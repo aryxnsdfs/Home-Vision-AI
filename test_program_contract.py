@@ -184,3 +184,40 @@ def test_a_home_gym_is_a_gym():
         contract, {0: [{"type": "home_gym"}, {"type": "bathroom"}]}, [],
     )
     assert indoor == [], "home_gym and gym must count as one room"
+
+
+def test_a_house_always_gets_a_kitchen():
+    # A weaker model left the kitchen out of the program entirely, and the plan
+    # came back as a 4BHK with nowhere to cook.
+    from server import _guarantee_essentials
+    types = [r["type"] for r in _guarantee_essentials([{"type": "bedroom"}], "3BHK house")]
+    assert "kitchen" in types
+    assert "bathroom" in types
+
+
+def test_essentials_are_not_duplicated_when_already_present():
+    from server import _guarantee_essentials
+    types = [r["type"] for r in _guarantee_essentials(
+        [{"type": "kitchen"}, {"type": "bathroom"}], "3BHK house")]
+    assert types.count("kitchen") == 1
+    assert types.count("bathroom") == 1
+
+
+def test_the_brief_outranks_the_model_on_compass():
+    # A model that reduced "kitchen in the southeast" to "east" used to block
+    # the prompt parser and lose half the instruction.
+    from intent_compiler import (
+        ArchitecturalConstraint, ConstraintKind, ConstraintOrigin,
+        ConstraintStrength, compile_intent,
+    )
+    rooms = [{"id": "kitchen-1", "type": "kitchen"}, {"id": "living_room-1", "type": "living_room"}]
+    extraction = {"spatial_relations": [
+        {"subject_room": "kitchen", "relation": "east", "required": True},
+    ]}
+    contract = compile_intent(
+        "3BHK house with the kitchen in the southeast", extraction, rooms,
+        program_id="compass-precedence",
+    )
+    directions = [c for c in contract.constraints if c.kind == ConstraintKind.DIRECTION]
+    assert len(directions) == 1, f"expected one kitchen direction, got {directions}"
+    assert directions[0].value == "south_east", directions[0].value

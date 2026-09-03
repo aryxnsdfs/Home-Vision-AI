@@ -602,10 +602,12 @@ def recover_prompt_directions(
     if not text:
         return []
 
-    already = {
-        str(c.source) for c in existing or []
-        if c.kind == ConstraintKind.DIRECTION
-    }
+    # Deliberately not skipping rooms the extraction already gave a direction.
+    # The brief is the user's own words; the extraction is a paraphrase of them,
+    # and a model that reduced "kitchen in the southeast" to "east" used to
+    # block the recovery and quietly lose half the instruction. Where the two
+    # disagree the brief wins, and the caller drops the paraphrase.
+    already = set()
     by_type_ids: Dict[str, List[str]] = {}
     for index, room in enumerate(rooms):
         room_type = _canonical(room.get("type") or room.get("room_type") or "room")
@@ -615,7 +617,7 @@ def recover_prompt_directions(
 
     recovered: List[ArchitecturalConstraint] = []
     for room_type, ids in by_type_ids.items():
-        if len(ids) != 1 or ids[0] in already or room_type in already:
+        if len(ids) != 1:
             continue
         label = room_type.replace("_", " ").strip()
         if not label or room_type in {"corridor", "hallway", "passage", "lobby"}:
@@ -702,12 +704,27 @@ def compile_intent(
                 origin=ConstraintOrigin.USER,
             ))
 
-    for constraint in recover_prompt_directions(prompt, rooms, constraints):
-        logger.info(
-            "[DIRECTION RECOVERY] '%s' asked for %s in the prompt; the extraction had no such constraint.",
-            constraint.original_source_selector, constraint.value,
-        )
-        constraints.append(constraint)
+    recovered_directions = recover_prompt_directions(prompt, rooms, constraints)
+    if recovered_directions:
+        claimed = {str(c.source) for c in recovered_directions}
+        claimed_types = {_canonical(c.original_source_selector) for c in recovered_directions}
+        superseded = [
+            c for c in constraints
+            if c.kind == ConstraintKind.DIRECTION
+            and (str(c.source) in claimed or _canonical(c.source) in claimed_types)
+        ]
+        for stale in superseded:
+            logger.info(
+                "[DIRECTION RECOVERY] Replacing extracted '%s -> %s' with the brief's own wording.",
+                stale.source, stale.value,
+            )
+            constraints.remove(stale)
+        for constraint in recovered_directions:
+            logger.info(
+                "[DIRECTION RECOVERY] The brief puts '%s' in the %s.",
+                constraint.original_source_selector, constraint.value,
+            )
+            constraints.append(constraint)
 
     # Preserve explicit instance ownership for ensuites even when Gemini only
     # put the assignment on the room program.

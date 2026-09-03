@@ -1017,7 +1017,11 @@ def auto_wire_topology(room_types: list, ai_categories: dict = None, bathroom_re
     ]
     
     if bathroom_requirements:
-        requested_attached = bathroom_requirements.get("attached", [])
+        # A default only applies when the key is absent. A model that sends
+        # "attached": null passes the key through with a None value and the
+        # whole generation died on len(None) - which a weaker model does often
+        # enough to matter now that Groq is in the rotation.
+        requested_attached = bathroom_requirements.get("attached") or []
         requested_attached_count = len(requested_attached)
         if len(attached_baths) > requested_attached_count:
             excess = len(attached_baths) - requested_attached_count
