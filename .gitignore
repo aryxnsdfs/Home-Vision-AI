@@ -23,3 +23,6 @@ public/blueprints/
 
 # Local dev preview config
 .claude/
+
+# Timestamped .env backups made when rotating API keys
+.env.bak.*
