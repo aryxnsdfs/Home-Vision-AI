@@ -19,6 +19,8 @@ from __future__ import annotations
 
 import contextvars
 import copy
+import hashlib
+import io
 import itertools
 import json
 import logging
@@ -63,13 +65,64 @@ _CACHE_MAX = int(os.getenv("LLM_CACHE_ENTRIES", "128"))
 _CACHE_TTL = float(os.getenv("LLM_CACHE_TTL_SECONDS", "900"))
 
 
+# The free tier allows 20 requests per day per project, and a restart used to
+# throw away every answer already paid for. Identical requests - a demo prompt,
+# a retried generation, the same brief twice - now cost nothing across restarts
+# as well as within one. Set LLM_CACHE_DIR="" to disable.
+_CACHE_DIR = os.getenv("LLM_CACHE_DIR", os.path.join(os.getenv("WORK_DIR", "."), ".llm_cache"))
+_DISK_TTL = float(os.getenv("LLM_DISK_CACHE_TTL_SECONDS", str(7 * 24 * 3600)))
+
+
+def _disk_path(key: tuple) -> Optional[str]:
+    if not _CACHE_DIR:
+        return None
+    digest = hashlib.sha256(repr(key).encode("utf-8")).hexdigest()[:32]
+    return os.path.join(_CACHE_DIR, digest + ".json")
+
+
+def _disk_get(key: tuple):
+    path = _disk_path(key)
+    if not path or not os.path.exists(path):
+        return None
+    try:
+        with io.open(path, encoding="utf-8") as handle:
+            record = json.load(handle)
+        if time.time() > float(record.get("expires", 0)):
+            os.remove(path)
+            return None
+        return record.get("value")
+    except Exception:  # noqa: BLE001 - a corrupt entry is just a cache miss
+        return None
+
+
+def _disk_put(key: tuple, value: Dict[str, Any]) -> None:
+    path = _disk_path(key)
+    if not path:
+        return
+    try:
+        os.makedirs(_CACHE_DIR, exist_ok=True)
+        tmp = path + ".tmp"
+        with io.open(tmp, "w", encoding="utf-8") as handle:
+            json.dump({"expires": time.time() + _DISK_TTL, "value": value}, handle)
+        os.replace(tmp, path)
+    except Exception as exc:  # noqa: BLE001 - never fail a generation over a cache
+        logger.debug("[LLM CACHE] Could not persist entry: %s", exc)
+
+
 def _cache_get(key: tuple):
     if _CACHE_MAX <= 0:
         return None
     with _lock:
         entry = _cache.get(key)
-        if entry is None:
-            return None
+    if entry is None:
+        stored = _disk_get(key)
+        if stored is not None:
+            with _lock:
+                _cache[key] = (time.time() + _CACHE_TTL, copy.deepcopy(stored))
+                _cache.move_to_end(key)
+            return stored
+        return None
+    with _lock:
         expires, value = entry
         if time.time() > expires:
             _cache.pop(key, None)
@@ -86,6 +139,7 @@ def _cache_put(key: tuple, value: Dict[str, Any]) -> None:
         _cache.move_to_end(key)
         while len(_cache) > _CACHE_MAX:
             _cache.popitem(last=False)
+    _disk_put(key, value)
 
 
 _counter = itertools.count()

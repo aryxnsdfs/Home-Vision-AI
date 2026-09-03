@@ -26,3 +26,6 @@ public/blueprints/
 
 # Timestamped .env backups made when rotating API keys
 .env.bak.*
+
+# Persisted model-answer cache (saves free-tier quota across restarts)
+.llm_cache/

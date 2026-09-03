@@ -1,3 +1,4 @@
+import io
 import os
 import json
 import logging
@@ -211,7 +212,42 @@ class InferredRoomSizes(BaseModel):
 
 # Sizes are a property of the room type, not of the request, so cache per type
 # and share them across prompts.
-_ROOM_SIZE_CACHE: Dict[str, Dict[str, float]] = {}
+# How big is a "pottery workshop"? The model is asked once and the answer is
+# reused - but only within one process, so every restart bought the same
+# handful of numbers again out of a 20 request daily allowance. Sizes for a
+# room type do not change, so they are kept on disk. Set ROOM_SIZE_CACHE_FILE=""
+# to disable.
+_ROOM_SIZE_CACHE_FILE = os.getenv(
+    "ROOM_SIZE_CACHE_FILE",
+    os.path.join(os.getenv("WORK_DIR", "."), ".llm_cache", "room_sizes.json"),
+)
+
+
+def _load_room_sizes() -> Dict[str, Dict[str, float]]:
+    if not _ROOM_SIZE_CACHE_FILE or not os.path.exists(_ROOM_SIZE_CACHE_FILE):
+        return {}
+    try:
+        with io.open(_ROOM_SIZE_CACHE_FILE, encoding="utf-8") as handle:
+            stored = json.load(handle)
+        return {str(k): v for k, v in stored.items() if isinstance(v, dict)}
+    except Exception:  # noqa: BLE001 - a corrupt cache is just an empty one
+        return {}
+
+
+def _save_room_sizes() -> None:
+    if not _ROOM_SIZE_CACHE_FILE:
+        return
+    try:
+        os.makedirs(os.path.dirname(_ROOM_SIZE_CACHE_FILE), exist_ok=True)
+        tmp = _ROOM_SIZE_CACHE_FILE + ".tmp"
+        with io.open(tmp, "w", encoding="utf-8") as handle:
+            json.dump(_ROOM_SIZE_CACHE, handle, indent=1, sort_keys=True)
+        os.replace(tmp, _ROOM_SIZE_CACHE_FILE)
+    except Exception as exc:  # noqa: BLE001 - never fail sizing over a cache
+        logger.debug("[ROOM SIZE] Could not persist cache: %s", exc)
+
+
+_ROOM_SIZE_CACHE: Dict[str, Dict[str, float]] = _load_room_sizes()
 
 # Guardrails: an inferred number is a hint, not a mandate. A hallucinated
 # 5,000 sq ft "wine cellar" would make every layout infeasible.
@@ -227,6 +263,7 @@ def infer_room_dimensions(room_types: List[str]) -> Dict[str, Dict[str, float]]:
     cheap on paper, it was also the first thing dropped when space got tight.
     """
     wanted = sorted({str(t).strip().lower() for t in room_types if str(t).strip()})
+    _sizes_changed = False
     missing = [t for t in wanted if t not in _ROOM_SIZE_CACHE]
     if missing and has_llm_credentials():
         try:
@@ -255,9 +292,12 @@ def infer_room_dimensions(room_types: List[str]) -> Dict[str, Dict[str, float]]:
                 # A room cannot be narrower than its own area allows.
                 dim = min(dim, (area ** 0.5))
                 _ROOM_SIZE_CACHE[room_type] = {"area": round(area, 1), "min_dim": round(dim, 1)}
+                _sizes_changed = True
             logger.info("[ROOM SIZING] Inferred usable minimums for %s", ", ".join(missing))
         except Exception as exc:  # noqa: BLE001 - sizing is an improvement, not a gate
             logger.warning("[ROOM SIZING] Falling back to default minimums for %s: %s", missing, exc)
+    if _sizes_changed:
+        _save_room_sizes()
     return {t: _ROOM_SIZE_CACHE[t] for t in wanted if t in _ROOM_SIZE_CACHE}
 
 
@@ -281,6 +321,16 @@ def generate_furniture_manifest(room_specs: List[Dict[str, Any]], user_prompt: s
             "length": round(float(room.get("length", 10.0)), 2),
         })
     cache_key = json.dumps({"rooms": normalized, "request": (user_prompt or "").strip().lower()}, sort_keys=True)
+    # The most expendable model call in the pipeline. layout_engine already
+    # falls back to asset_library.furniture_for_room() whenever this returns
+    # nothing, so turning it off costs bespoke furniture choices and nothing
+    # else - and on a 20 request daily allowance that is roughly a quarter of
+    # every house's budget. Set GEMINI_FURNITURE=0 to spend the quota on
+    # layouts instead.
+    if os.getenv("GEMINI_FURNITURE", "1").strip().lower() in {"0", "false", "no", "off"}:
+        logger.info("[GEMINI] Furniture manifest disabled; using the deterministic library.")
+        return {}
+
     if cache_key in _FURNITURE_CACHE:
         return _FURNITURE_CACHE[cache_key]
     try:
