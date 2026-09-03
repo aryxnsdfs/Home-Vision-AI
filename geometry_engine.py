@@ -340,6 +340,7 @@ class CPSolver:
         # Default zoning is deliberately soft. Only explicit hard directional
         # constraints are promoted to CP-SAT feasibility rules.
         pub_count, srv_count, priv_count = 0, 0, 0
+        hard_direction_count = 0
         for rv in room_vars.values():
             rt = rv['type'].lower()
             if rt in {"foyer", "living_room", "dining_room", "living", "dining"}:
@@ -351,6 +352,13 @@ class CPSolver:
 
             for constraint in rv.get('direction_constraints', []):
                 if str(constraint.get('strength', '')).lower() != 'hard':
+                    continue
+                hard_direction_count += 1
+                # A compass pin confines a room's centre to one half of the
+                # plot. Combined with the door graph that can be infeasible on
+                # a busy program, and a house with the gym on the wrong side
+                # beats no house at all, so a recovery pass drops these.
+                if floor_data.get('relax_directional'):
                     continue
                 direction = str(constraint.get('value', '')).lower().replace('-', '_')
                 center_x2 = 2 * rv['x'] + rv['w']
@@ -365,6 +373,7 @@ class CPSolver:
                     model.Add(center_z2 >= plot_l)
 
         logger.info(f"[ZONE] Public rooms={pub_count} | Service rooms={srv_count} | Private rooms={priv_count} (soft defaults)")
+        floor_data['_hard_direction_count'] = hard_direction_count
         # ────────────────────────────────────────────
         # PHASE 3 — Required Door Graph (HARD vs SOFT)
         # Only strictly required structural adjacencies (attached bath ↔ bedroom,
@@ -766,6 +775,27 @@ class CPSolver:
             logger.info(f"CP Solver did not return a solution (status {status}, attempt {attempt}).")
             floor_data['validation'] = {'passed': False, 'errors': ['Solver infeasible']}
             
+            # First recovery: keep every room, drop the compass pins. These are
+            # placement preferences, not access rules, and they were turning
+            # solvable programs infeasible on plots less than half full.
+            if (
+                'resolved_rooms' not in floor_data
+                and floor_data.get('_hard_direction_count')
+                and not floor_data.get('relax_directional')
+            ):
+                logger.info(
+                    "[RELAXATION] Dropping %d hard directional constraint(s) and retrying...",
+                    floor_data['_hard_direction_count'],
+                )
+                floor_data_free = dict(floor_data)
+                floor_data_free['relax_directional'] = True
+                try:
+                    result = self._solve_single_topology(floor_data_free, attempt, topology_type)
+                    if 'resolved_rooms' in result:
+                        return result
+                except Exception:  # noqa: BLE001 - fall through to the next recovery
+                    pass
+
             # Relaxation pass for slab-constrained upper floors or complex programs
             if 'resolved_rooms' not in floor_data and attempt < 2:
                 relaxed_specs = self._relax_optional_rooms(rooms_spec)

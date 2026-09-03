@@ -924,15 +924,33 @@ def auto_wire_topology(room_types: list, ai_categories: dict = None, bathroom_re
         if ci != hub_idx and room_specs[ci]["type"] in {"staircase", "stairwell"}:
             add_conn(ci, hub_idx, "direct_door", 20)
 
+    # A second corridor is only useful if you can walk to it. Chain every
+    # additional horizontal circulation space back to the primary hub so the
+    # floor stays one connected walking network.
+    secondary_hubs = [
+        ci for ci in circulation_idx
+        if ci != hub_idx and room_specs[ci]["type"] in {"corridor", "hallway", "passage", "lobby"}
+    ]
+    for ci in secondary_hubs:
+        add_conn(hub_idx, ci, "direct_door", 25)
+
     # 3. Connect Outdoor Spaces to the Hub
     for oi in outdoor_idx:
         if hub_idx != oi:
             add_conn(hub_idx, oi, "open_flow", 10)
 
-    # 4. Connect Private Zones (Bedrooms) to the Corridor Hub via Direct Doors
-    for pi in private_idx:
-        if hub_idx != pi:
-            add_conn(pi, hub_idx, "direct_door", 20)
+    # 4. Connect Private Zones (Bedrooms) to circulation via Direct Doors.
+    #
+    # Every private room needs a >=3 ft shared wall with the hub it opens off.
+    # A single corridor rectangle has a finite perimeter, so hanging a dozen
+    # rooms off one hub is geometrically unsatisfiable however much floor area
+    # is free -- that was CP-SAT reporting "could not satisfy door adjacency"
+    # on plots less than half full. Share the load across every corridor.
+    hubs = [hub_idx] + secondary_hubs
+    for order, pi in enumerate(private_idx):
+        if pi in hubs:
+            continue
+        add_conn(pi, hubs[order % len(hubs)], "direct_door", 20)
 
     # 5. Distribute Wet Zones (Bathrooms)
     available_baths = list(wet_idx)

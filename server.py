@@ -885,8 +885,7 @@ def ensure_circulation(room_specs: list) -> list:
     """
     specs = [item for item in (room_specs or []) if isinstance(item, dict)]
     types = [canonical_type(item.get("type")) for item in specs]
-    if any(t in CIRCULATION_TYPES for t in types):
-        return specs
+    existing = sum(1 for t in types if t in CIRCULATION_TYPES)
     private_count = sum(
         1 for t in types
         if "bedroom" in t or "bath" in t or "toilet" in t or t in {"study_room", "pooja_room"}
@@ -895,9 +894,28 @@ def ensure_circulation(room_specs: list) -> list:
     # that the plan needs somewhere to actually walk.
     if private_count < 3:
         return specs
-    logger.info("[CIRCULATION] Added corridor for %d private rooms with no circulation space", private_count)
-    return specs + [{"type": "corridor", "name": "Corridor", "confidence": 100, "required": True,
-                     "provenance": "building_requirement"}]
+
+    # A corridor is a rectangle, so its perimeter caps how many rooms can each
+    # hold the ~3 ft of shared wall a door needs. Hanging a dozen rooms off one
+    # hub is unsatisfiable however much floor area is free, which is why
+    # room-heavy plans failed door adjacency on plots less than half full.
+    # Scale circulation with the program the way a real plan does.
+    per_hub = max(2, int(os.getenv("ROOMS_PER_CIRCULATION_HUB", "6")))
+    needed = max(1, math.ceil(private_count / per_hub))
+    if existing >= needed:
+        return specs
+
+    added = needed - existing
+    logger.info(
+        "[CIRCULATION] %d private rooms need %d circulation space(s); adding %d (had %d).",
+        private_count, needed, added, existing,
+    )
+    extra = [
+        {"type": "corridor", "name": "Corridor" if existing + i == 0 else f"Corridor {existing + i + 1}",
+         "confidence": 100, "required": True, "provenance": "building_requirement"}
+        for i in range(added)
+    ]
+    return specs + extra
 
 
 def fit_program_to_plot(
