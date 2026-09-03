@@ -199,6 +199,68 @@ class GeneratedFurnitureResponse(BaseModel):
     rooms: List[GeneratedRoomAssets] = Field(default_factory=list)
 
 
+class InferredRoomSize(BaseModel):
+    room_type: str = Field(description="The exact room type string that was asked about")
+    min_area_sqft: float = Field(description="Smallest floor area in square feet at which this room is still usable")
+    min_dimension_ft: float = Field(description="Smallest usable width or depth in feet, accounting for furniture and clearance")
+
+
+class InferredRoomSizes(BaseModel):
+    rooms: List[InferredRoomSize] = Field(default_factory=list)
+
+
+# Sizes are a property of the room type, not of the request, so cache per type
+# and share them across prompts.
+_ROOM_SIZE_CACHE: Dict[str, Dict[str, float]] = {}
+
+# Guardrails: an inferred number is a hint, not a mandate. A hallucinated
+# 5,000 sq ft "wine cellar" would make every layout infeasible.
+_MIN_INFERRED_AREA, _MAX_INFERRED_AREA = 20.0, 600.0
+_MIN_INFERRED_DIM, _MAX_INFERRED_DIM = 4.0, 24.0
+
+
+def infer_room_dimensions(room_types: List[str]) -> Dict[str, Dict[str, float]]:
+    """Ask for usable minimums for room types the size table does not know.
+
+    Unknown rooms previously fell back to a flat 40 sq ft / 5 ft default, so a
+    home theatre was allowed to be the size of a store cupboard — and, being
+    cheap on paper, it was also the first thing dropped when space got tight.
+    """
+    wanted = sorted({str(t).strip().lower() for t in room_types if str(t).strip()})
+    missing = [t for t in wanted if t not in _ROOM_SIZE_CACHE]
+    if missing and has_llm_credentials():
+        try:
+            parsed = generate_json(
+                contents=json.dumps({"room_types": missing}),
+                system_instruction=(
+                    "You size rooms for a residential floor-plan solver. For every supplied "
+                    "room type, give the smallest floor area (square feet) and smallest side "
+                    "length (feet) at which that room is genuinely usable, allowing for its "
+                    "normal furniture and circulation clearance. Be realistic for an Indian "
+                    "home: a home theatre needs far more than a store cupboard, a wine cellar "
+                    "far less than a gym. Return one entry per supplied room type."
+                ),
+                response_schema=InferredRoomSizes,
+                temperature=0.0,
+                stage="room-sizing",
+            )
+            for entry in parsed.get("rooms", []) or []:
+                room_type = str(entry.get("room_type", "")).strip().lower()
+                if not room_type:
+                    continue
+                area = float(entry.get("min_area_sqft") or 0) or _MIN_INFERRED_AREA
+                dim = float(entry.get("min_dimension_ft") or 0) or _MIN_INFERRED_DIM
+                area = max(_MIN_INFERRED_AREA, min(_MAX_INFERRED_AREA, area))
+                dim = max(_MIN_INFERRED_DIM, min(_MAX_INFERRED_DIM, dim))
+                # A room cannot be narrower than its own area allows.
+                dim = min(dim, (area ** 0.5))
+                _ROOM_SIZE_CACHE[room_type] = {"area": round(area, 1), "min_dim": round(dim, 1)}
+            logger.info("[ROOM SIZING] Inferred usable minimums for %s", ", ".join(missing))
+        except Exception as exc:  # noqa: BLE001 - sizing is an improvement, not a gate
+            logger.warning("[ROOM SIZING] Falling back to default minimums for %s: %s", missing, exc)
+    return {t: _ROOM_SIZE_CACHE[t] for t in wanted if t in _ROOM_SIZE_CACHE}
+
+
 _FURNITURE_CACHE: Dict[str, Dict[str, List[Dict[str, Any]]]] = {}
 
 

@@ -768,6 +768,51 @@ def enforce_floor_intent(prompt: str, slm_result: dict, requested_floors: int = 
     return automatically_repair_program(prompt, slm_result, requested_floors)
 
 
+def spec_min_area(spec: Any) -> float:
+    """Minimum area for a spec, preferring a size inferred for its own type."""
+    from layout_engine import get_min_area
+    if isinstance(spec, dict):
+        target = spec.get("target_area")
+        if target:
+            return float(target)
+        return get_min_area(canonical_type(spec.get("type")) or "room")
+    return get_min_area(canonical_type(spec) or "room")
+
+
+def apply_inferred_room_sizes(room_specs: list) -> list:
+    """Give rooms outside the size table a realistic minimum of their own.
+
+    ROOM_MINIMUMS knows 19 common types; everything else fell back to a flat
+    40 sq ft / 5 ft. That let a home theatre be solved at cupboard size, and
+    made it the cheapest thing to shed when the plot got tight. Ask what the
+    room actually needs instead, and stamp it where CP-SAT already looks.
+    """
+    from layout_engine import ROOM_MINIMUMS
+
+    specs = [item for item in (room_specs or []) if isinstance(item, dict)]
+    unknown = sorted({
+        canonical_type(item.get("type"))
+        for item in specs
+        if canonical_type(item.get("type"))
+        and canonical_type(item.get("type")) not in ROOM_MINIMUMS
+        and not item.get("target_area")
+    })
+    if not unknown:
+        return specs
+    try:
+        from cloud_extractor import infer_room_dimensions
+        sizes = infer_room_dimensions(unknown)
+    except Exception as exc:  # noqa: BLE001 - sizing is an improvement, not a gate
+        logger.warning("[ROOM SIZING] Unavailable, keeping default minimums: %s", exc)
+        return specs
+    for item in specs:
+        inferred = sizes.get(canonical_type(item.get("type")))
+        if inferred and not item.get("target_area"):
+            item["target_area"] = inferred["area"]
+            item["target_min_dim"] = inferred["min_dim"]
+    return specs
+
+
 CIRCULATION_TYPES = {"corridor", "circulation", "hallway", "foyer", "lobby", "passage", "entrance_lobby"}
 
 
@@ -892,7 +937,7 @@ def fit_program_to_plot(
     budget = max(1.0, float(plot_width) * float(plot_length) * coverage * max(1, int(floors)) * slack)
 
     def required_area(items):
-        return sum(get_min_area(item.get("type", "room")) for item in items if not item.get("is_outdoor"))
+        return sum(spec_min_area(item) for item in items if not item.get("is_outdoor"))
 
     # A zone also has a frontage limit, not just an area limit: the fallback
     # layout splits the available width evenly, so a slab that can only front
@@ -971,7 +1016,7 @@ def fit_program_to_plot(
 
     order = sorted(
         (i for i, item in enumerate(specs) if shed_rank(i, specs[i]) is not None),
-        key=lambda i: (shed_rank(i, specs[i]), -get_min_area(specs[i].get("type", "room"))),
+        key=lambda i: (shed_rank(i, specs[i]), -spec_min_area(specs[i])),
     )
     dropped, kept_flags = [], [True] * len(specs)
     for index in order:
@@ -6171,8 +6216,21 @@ def _stream_generate_work_impl(req: "GenerateRequest", emit_fn: Callable) -> Non
         buildable_plot_area = plot_w * plot_l * 0.85
 
         from layout_engine import get_min_area
-        total_required_area = sum(get_min_area(r.get("type", "room")) for r in layout_params.get("rooms", []))
-        if total_required_area > buildable_plot_area:
+        # Size any room the fixed table does not know before anything measures
+        # the program, so the area budget, the shed order and CP-SAT all work
+        # from what the room actually needs rather than a flat 40 sq ft.
+        layout_params["rooms"] = apply_inferred_room_sizes(layout_params["rooms"])
+        if explicit_program:
+            for _level in list(explicit_program):
+                explicit_program[_level] = apply_inferred_room_sizes(explicit_program[_level])
+
+        total_required_area = sum(spec_min_area(r) for r in layout_params.get("rooms", []))
+        # Adding a storey changes what the user asked for, so it needs a clear
+        # margin rather than a rounding overshoot. A 2BHK flat whose program
+        # came out 1% over the buildable area was silently becoming a duplex,
+        # and then failing on the upper floor it never needed.
+        escalation_margin = float(os.getenv("VERTICAL_ESCALATION_MARGIN", "1.15"))
+        if total_required_area > buildable_plot_area * escalation_margin:
             needed_floors = math.ceil(total_required_area / max(1.0, buildable_plot_area))
             floors = max(floors, min(3, needed_floors))
             logger.info(f"[VERTICAL ESCALATION] Total required room area ({total_required_area:.0f} sq ft) exceeds buildable plot area ({buildable_plot_area:.0f} sq ft). Auto-escalating to {floors}-story layout.")
@@ -6302,7 +6360,7 @@ def _stream_generate_work_impl(req: "GenerateRequest", emit_fn: Callable) -> Non
 
             # --- AUTOMATIC VERTICAL ESCALATION FOR OVERSIZED GROUND FLOOR ---
             all_ground_rooms = floor_specs_by_level.get(0, [])
-            f0_min_area = sum(get_min_area(r.get("type", "room")) for r in all_ground_rooms)
+            f0_min_area = sum(spec_min_area(r) for r in all_ground_rooms)
             if floors > 1 and (f0_min_area > buildable_plot_area or len(floor_specs_by_level.get(1, [])) == 0):
                 ground_spec, first_spec = split_duplex_specs(all_ground_rooms, bhk_val)
                 floor_specs_by_level[0] = sort_spec_by_generation_order(ground_spec)
@@ -6314,8 +6372,8 @@ def _stream_generate_work_impl(req: "GenerateRequest", emit_fn: Callable) -> Non
             if floors > 1 and len(floor_specs_by_level.get(1, [])) > 0 and not has_explicit_schedule:
                 from layout_engine import get_min_area
                 
-                f0_area = sum(get_min_area(r.get("type", "room")) for r in floor_specs_by_level.get(0, []))
-                f1_area = sum(get_min_area(r.get("type", "room")) for r in floor_specs_by_level.get(1, []))
+                f0_area = sum(spec_min_area(r) for r in floor_specs_by_level.get(0, []))
+                f1_area = sum(spec_min_area(r) for r in floor_specs_by_level.get(1, []))
                 
                 # If Floor 1 is heavier than Floor 0, forcefully intervene
                 if f1_area > f0_area:
@@ -6344,8 +6402,8 @@ def _stream_generate_work_impl(req: "GenerateRequest", emit_fn: Callable) -> Non
             # --- ABSOLUTE FAIL-SAFE: STRUCTURAL PADDER ---
             # If Floor 1 STILL requires more area, inject an outdoor pad to expand the foundation
             if floors > 1 and len(floor_specs_by_level.get(1, [])) > 0:
-                f0_area = sum(get_min_area(r.get("type", "room")) for r in floor_specs_by_level.get(0, []))
-                f1_area = sum(get_min_area(r.get("type", "room")) for r in floor_specs_by_level.get(1, []))
+                f0_area = sum(spec_min_area(r) for r in floor_specs_by_level.get(0, []))
+                f1_area = sum(spec_min_area(r) for r in floor_specs_by_level.get(1, []))
                 if f1_area > f0_area:
                     padding_needed = f1_area - f0_area
                     pad_dim = int(math.sqrt(padding_needed)) + 1
@@ -6522,7 +6580,7 @@ def _stream_generate_work_impl(req: "GenerateRequest", emit_fn: Callable) -> Non
             target_footprint = min(
                 (plot_w * plot_l) * coverage_ratio,
                 engine.buildable_width * engine.buildable_length * 0.85,
-                sum(get_min_area(room.get("type", "room")) for room in floor_0_rooms) * 1.25,
+                sum(spec_min_area(room) for room in floor_0_rooms) * 1.25,
             )
             from room_planner import apply_room_scaling
             floor_0_rooms = apply_room_scaling(floor_0_rooms, target_footprint)
@@ -6552,7 +6610,7 @@ def _stream_generate_work_impl(req: "GenerateRequest", emit_fn: Callable) -> Non
                 # Calculate minimum foundation dimensions needed for Floor 1
                 if floors > 1 and first_spec:
                     from layout_engine import get_min_area
-                    floor_1_min_area = sum(get_min_area(r.get("type", "room")) for r in first_spec)
+                    floor_1_min_area = sum(spec_min_area(r) for r in first_spec)
                     if floor_1_min_area > 0:
                         aspect = plot_w / max(1.0, plot_l)
                         min_l_needed = math.sqrt(floor_1_min_area / max(0.1, aspect))
