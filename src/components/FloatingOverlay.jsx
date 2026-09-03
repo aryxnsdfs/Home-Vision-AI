@@ -114,17 +114,48 @@ const downloadBlob = (blob, filename) => {
     try {
       validateProject();
       await new Promise((resolve) => requestAnimationFrame(resolve));
-      const snapshot = captureScene();
+
+      // The 3D views are a nice-to-have; the engineering drawings are the
+      // point. A lost WebGL context made captureScene throw or return
+      // unusable images, and embedding those left the export spinning
+      // forever with no PDF at all.
+      let snapshot = {};
+      try {
+        snapshot = captureScene() || {};
+      } catch (err) {
+        console.warn("3D snapshot unavailable; exporting drawings without it.", err);
+      }
+
       const latestProject = useProjectStore.getState().project;
       const [{ pdf }, { default: ArchitectReport }] = await Promise.all([
         import("@react-pdf/renderer"),
         import("../pdf/ArchitectReport.jsx")
       ]);
-      const blob = await pdf(
-        <ArchitectReport project={latestProject} snapshot={snapshot} />
+
+      const build = (shots) => pdf(
+        <ArchitectReport project={latestProject} snapshot={shots} />
       ).toBlob();
-      const safeName = latestProject.name.replace(/[^a-zA-Z0-9]/g, '-');
+
+      // Bound the render. If the snapshots are what is stalling it, fall back
+      // to a drawings-only export rather than leaving the user with nothing.
+      const withTimeout = (promise, ms) => Promise.race([
+        promise,
+        new Promise((_, reject) => setTimeout(() => reject(new Error("pdf-timeout")), ms))
+      ]);
+
+      let blob;
+      try {
+        blob = await withTimeout(build(snapshot), 45000);
+      } catch (err) {
+        console.warn("Blueprint render stalled; retrying without 3D views.", err);
+        blob = await build({});
+      }
+
+      const safeName = (latestProject.name || "project").replace(/[^a-zA-Z0-9]/g, '-');
       downloadBlob(blob, `Home-Vision-AI-${safeName}-Architect-Export.pdf`);
+    } catch (err) {
+      console.error("Blueprint export failed:", err);
+      useProjectStore.setState({ uiWarning: "Could not build the blueprint PDF. Please try again." });
     } finally {
       setBusy(false);
     }

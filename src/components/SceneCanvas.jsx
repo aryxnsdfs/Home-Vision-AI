@@ -104,6 +104,9 @@ const sanitizeCanvasDataUrl = (value) => {
   return null;
 };
 
+const SNAPSHOT_W = 1200;
+const SNAPSHOT_H = 815;
+
 function takeSnapshot(gl, scene, camera, options = {}) {
   const size = gl.getSize(new THREE.Vector2());
   const ratio = gl.getPixelRatio();
@@ -152,11 +155,26 @@ function takeSnapshot(gl, scene, camera, options = {}) {
   }
   captureCamera.updateProjectionMatrix();
   
-  gl.setPixelRatio(Math.min(2, window.devicePixelRatio || 1));
-  gl.setSize(1800, 1220, false);
+  // These four views are printed a few inches wide. Capturing 1800x1220 at up
+  // to 2x device ratio built ~3600x2440 buffers, and four JPEGs that large are
+  // megabytes of data URI for react-pdf to decode — enough to stall the export
+  // outright on a busy scene. Capture at print resolution instead.
+  gl.setPixelRatio(1);
+  gl.setSize(SNAPSHOT_W, SNAPSHOT_H, false);
   gl.render(scene, captureCamera);
-  
-  const dataUrl = sanitizeCanvasDataUrl(gl.domElement.toDataURL("image/jpeg", 0.94));
+
+  let dataUrl = null;
+  try {
+    dataUrl = sanitizeCanvasDataUrl(gl.domElement.toDataURL("image/jpeg", 0.82));
+  } catch (err) {
+    // A lost WebGL context taints or empties the canvas; the drawings matter
+    // more than the render, so carry on without this view.
+    console.warn("Scene snapshot unavailable for this view.", err);
+    dataUrl = null;
+  }
+  // A blank/lost context yields a token-sized image. Embedding those wastes
+  // time and prints an empty box, so drop them.
+  if (typeof dataUrl === "string" && dataUrl.length < 1024) dataUrl = null;
   
   originalMaterials.forEach(([node, mat]) => {
     node.material = mat;
