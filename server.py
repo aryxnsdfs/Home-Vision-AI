@@ -7805,7 +7805,12 @@ QUESTION_LIBRARY = {
 }
 
 @app.post("/api/analyze-prompt")
-async def analyze_prompt(req: GenerateRequest):
+# Named apart from the analyze_prompt() helper above deliberately. Defined
+# later at module level, a route handler of the same name replaced the helper,
+# so the local-NLP fallback that every LLM failure lands in called this
+# coroutine instead and died with "'coroutine' object is not subscriptable" -
+# hiding the real message, which was that the model was unavailable.
+async def analyze_prompt_endpoint(req: GenerateRequest):
     logger.info("[API] Analyzing prompt for missing information...")
     try:
         from cloud_extractor import extract_keywords_groq
