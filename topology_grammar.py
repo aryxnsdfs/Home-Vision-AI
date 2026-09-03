@@ -103,13 +103,62 @@ def public_chain(rooms: Sequence[dict], open_plan: bool = False) -> List[Topolog
     return result
 
 
-def private_branch(rooms: Sequence[dict], hub_id: Optional[str]) -> List[TopologyEdge]:
+def choose_all_by_type(rooms: Sequence[dict], *types: str) -> List[str]:
+    """Every room of these types, in order, not just the first.
+
+    ``choose_by_type`` returns one id, and every topology fed that single id to
+    ``private_branch``/``attach_unhandled``, so the whole private and semi public
+    program hung off one corridor. A corridor is a rectangle with a finite
+    perimeter and CP-SAT holds it to 5 ft wide, so a busy floor needed a 41 ft
+    corridor to seat its doors and came back infeasible on a plot it used a
+    third of. ``ensure_circulation`` had already provisioned the extra corridors;
+    nothing was using them.
+    """
+    wanted = {canonical(value) for value in types}
+    found: List[str] = []
+    for room in rooms:
+        if canonical(room.get("type")) in wanted:
+            room_id = str(room.get("id") or "")
+            if room_id and room_id not in found:
+                found.append(room_id)
+    return found
+
+
+def _hub_list(hubs: object) -> List[str]:
+    """Accept either a single hub id or an ordered list of them."""
+    if hubs is None:
+        return []
+    if isinstance(hubs, str):
+        return [hubs] if hubs else []
+    return [str(h) for h in hubs if h]
+
+
+def hub_chain(hubs: Sequence[str]) -> List[TopologyEdge]:
+    """Link secondary hubs back to the primary one.
+
+    Distributing rooms across several corridors only works if the corridors
+    themselves are connected; otherwise a room lands on a corridor that reaches
+    nothing and the layout fails reachability instead of adjacency.
+    """
+    chain: List[TopologyEdge] = []
+    ordered = _hub_list(hubs)
+    for secondary in ordered[1:]:
+        item = edge(ordered[0], secondary, reason="hub_chain")
+        if item:
+            chain.append(item)
+    return chain
+
+
+def private_branch(rooms: Sequence[dict], hub_id: object) -> List[TopologyEdge]:
     result: List[TopologyEdge] = []
     by_id = {str(room.get("id")): room for room in rooms}
+    hubs = _hub_list(hub_id)
+    primary = hubs[0] if hubs else None
+    assigned = 0
     for room in rooms:
         room_id = str(room.get("id"))
         room_type = canonical(room.get("type"))
-        if room_zone(room_type) != "private" or room_id == hub_id:
+        if room_zone(room_type) != "private" or room_id in hubs:
             continue
         if is_bathroom(room_type) and (
             canonical(room.get("bathroom_role")) == "attached"
@@ -120,24 +169,36 @@ def private_branch(rooms: Sequence[dict], hub_id: Optional[str]) -> List[Topolog
                 owner = next((str(item.get("id")) for item in rooms if is_bedroom(item.get("type", ""))), "")
             item = edge(owner, room_id, reason="exclusive_ensuite")
         else:
-            item = edge(hub_id, room_id, reason="private_distribution")
+            # Spread the doors over every corridor the program was given.
+            hub = hubs[assigned % len(hubs)] if hubs else primary
+            assigned += 1
+            item = edge(hub, room_id, reason="private_distribution")
         if item:
             result.append(item)
     return result
 
 
-def attach_unhandled(rooms: Sequence[dict], edges: Iterable[TopologyEdge], default_hub: Optional[str]) -> List[TopologyEdge]:
+def attach_unhandled(rooms: Sequence[dict], edges: Iterable[TopologyEdge], default_hub: object) -> List[TopologyEdge]:
     """Connect remaining destinations without ever making one a transit hub."""
     result = list(edges)
     touched = {node for item in result for node in (item.source, item.target)}
-    living = choose_by_type(rooms, "living_room", "family_lounge", "foyer") or default_hub
+    hubs = _hub_list(default_hub)
+    primary = hubs[0] if hubs else None
+    living = choose_by_type(rooms, "living_room", "family_lounge", "foyer") or primary
     kitchen = choose_by_type(rooms, "kitchen", "open_kitchen")
+    assigned = 0
     for room in rooms:
         room_id = str(room.get("id"))
-        if room_id in touched or room_id == default_hub:
+        if room_id in touched or room_id in hubs:
             continue
         zone = room_zone(room.get("type", ""))
-        anchor = kitchen if zone == "service" and kitchen and room_id != kitchen else default_hub or living
+        if zone == "service" and kitchen and room_id != kitchen:
+            anchor = kitchen
+        elif hubs:
+            anchor = hubs[assigned % len(hubs)]
+            assigned += 1
+        else:
+            anchor = living
         item = edge(anchor, room_id, "open_flow" if zone == "outdoor" else "direct_door", "orphan_reachability")
         if item:
             result.append(item)

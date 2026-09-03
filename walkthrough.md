@@ -53,7 +53,7 @@ Role selectors such as `master_bedroom`, `master_bathroom`, `attached_bathroom`,
 
 Every compiled constraint and serialized `SpatialRelation` retains `original_source_selector` and `original_target_selector` for logs, while `source`/`target` and `source_room_id`/`target_room_id` contain canonical IDs only.
 
-Before topology generation, `assert_relation_endpoints()` verifies every endpoint against the canonical room map. A missing user-authored endpoint raises `InternalInvariantError` with the relation ID, original selector, attempted ID, available IDs, and program/candidate ID. Candidate generation never loops over multiple graphs for one unresolved alias. Architectural-default relations to an optional room that was intentionally pruned are removed or rebound to the actual entry before this audit.
+Before topology generation, `assert_relation_endpoints()` verifies every endpoint against the canonical room map. A relation whose endpoint is not on this floor is dropped and reported as `[RELATION DROPPED]` with the relation ID, original selector, attempted ID and available IDs: losing one adjacency preference is better than losing the house, and the room program itself is still enforced by the semantic gate. `LayoutCandidate.assert_identity_invariants()` still raises `InternalInvariantError` for a dangling relation, because by then pruning has run and a survivor means an internal bug rather than an unresolvable brief. Candidate generation never loops over multiple graphs for one unresolved alias. Architectural-default relations to an optional room that was intentionally pruned are removed or rebound to the actual entry before this audit.
 
 ## Circulation and utility semantics
 

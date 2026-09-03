@@ -864,7 +864,18 @@ def apply_inferred_room_sizes(room_specs: list) -> list:
     return specs
 
 
-CIRCULATION_TYPES = {"corridor", "circulation", "hallway", "foyer", "lobby", "passage", "entrance_lobby"}
+# What actually distributes access, which is not the same as what looks like
+# circulation on a plan. The topology grammar zones a foyer as *public* and only
+# ever gives it a single foyer->living edge, so counting it here as a hub made
+# ensure_circulation believe a busy floor was already provisioned and add no
+# corridor at all - on exactly the 17 room case its docstring describes. Keep
+# this in step with topology_grammar.CIRCULATION; a room that does not
+# distribute in the grammar must not be counted as a hub here.
+CIRCULATION_TYPES = {"corridor", "circulation", "hallway", "lobby", "passage", "entrance_lobby"}
+
+# Circulation that carries people between floors rather than across one. It is
+# reached from a hub like any destination, so it counts as load, not capacity.
+VERTICAL_CIRCULATION_TYPES = {"staircase", "stairwell", "stairs"}
 
 
 def rewire_floor_access(
@@ -968,6 +979,9 @@ def ensure_circulation(room_specs: list) -> list:
         and not item.get("is_outdoor")
         and not is_outdoor_type(room_type)
     )
+    # A foyer is reached from the entrance and hands off to the living room, so
+    # it is neither a hub nor a room hanging off one.
+    attached_count -= sum(1 for room_type in types if room_type in {"foyer"})
     per_hub = max(2, int(os.getenv("ROOMS_PER_CIRCULATION_HUB", "6")))
     needed = max(1, math.ceil(max(private_count, attached_count) / per_hub))
     if existing >= needed:
@@ -8121,6 +8135,10 @@ async def api_recalculate_cost(req: CostRequest):
         # Derive built-up area from rooms; fall back to stored metrics/plot.
         area = 0.0
         for r in rooms:
+            # Parking, balconies and terraces are site or open area, not
+            # built-up area, and charging for them inflated every estimate.
+            if r.get("is_outdoor") or str(r.get("roof_type", "")).lower() == "open":
+                continue
             try:
                 area += float(r.get("width", 0) or 0) * float(r.get("length", 0) or 0)
             except (TypeError, ValueError):
@@ -8158,7 +8176,10 @@ async def api_recalculate_cost(req: CostRequest):
 async def api_generate_structural(req: MEPRequest):
     try:
         updated_project = structural_generator.generate_structural(req.project, req.options)
-        return {"status": "success", "project": updated_project}
+        # Same mirror the wiring and plumbing endpoints apply. Returning the raw
+        # project leaves project.rooms out of step with project.floors, which is
+        # the desync that previously put MEP nodes outside the house.
+        return {"status": "success", "project": sync_room_mirror(updated_project)}
     except Exception as e:
         logger.error(f"Structural generation failed: {str(e)}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))

@@ -22,8 +22,14 @@ FORBIDDEN_PAIRS = {
     frozenset({'dining_room', 'toilet'}),
 }
 
-# Minimum shared wall length (feet) required to place a door
+# Minimum shared wall length (feet) required to place a door.
+# These must stay in step with the required_overlap map in topology_generator:
+# an open flow between two public rooms asks for 4 ft, while a direct door,
+# an attached bath and a stair edge ask for 3 ft. Validating everything at 4 ft
+# rejected layouts that satisfied the constraint they were actually given.
 MIN_DOOR_WALL_FT = 4.0
+OPEN_FLOW_WALL_FT = 4.0
+DIRECT_DOOR_WALL_FT = 3.0
 
 COORD_SCALE = 4  # quarter-foot precision
 
@@ -1076,11 +1082,18 @@ class CPSolver:
                     target = next((t for t in rooms if t['type'] == tt and t['id'] != r['id']), None)
                 if not target:
                     continue
+                # Check what the solver was actually told to satisfy. The
+                # contract asks 4 ft for an open flow but only 3 ft for an
+                # attached bath or a stair edge (see topology_generator's
+                # required_overlap map), so a flat 4 ft here threw away layouts
+                # that met their own constraint - an ensuite door realised at
+                # 3.0-3.99 ft was legal to CP-SAT and discarded right after.
+                required = OPEN_FLOW_WALL_FT if intent == 'open_flow' else DIRECT_DOOR_WALL_FT
                 sw = self._shared_wall(r, target)
-                if sw < MIN_DOOR_WALL_FT:
+                if sw < required:
                     errors.append(
                         f"DOOR INFEASIBLE: {r['id']}↔{target['id']} "
-                        f"shared wall {sw:.1f}ft < {MIN_DOOR_WALL_FT}ft"
+                        f"shared wall {sw:.1f}ft < {required}ft"
                     )
 
         # BFS from living_room — every room must be reachable

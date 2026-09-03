@@ -302,7 +302,7 @@ bug:
 | `layout_scorer.py` | Objective vector used to rank candidates |
 | `candidate_contract.py` | `LayoutCandidate`, `RoomProvenance`, invariants |
 | `semantic_evaluator.py` / `semantic_models.py` | Open-vocabulary room semantics |
-| `structural_generator.py` / `structural_inference.py` | Beams and columns |
+| `structural_generator.py` | Beams and columns |
 | `cost_engine.py` | Material and cost estimation |
 | `edit_intelligence.py` | "Modify layout" on an existing project |
 | `asset_library.py` | Furniture, site features, outdoor/custom room recovery |
@@ -345,11 +345,14 @@ All read from the environment with the defaults below.
 
 ## 10. Known limits
 
-- **Very dense single floors.** Past roughly 17 rooms on one storey the corridor
-  perimeter cannot front them all. This is geometry, not area: a 17-room duplex
-  floor fails door adjacency on a plot it uses a third of. Circulation scales
-  with the number of rooms opening off it, but a rectangle has a finite
-  perimeter.
+- **Very dense single floors** used to fail door adjacency on a plot they filled
+  a third of, and this section used to call that an inherent corridor-perimeter
+  limit. It was not. Every topology funnelled the whole private and semi public
+  program onto the *first* corridor, `ensure_circulation` counted the foyer as a
+  hub and so provisioned no extra corridors, and CP-SAT holds a corridor to 5 ft
+  wide - so eleven doors needed a 41 ft corridor. Circulation is now distributed
+  across every hub the program is given, with the hubs chained so they stay
+  reachable. The perimeter argument is real but it binds far later than it did.
 - **Rare enclosed voids.** Roughly one layout in nineteen leaves a small pocket
   of dead space walled in on every side. `dead_space` is a soft objective, not a
   hard constraint.

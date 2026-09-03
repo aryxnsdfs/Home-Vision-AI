@@ -352,6 +352,7 @@ const fitFont = (text, boxW, baseSize, minSize = 0) => {
 };
 
 function FloorPlanTopDown({ floor0, mep, mode = "architectural", project, height = 255, sharedBounds = null }) {
+  const showSite = mode !== "electrical" && mode !== "plumbing";
   let minX = Infinity, minZ = Infinity, maxX = -Infinity, maxZ = -Infinity;
   floor0.forEach(r => {
     const rx = r.x || 0;
@@ -367,6 +368,18 @@ function FloorPlanTopDown({ floor0, mep, mode = "architectural", project, height
   if (minX === Infinity) {
     minX = 0; minZ = 0; maxX = 10; maxZ = 10;
   }
+
+  // Parking usually sits outside the building footprint, so the viewBox has to
+  // grow to include it or it is drawn off the edge of the sheet.
+  const siteAreas = showSite ? projectSiteAreas(project) : [];
+  siteAreas.forEach((a) => {
+    const ax = Number(a.x) || 0, az = Number(a.z) || 0;
+    const aw = Number(a.width) || 0, al = Number(a.length) || 0;
+    if (ax < minX) minX = ax;
+    if (az < minZ) minZ = az;
+    if (ax + aw > maxX) maxX = ax + aw;
+    if (az + al > maxZ) maxZ = az + al;
+  });
 
   if (sharedBounds) {
     minX = sharedBounds.minX; minZ = sharedBounds.minZ;
@@ -409,6 +422,33 @@ function FloorPlanTopDown({ floor0, mep, mode = "architectural", project, height
         ) : null}
 
         <Text x={maxX - 1.5} y={minZ + dimSize * 1.6} style={{ fontSize: dimSize * 1.1, fill: MUTED, textAnchor: "middle", fontWeight: "bold" }}>N↑</Text>
+
+        {siteAreas.map((a, index) => {
+          const ax = Number(a.x) || 0, az = Number(a.z) || 0;
+          const aw = Number(a.width) || 1, al = Number(a.length) || 1;
+          const kind = String(a.type || "site").toLowerCase();
+          return (
+            <React.Fragment key={a.id || `site-${kind}-${index}`}>
+              <Rect
+                x={ax} y={az} width={aw} height={al}
+                fill={SITE_FILLS[kind] || "#e8ebef"}
+                stroke={MUTED} strokeWidth={0.25} strokeDasharray="1.5,1.2"
+              />
+              <Text
+                x={ax + aw / 2} y={az + al / 2}
+                style={{ fontSize: dimSize * 0.95, fill: MUTED, textAnchor: "middle", fontWeight: "bold" }}
+              >
+                {up(roomLabel(a.name || kind))}
+              </Text>
+              <Text
+                x={ax + aw / 2} y={az + al / 2 + dimSize * 1.2}
+                style={{ fontSize: dimSize * 0.8, fill: MUTED, textAnchor: "middle" }}
+              >
+                {`${Math.round(aw)}' x ${Math.round(al)}'`}
+              </Text>
+            </React.Fragment>
+          );
+        })}
 
         {floor0.map(r => {
           const rx = r.x || 0;
@@ -654,6 +694,24 @@ const allProjectRooms = (project) => {
   return project?.rooms || [];
 };
 
+// Requested site features - parking, gardens, terraces. The backend fills
+// `outdoor_areas` with real plot coordinates, and this report never read it, so
+// a drawing for a brief asking for parking showed none. They belong on the plan
+// but are not habitable rooms, so they are drawn distinctly and excluded from
+// built-up area.
+const SITE_FILLS = {
+  parking: "#dbe2ea", garage: "#dbe2ea", carport: "#dbe2ea", driveway: "#e4e8ee",
+  garden: "#dff0dc", lawn: "#dff0dc", courtyard: "#efe9dc",
+  terrace: "#e6eaef", swimming_pool: "#d6ecf7", pool: "#d6ecf7",
+};
+
+const projectSiteAreas = (project) => {
+  const areas = project?.layout_data?.outdoor_areas ?? project?.outdoor_areas;
+  return Array.isArray(areas)
+    ? areas.filter((a) => Number(a?.width) > 0 && Number(a?.length) > 0)
+    : [];
+};
+
 const combinedBounds = (rooms) => {
   let minX = Infinity, minZ = Infinity, maxX = -Infinity, maxZ = -Infinity;
   rooms.forEach(r => {
@@ -664,6 +722,20 @@ const combinedBounds = (rooms) => {
     if (rz + rl > maxZ) maxZ = rz + rl;
   });
   if (minX === Infinity) return null;
+  return { minX, minZ, maxX, maxZ };
+};
+
+const boundsWithSite = (bounds, areas) => {
+  if (!bounds || !areas.length) return bounds;
+  let { minX, minZ, maxX, maxZ } = bounds;
+  areas.forEach((a) => {
+    const ax = Number(a.x) || 0, az = Number(a.z) || 0;
+    const aw = Number(a.width) || 0, al = Number(a.length) || 0;
+    if (ax < minX) minX = ax;
+    if (az < minZ) minZ = az;
+    if (ax + aw > maxX) maxX = ax + aw;
+    if (az + al > maxZ) maxZ = az + al;
+  });
   return { minX, minZ, maxX, maxZ };
 };
 

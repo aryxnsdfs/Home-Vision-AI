@@ -9,9 +9,10 @@ from typing import Dict, Iterable, List, Sequence
 from candidate_contract import LayoutCandidate, SpatialRelation, stable_relation_id
 from constraint_schema import ConstraintKind, ConstraintStrength, IntentContract
 from topology_grammar import (
-    TopologyEdge, attach_unhandled, choose_by_type, classify_rooms, dedupe_edges,
-    edge, mutate_insert_short_corridor, mutate_move_utility_behind_kitchen,
-    mutate_split_public_private_hub, private_branch, public_chain, room_zone,
+    TopologyEdge, attach_unhandled, choose_all_by_type, choose_by_type,
+    classify_rooms, dedupe_edges, edge, hub_chain, mutate_insert_short_corridor,
+    mutate_move_utility_behind_kitchen, mutate_split_public_private_hub,
+    private_branch, public_chain, room_zone,
 )
 
 
@@ -252,7 +253,12 @@ def generate_topology_candidates(
     assert_relation_endpoints(contract, rooms, candidate_id=contract.program_id or "topology-generation")
     zones = classify_rooms(rooms)
     living = choose_by_type(rooms, "living_room", "family_lounge", "foyer")
-    corridor = choose_by_type(rooms, "corridor", "hallway", "passage", "lobby", "entrance_lobby")
+    corridors = choose_all_by_type(rooms, "corridor", "hallway", "passage", "lobby", "entrance_lobby")
+    corridor = corridors[0] if corridors else ""
+    # Every corridor the program was given, not just the first. ensure_circulation
+    # provisions extra hubs for a busy floor and they used to receive one stub
+    # edge each and carry nothing, leaving one corridor to seat every door.
+    chain = hub_chain(corridors)
     foyer = choose_by_type(rooms, "foyer", "entrance_lobby")
     entry = contract.entry_room_id if contract.entry_room_id in {str(r.get("id")) for r in rooms} else (foyer or living or corridor)
     default_hub = corridor or living or entry
@@ -263,27 +269,28 @@ def generate_topology_candidates(
     candidates: List[tuple[str, List[TopologyEdge]]] = []
 
     # Public/private spine: the everyday residential grammar.
-    spine = base_public + private_branch(rooms, corridor or living)
+    private_hubs = corridors or ([living] if living else [])
+    spine = base_public + list(chain) + private_branch(rooms, private_hubs)
     if living and corridor and living != corridor:
         item = edge(living, corridor, reason="public_private_threshold")
         if item: spine.append(item)
-    candidates.append(("public_private_spine", attach_unhandled(rooms, spine, default_hub)))
+    candidates.append(("public_private_spine", attach_unhandled(rooms, spine, private_hubs or default_hub)))
 
     # Split branches: private circulation and service circulation diverge.
-    split = list(base_public) + private_branch(rooms, corridor or living)
-    candidates.append(("split_public_private_branches", attach_unhandled(rooms, split, corridor or living)))
+    split = list(base_public) + list(chain) + private_branch(rooms, private_hubs)
+    candidates.append(("split_public_private_branches", attach_unhandled(rooms, split, private_hubs or default_hub)))
 
     # Small central lobby. Unlike a living-room hub, a lobby may branch freely.
-    lobby = corridor or foyer or living
-    lobby_edges = list(base_public) + private_branch(rooms, lobby)
-    candidates.append(("small_central_lobby", attach_unhandled(rooms, lobby_edges, lobby)))
+    lobby_hubs = corridors or [h for h in (foyer, living) if h]
+    lobby_edges = list(base_public) + list(chain) + private_branch(rooms, lobby_hubs)
+    candidates.append(("small_central_lobby", attach_unhandled(rooms, lobby_edges, lobby_hubs)))
 
     # Open-plan public core is rewarded only when the request supports it.
-    open_edges = public_chain(rooms, True) + private_branch(rooms, corridor or living)
+    open_edges = public_chain(rooms, True) + list(chain) + private_branch(rooms, private_hubs)
     if living and corridor and living != corridor:
         item = edge(living, corridor, reason="open_core_private_threshold")
         if item: open_edges.append(item)
-    candidates.append(("open_plan_public_core", attach_unhandled(rooms, open_edges, corridor or living)))
+    candidates.append(("open_plan_public_core", attach_unhandled(rooms, open_edges, private_hubs or default_hub)))
 
     # A compact hub remains an option; adaptive privacy scoring decides when it
     # is suitable instead of a global maximum-degree rule.
@@ -294,8 +301,8 @@ def generate_topology_candidates(
 
     # Linear spine attaches destinations to the circulation line and public
     # service rooms in their natural sequence.
-    linear = list(base_public) + private_branch(rooms, corridor or living)
-    candidates.append(("linear_spine", attach_unhandled(rooms, linear, corridor or living)))
+    linear = list(base_public) + list(chain) + private_branch(rooms, private_hubs)
+    candidates.append(("linear_spine", attach_unhandled(rooms, linear, private_hubs or default_hub)))
 
     seeds = list(candidates)
     for name, edges in seeds:

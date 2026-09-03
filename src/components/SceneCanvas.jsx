@@ -311,6 +311,111 @@ function SiteContext({ site, accent }) {
   );
 }
 
+/* ── Requested site features ──
+   Parking, gardens, terraces and driveways. The backend has always produced
+   these in `layout_data.outdoor_areas`, with real plot coordinates and a full
+   asset list (bays, car, pathway, lights), and nothing on the front end read
+   them - so a plan that asked for "parking for two cars" showed no parking
+   anywhere, in the viewer or the drawings. Balconies were never affected
+   because they stay inside the floor lists and render as rooms.
+
+   These sit on the plot in the same feet-based space as rooms, so the group is
+   placed at the area's corner and its assets keep their area-local offsets,
+   exactly as InteriorObjects does for furniture. */
+const SITE_FINISHES = {
+  parking: { pad: "#3f4753", label: "PARKING" },
+  garage: { pad: "#3f4753", label: "PARKING" },
+  carport: { pad: "#3f4753", label: "CARPORT" },
+  driveway: { pad: "#4a5260", label: "DRIVEWAY" },
+  garden: { pad: "#2f5d33", label: "GARDEN" },
+  lawn: { pad: "#2f5d33", label: "LAWN" },
+  courtyard: { pad: "#5a5348", label: "COURTYARD" },
+  terrace: { pad: "#57606b", label: "TERRACE" },
+  swimming_pool: { pad: "#1d6f9c", label: "POOL" },
+  pool: { pad: "#1d6f9c", label: "POOL" },
+};
+
+function SiteLayer({ areas, accent, showLabels = true }) {
+  if (!Array.isArray(areas) || areas.length === 0) return null;
+
+  return (
+    <group userData={{ siteLayer: true }}>
+      {areas.map((area, index) => {
+        const width = Number(area?.width || 0);
+        const length = Number(area?.length || 0);
+        if (!(width > 0) || !(length > 0)) return null;
+
+        const type = String(area?.type || "site").toLowerCase();
+        const finish = SITE_FINISHES[type] || { pad: "#454c57", label: type.replace(/_/g, " ").toUpperCase() };
+        const padW = width * SCALE;
+        const padL = length * SCALE;
+        const originX = Number(area?.x || 0) * SCALE;
+        const originZ = Number(area?.z || 0) * SCALE;
+        const assets = Array.isArray(area?.assets) ? area.assets : [];
+
+        return (
+          <group key={area?.id || `site-${type}-${index}`} position={[originX, 0, originZ]}>
+            {/* Sits just above the ground plate so it reads as a surface
+                rather than z-fighting with it. */}
+            <mesh
+              receiveShadow
+              rotation={[-Math.PI / 2, 0, 0]}
+              position={[padW / 2, 0.02, padL / 2]}
+            >
+              <planeGeometry args={[padW, padL]} />
+              <meshStandardMaterial color={finish.pad} roughness={0.88} metalness={0.02} />
+            </mesh>
+            <Line
+              points={[
+                [0, 0.03, 0],
+                [padW, 0.03, 0],
+                [padW, 0.03, padL],
+                [0, 0.03, padL],
+                [0, 0.03, 0],
+              ]}
+              color={accent}
+              lineWidth={1}
+              transparent
+              opacity={0.45}
+            />
+            {assets.map((item, assetIndex) => {
+              const assetType = String(item?.type || "").toLowerCase();
+              const key = `${area?.id || type}-${assetType || "asset"}-${assetIndex}`;
+              if (assetType === "car") {
+                return (
+                  <CarModel
+                    key={key}
+                    x={Number(item?.x || 0) * SCALE}
+                    z={Number(item?.z || 0) * SCALE}
+                    accent={accent}
+                    isSelected={false}
+                    onClick={() => {}}
+                  />
+                );
+              }
+              return (
+                <ManifestFurniture key={key} item={item} isSelected={false} accent={accent} onClick={() => {}} />
+              );
+            })}
+            {showLabels && (
+              <Text
+                position={[padW / 2, 0.12, padL / 2]}
+                rotation={[-Math.PI / 2, 0, 0]}
+                fontSize={Math.max(0.16, Math.min(0.34, padW * 0.12))}
+                color="#cbd5e1"
+                anchorX="center"
+                anchorY="middle"
+              >
+                {finish.label}
+              </Text>
+            )}
+          </group>
+        );
+      })}
+    </group>
+  );
+}
+
 /* ── Plot boundary visualizer ──
    `offset` lets the boundary be rendered either at scene root (default house
    offset) or inside an already-offset floor group (pass [0,0,0]).
@@ -1190,6 +1295,15 @@ function SceneContent() {
       {/* House Group */}
       <group position={sceneOffset}>
         <Plinth rooms={groundFloorRooms} />
+
+        {/* Site features share the plot's coordinate space with the rooms, and
+            sit at ground level rather than on any one storey, so they render
+            beside the floor groups and stay visible whichever floor is shown. */}
+        <SiteLayer
+          areas={project.outdoor_areas}
+          accent={accentColor}
+          showLabels={viewMode !== "walk"}
+        />
 
         {[-1, 0, 1, 2].map(floor => {
            const getFloor = (r) => r.floorIndex !== undefined ? r.floorIndex : (r.isFloor1 ? 1 : 0);

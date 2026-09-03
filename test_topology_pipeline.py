@@ -178,13 +178,24 @@ class AuthoritativeCandidateTests(unittest.TestCase):
         self.assertGreaterEqual(rect.x + rect.width / 2, 15.0)
 
     def test_d_hard_infeasible_candidate_never_reaches_pareto(self):
+        # A hard user relation pointing at a room that is not on this floor used
+        # to raise. It is now dropped and reported instead, because losing one
+        # adjacency is better than losing the whole house. What must still hold
+        # is the point of this test: no candidate may be built around it.
         rooms = [{"id": "living-1", "type": "living_room"}]
         contract = IntentContract(constraints=[ArchitecturalConstraint(
             ConstraintKind.DIRECT_CONNECTION, "living-1", target="missing-room",
             strength=ConstraintStrength.HARD, origin=ConstraintOrigin.USER,
         )])
-        with self.assertRaisesRegex(InternalInvariantError, "missing target"):
-            generate_topology_candidates(rooms, contract, 8)
+        with self.assertLogs("homevision", level="WARNING") as captured:
+            candidates = generate_topology_candidates(rooms, contract, 8)
+
+        self.assertTrue(any("RELATION DROPPED" in line for line in captured.output),
+                        "an unresolvable relation must be reported, not dropped silently")
+        self.assertEqual(contract.constraints, [], "the dead relation must not survive")
+        for candidate in candidates:
+            for item in candidate.edges:
+                self.assertNotIn("missing-room", (item.source, item.target))
 
     def test_e_duplicate_types_keep_exact_identity_and_owner_door(self):
         rooms = [

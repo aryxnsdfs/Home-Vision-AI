@@ -880,8 +880,9 @@ def compile_intent(
     )
     assert_relation_endpoints(contract, rooms, candidate_id=program_id)
     logger.info(
-        "[CONSTRAINT AUDIT] scalar_relations=%s group_constraints=%s resolved_selectors=%s unresolved=0",
-        len(contract.constraints), len(contract.group_constraints), requested_relations
+        "[CONSTRAINT AUDIT] scalar_relations=%s group_constraints=%s resolved_selectors=%s unresolved=%s",
+        len(contract.constraints), len(contract.group_constraints), requested_relations,
+        max(0, requested_relations - len(contract.constraints)),
     )
     return contract
 

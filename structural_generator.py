@@ -3,6 +3,24 @@ from typing import Dict, Any, List
 
 logger = logging.getLogger(__name__)
 
+# EVERYTHING HERE IS IN FEET, because that is what RoomNode.rect and every room
+# dict in this pipeline carry. The sizes below were written as metres - a 400 mm
+# column, a 1.5 m footing pad, a 2.6 m storey, a 4 m wall before it needs an
+# intermediate column - and then compared against feet, so an intermediate
+# column was added to virtually every wall and the columns came out 0.4 ft
+# (under five inches) square. Keep the metric intent in the comment and the
+# value in feet.
+FT_PER_M = 3.28084
+
+COLUMN_SIDE_FT = round(0.4 * FT_PER_M, 3)        # 400 x 400 mm
+FOOTING_SIDE_FT = round(1.5 * FT_PER_M, 3)       # 1.5 x 1.5 m pad
+FOOTING_DEPTH_FT = round(0.3 * FT_PER_M, 3)
+FOOTING_LEVEL_FT = round(-0.5 * FT_PER_M, 3)     # 0.5 m below ground
+STOREY_HEIGHT_FT = round(2.6 * FT_PER_M, 3)      # standard floor height
+MAX_UNSUPPORTED_WALL_FT = round(4.0 * FT_PER_M, 3)   # add a column past this
+MAX_BEAM_SPAN_FT = round(6.0 * FT_PER_M, 3)
+
+
 def find_corners_and_junctions(rooms: List[Dict[str, Any]]) -> List[Dict[str, float]]:
     # We collect all distinct grid corners used by the rooms
     points = []
@@ -23,11 +41,11 @@ def find_corners_and_junctions(rooms: List[Dict[str, Any]]) -> List[Dict[str, fl
         add_point(rx, rz + rl)
         add_point(rx + rw, rz + rl)
         
-        # If wall > 4m, add midpoints
-        if rw > 4.0:
+        # A wall longer than this needs an intermediate column.
+        if rw > MAX_UNSUPPORTED_WALL_FT:
             add_point(rx + rw/2, rz)
             add_point(rx + rw/2, rz + rl)
-        if rl > 4.0:
+        if rl > MAX_UNSUPPORTED_WALL_FT:
             add_point(rx, rz + rl/2)
             add_point(rx + rw, rz + rl/2)
 
@@ -59,9 +77,9 @@ def generate_structural(layout: Dict[str, Any], options: Dict[str, Any]) -> Dict
             "x": px,
             "y": 0,
             "z": pz,
-            "width": 0.4, # 400x400mm
-            "length": 0.4,
-            "height": 2.6 # Standard floor height
+            "width": COLUMN_SIDE_FT,
+            "length": COLUMN_SIDE_FT,
+            "height": STOREY_HEIGHT_FT
         })
         
         # Footing
@@ -69,11 +87,11 @@ def generate_structural(layout: Dict[str, Any], options: Dict[str, Any]) -> Dict
             "id": f"footing_{i}",
             "type": "footing",
             "x": px,
-            "y": -0.5, # 0.5m below ground
+            "y": FOOTING_LEVEL_FT,
             "z": pz,
-            "width": 1.5, # 1.5x1.5m pad
-            "length": 1.5,
-            "height": 0.3
+            "width": FOOTING_SIDE_FT,
+            "length": FOOTING_SIDE_FT,
+            "height": FOOTING_DEPTH_FT
         })
         
     # 3. Connect Beams (Plinth + Roof)
@@ -89,7 +107,7 @@ def generate_structural(layout: Dict[str, Any], options: Dict[str, Any]) -> Dict
             
             if same_x or same_z:
                 dist = abs(c1["z"] - c2["z"]) if same_x else abs(c1["x"] - c2["x"])
-                if dist < 6.0: # Only connect if within a reasonable beam span
+                if dist < MAX_BEAM_SPAN_FT:
                     # We might get overlapping segments, but visually it works for now
                     
                     # Plinth Beam
